@@ -67,11 +67,13 @@ public final class KeeperService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        NotificationManager nm = getSystemService(NotificationManager.class);
-        NotificationChannel ch = new NotificationChannel(CHANNEL, "Wireless debugging", NotificationManager.IMPORTANCE_LOW);
-        ch.setDescription("Shows whether wireless debugging is being kept on");
-        ch.setShowBadge(false);
-        nm.createNotificationChannel(ch);
+        if (Keeper.isAtLeast(26)) {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            NotificationChannel ch = new NotificationChannel(CHANNEL, "Wireless debugging", NotificationManager.IMPORTANCE_LOW);
+            ch.setDescription("Shows whether wireless debugging is being kept on");
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
+        }
         Notification n = build("Starting…");
         if (Keeper.isAtLeast(34)) {
             startForeground(NOTIFICATION, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
@@ -151,6 +153,13 @@ public final class KeeperService extends Service {
     }
 
     private void ensure() {
+        if (!Keeper.hasWirelessDebugging()) {
+            // Android 10 and older: no wireless debugging; the PC reaches the
+            // phone with adb tcpip, so only keeping Wi-Fi connected matters.
+            show(Keeper.onWifi(this) ? "Keeping Wi-Fi connected (this Android has no wireless debugging)"
+                    : "Waiting for Wi-Fi to connect", false);
+            return;
+        }
         if (!Keeper.canWriteSettings(this)) {
             show("Needs one-time setup from the PC (tap for details)", true);
             return;
@@ -217,7 +226,9 @@ public final class KeeperService extends Service {
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         PendingIntent pause = PendingIntent.getService(this, 1, new Intent(this, KeeperService.class).setAction(ACTION_PAUSE),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        return new Notification.Builder(this, CHANNEL)
+        @SuppressWarnings("deprecation")
+        Notification.Builder b = Keeper.isAtLeast(26) ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+        return b
                 .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
                 .setContentTitle("Wireless Debugging Keeper")
                 .setContentText(text)

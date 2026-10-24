@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.androidcontroller.keeper"
-    android:versionCode="2"
-    android:versionName="0.2.0">
+    android:versionCode="3"
+    android:versionName="0.3.0">
 
     <!-- Target 28 on purpose: since Android 10, only apps targeting 28 or lower
          may switch Wi-Fi off and on (WifiManager.setWifiEnabled), which is how
          the Wi-Fi watchdog gets a phone back onto a network Android gave up on. -->
-    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="28" />
+    <!-- minSdk 23: installs on Android 6+. Wireless debugging itself needs
+         Android 11; older phones still get the Wi-Fi watchdog (for adb tcpip). -->
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="28" />
 
     <!-- Granted once from the PC: adb shell pm grant org.androidcontroller.keeper android.permission.WRITE_SECURE_SETTINGS -->
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
@@ -28,7 +30,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@android:style/Theme.DeviceDefault.DayNight">
+            android:theme="@android:style/Theme.DeviceDefault.Light">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

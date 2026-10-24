@@ -631,8 +631,8 @@ impl Manager {
     fn setup_helper(&self, i: usize) {
         let s = &self.slots[i];
         let (Some(serial), Some(d)) = (s.adb_serial.clone(), s.device.as_ref()) else { return };
-        if d.sdk != 0 && d.sdk < 30 {
-            return; // wireless debugging (and the helper) need Android 11+
+        if d.sdk != 0 && d.sdk < 23 {
+            return; // the helper needs Android 6+
         }
         let shell_v2 = d.shell_v2();
         let title = if s.alias.is_empty() && !d.model.is_empty() { d.model.clone() } else { s.display_name() };

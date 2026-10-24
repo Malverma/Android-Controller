@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -36,6 +37,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle saved) {
+        if (Keeper.isAtLeast(29)) setTheme(android.R.style.Theme_DeviceDefault_DayNight);
         super.onCreate(saved);
         int pad = dp(20);
         LinearLayout col = new LinearLayout(this);
@@ -138,6 +140,11 @@ public final class MainActivity extends Activity {
         watchdog.setChecked(Keeper.watchdog(this));
         watchdog.setEnabled(Keeper.active(this));
         StringBuilder s = new StringBuilder();
+        if (!Keeper.hasWirelessDebugging()) {
+            s.append("This phone runs Android ").append(Build.VERSION.RELEASE)
+                    .append(", which has no wireless debugging (it needs Android 11). Connect it once by USB and use ")
+                    .append("\"Enable Wi-Fi ADB\" in Android Controller; this app then keeps Wi-Fi connected.\n\n");
+        }
         s.append("Wireless debugging: ").append(Keeper.wirelessDebuggingOn(this) ? "on" : "off").append('\n');
         s.append("USB debugging: ").append(Keeper.usbDebuggingOn(this) ? "on" : "off").append('\n');
         s.append("Wi-Fi: ").append(Keeper.onWifi(this) ? "connected" : "not connected").append('\n');
@@ -147,7 +154,7 @@ public final class MainActivity extends Activity {
         s.append('\n').append("Battery restrictions: ").append(unrestricted ? "off (good)" : "on — may stop the app");
         status.setText(s);
         battery.setVisibility(unrestricted ? View.GONE : View.VISIBLE);
-        setup.setText(granted ? ""
+        setup.setText(granted || !Keeper.hasWirelessDebugging() ? ""
                 : "One-time setup: connect the phone to the PC with USB debugging on, then run\n\n"
                         + Keeper.GRANT_COMMAND + "\n\n(or android-helper/setup.sh from the Android Controller repository).");
     }

@@ -1,6 +1,6 @@
 # Wireless Debugging Keeper (Android helper)
 
-A small app for the phones (Android 11+) that keeps **Wireless debugging**
+A small app for the phones (Android 6+; wireless debugging needs Android 11, older phones get only the Wi-Fi watchdog) that keeps **Wireless debugging**
 on, so Android Controller can reconnect by itself:
 
 - Android turns wireless debugging off whenever Wi-Fi drops and after a
@@ -20,6 +20,9 @@ on, so Android Controller can reconnect by itself:
    "install unknown apps" when Android asks):
    **https://github.com/Malverma/Android-Controller/raw/main/android-helper/dist/wireless-debugging-keeper.apk**
    One APK works on 32-bit and 64-bit phones (it has no native code).
+   If Android says "There was a problem parsing the package", the phone is
+   older than Android 6, or the download is incomplete: delete it from
+   Downloads and download it again.
 2. Turn on **Developer options › Wireless debugging** and pair the phone in
    Android Controller (**Add Device**). Tick **Always allow on this network**.
 3. That's it: when the phone connects, Android Controller grants the

@@ -24,10 +24,11 @@ for s in "${serials[@]}"; do
     model=$(adb -s "$s" shell getprop ro.product.model | tr -d '\r')
     sdk=$(adb -s "$s" shell getprop ro.build.version.sdk | tr -d '\r')
     echo "== $model ($s, Android SDK $sdk)"
-    if (( sdk < 30 )); then
-        echo "   skipped: wireless debugging needs Android 11 or newer"
+    if (( sdk < 23 )); then
+        echo "   skipped: needs Android 6 or newer"
         continue
     fi
+    (( sdk < 30 )) && echo "   Android older than 11: no wireless debugging; only the Wi-Fi watchdog runs"
     adb -s "$s" install -r "$APK" >/dev/null
     adb -s "$s" shell pm grant $PKG android.permission.WRITE_SECURE_SETTINGS
     if (( sdk >= 33 )); then

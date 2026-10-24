@@ -28,6 +28,11 @@ final class Keeper {
 
     private Keeper() {}
 
+    /** Wireless debugging exists from Android 11 (API 30). */
+    static boolean hasWirelessDebugging() {
+        return Build.VERSION.SDK_INT >= 30;
+    }
+
     static boolean canWriteSettings(Context c) {
         return c.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED;
     }
@@ -56,7 +61,7 @@ final class Keeper {
      * depends on). Returns false when the permission has not been granted.
      */
     static boolean turnOn(Context c) {
-        if (!canWriteSettings(c)) return false;
+        if (!hasWirelessDebugging() || !canWriteSettings(c)) return false;
         ContentResolver r = c.getContentResolver();
         try {
             if (!usbDebuggingOn(c)) {
@@ -89,7 +94,11 @@ final class Keeper {
     static void start(Context c) {
         Intent i = new Intent(c, KeeperService.class);
         try {
-            c.startForegroundService(i);
+            if (isAtLeast(26)) {
+                c.startForegroundService(i);
+            } else {
+                c.startService(i);
+            }
         } catch (IllegalStateException | SecurityException e) {
             Log.w(TAG, "cannot start the service", e);
         }
