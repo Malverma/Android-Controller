@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.graphics.PixelFormat;
 import android.graphics.Path;
 import android.media.AudioManager;
 import android.os.Bundle;
@@ -13,6 +14,8 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.View;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
@@ -48,6 +51,8 @@ public final class InputService extends AccessibilityService {
     private float scrollV, scrollH, scrollX, scrollY;
     private int scrollW, scrollH0;
     private boolean scrollQueued;
+    /** The invisible window that keeps the screen on; main thread only. */
+    private View keepOnView;
 
     static InputService get() {
         return instance;
@@ -62,18 +67,59 @@ public final class InputService extends AccessibilityService {
     protected void onServiceConnected() {
         instance = this;
         Log.i(Direct.TAG, "touch control on");
+        // Turned on while the PC already wants the screen kept on.
+        if (Screen.keptOn()) keepScreenOn(true);
     }
 
     @Override
     public void onDestroy() {
         if (instance == this) instance = null;
+        removeKeepOn();
         super.onDestroy();
     }
 
     @Override
     public boolean onUnbind(android.content.Intent intent) {
         if (instance == this) instance = null;
+        main.post(this::removeKeepOn);
         return super.onUnbind(intent);
+    }
+
+    /** Shows or removes a 1-pixel, untouchable window with FLAG_KEEP_SCREEN_ON. */
+    void keepScreenOn(boolean on) {
+        main.post(() -> {
+            if (!on) {
+                removeKeepOn();
+                return;
+            }
+            if (keepOnView != null) return;
+            WindowManager wm = getSystemService(WindowManager.class);
+            if (wm == null) return;
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(1, 1,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                    PixelFormat.TRANSLUCENT);
+            lp.alpha = 0f;
+            View v = new View(this);
+            try {
+                wm.addView(v, lp);
+                keepOnView = v;
+            } catch (RuntimeException e) {
+                Log.w(Direct.TAG, "keep screen on window: " + e);
+            }
+        });
+    }
+
+    private void removeKeepOn() {
+        if (keepOnView == null) return;
+        WindowManager wm = getSystemService(WindowManager.class);
+        try {
+            if (wm != null) wm.removeView(keepOnView);
+        } catch (RuntimeException ignored) {
+            // already gone with the service
+        }
+        keepOnView = null;
     }
 
     @Override

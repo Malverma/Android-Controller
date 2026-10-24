@@ -332,7 +332,11 @@ public final class DirectService extends Service {
         } finally {
             links.remove(s);
             updateLocks();
-            if (links.isEmpty()) setStatus("Waiting for the PC");
+            if (links.isEmpty()) {
+                setStatus("Waiting for the PC");
+                // The choice is remembered and applied again when the PC reconnects.
+                Screen.keepOn(this, false);
+            }
         }
     }
 

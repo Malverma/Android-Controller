@@ -61,6 +61,7 @@ What works compared with ADB phones:
 | Files to Download | yes | yes (resumable, checksummed) |
 | APK install | silent | Android's installer asks on the phone |
 | Clipboard from the phone | yes | no (PC → phone works) |
+| Keep screen on (tile toggle) | changes the screen timeout | held by touch control while the PC is connected (needs touch control on) |
 
 Security: only PCs paired with the on-screen code are accepted (P-256 key
 exchange confirmed by the code, then an HMAC challenge on every
