@@ -1243,7 +1243,7 @@ scrcpy_binary    = "/usr/bin/scrcpy"    # used only for `--version`
 scrcpy_server    = "/usr/share/scrcpy/scrcpy-server"
 start_adb_server = true
 lan_only         = true                 # enforce §3.1 address filter
-max_slots        = 5                    # 1..=5
+max_slots        = 4                    # 1..=5; slots shown in the grid
 
 [discovery]
 avahi                  = true

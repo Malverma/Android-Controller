@@ -34,6 +34,7 @@ fn main() -> glib::ExitCode {
         .enable_all()
         .build()
         .expect("failed to start the tokio runtime");
+    let slots = config.general.max_slots.clamp(1, ac_core::MAX_SLOTS as u8);
     let manager = {
         let _guard = runtime.enter();
         ac_device::spawn(ac_device::ManagerOptions::new(config, paths))
@@ -47,7 +48,7 @@ fn main() -> glib::ExitCode {
             return;
         }
         if let Some(m) = manager.borrow_mut().take() {
-            window::build(app, m, config_error.clone());
+            window::build(app, m, slots, config_error.clone());
         }
     });
     let code = app.run();

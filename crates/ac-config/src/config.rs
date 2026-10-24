@@ -72,7 +72,7 @@ impl Default for General {
             scrcpy_server: "/usr/share/scrcpy/scrcpy-server".into(),
             start_adb_server: true,
             lan_only: true,
-            max_slots: 5,
+            max_slots: 4,
         }
     }
 }

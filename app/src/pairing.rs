@@ -71,7 +71,9 @@ impl PairingDialog {
         let header = adw::HeaderBar::builder().title_widget(&switcher).build();
 
         // Slot selection shared by all pages.
-        let slot_choice = gtk::DropDown::from_strings(&["Next free slot", "Slot 1", "Slot 2", "Slot 3", "Slot 4", "Slot 5"]);
+        let choices: Vec<String> =
+            std::iter::once("Next free slot".to_owned()).chain((1..=app.slot_count()).map(|n| format!("Slot {n}"))).collect();
+        let slot_choice = gtk::DropDown::from_strings(&choices.iter().map(String::as_str).collect::<Vec<_>>());
         slot_choice.set_selected(slot.map_or(0, u32::from));
         let slot_row = adw::ActionRow::builder().title("Assign to").build();
         slot_row.add_suffix(&slot_choice);

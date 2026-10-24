@@ -1,6 +1,6 @@
 [package]
 name = "android-controller"
-description = "Mirror and control up to five Android phones over Wi-Fi"
+description = "Mirror and control up to four Android phones over Wi-Fi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -115,8 +115,11 @@ impl Manager {
             }),
             None => Devices::default(),
         };
-        let mut slots: Vec<Slot> = (1..=MAX_SLOTS as SlotId).map(Slot::new).collect();
-        for rec in devices.devices.iter().filter(|d| d.slot != 0) {
+        let n = opts.config.general.max_slots.clamp(1, MAX_SLOTS as u8);
+        let mut slots: Vec<Slot> = (1..=n).map(Slot::new).collect();
+        // A device saved in a slot beyond `max_slots` waits unassigned until it
+        // is seen again, then takes the next free slot.
+        for rec in devices.devices.iter().filter(|d| d.slot != 0 && d.slot <= n) {
             let mut s = Slot::restored(rec.slot, &rec.id, rec.transport, rec.last_address.clone(), rec.wifi_mac.clone());
             s.alias = rec.alias.clone();
             slots[rec.slot as usize - 1] = s;
@@ -131,9 +134,9 @@ impl Manager {
             discovery: opts.discovery,
             devices,
             slots,
-            timers: (0..MAX_SLOTS).map(|_| None).collect(),
-            monitors: (0..MAX_SLOTS).map(|_| None).collect(),
-            views: vec![None; MAX_SLOTS],
+            timers: (0..n).map(|_| None).collect(),
+            monitors: (0..n).map(|_| None).collect(),
+            views: vec![None; n as usize],
             nearby: BTreeMap::new(),
             last_nearby: Vec::new(),
             adb_snapshot: Vec::new(),
@@ -241,12 +244,12 @@ impl Manager {
     }
 
     fn emit_all(&mut self) {
-        self.views = vec![None; MAX_SLOTS];
+        self.views = vec![None; self.slots.len()];
         self.emit_changed();
     }
 
     fn emit_changed(&mut self) {
-        for i in 0..MAX_SLOTS {
+        for i in 0..self.slots.len() {
             let v = self.view(i);
             if self.views[i].as_ref() != Some(&v) {
                 self.views[i] = Some(v.clone());
@@ -282,12 +285,12 @@ impl Manager {
 
     // ---- slot plumbing -----------------------------------------------------------
 
-    fn idx(slot: SlotId) -> Option<usize> {
-        (1..=MAX_SLOTS as SlotId).contains(&slot).then(|| slot as usize - 1)
+    fn idx(&self, slot: SlotId) -> Option<usize> {
+        (1..=self.slots.len() as SlotId).contains(&slot).then(|| slot as usize - 1)
     }
 
     fn feed(&mut self, slot: SlotId, ev: SlotEvent) {
-        let Some(i) = Self::idx(slot) else { return };
+        let Some(i) = self.idx(slot) else { return };
         tracing::debug!(slot, phase = self.slots[i].phase.name(), event = ?ev, "slot event");
         let effects = self.slots[i].handle(ev, Instant::now(), &self.cfg.connection);
         for fx in effects {
@@ -295,9 +298,13 @@ impl Manager {
         }
     }
 
+    fn slots_full(&self) -> String {
+        format!("All {} slots are in use", self.slots.len())
+    }
+
     fn pick_slot(&self, requested: Option<SlotId>) -> Option<SlotId> {
         if let Some(s) = requested {
-            return Self::idx(s).filter(|&i| !self.slots[i].is_active()).map(|_| s);
+            return self.idx(s).filter(|&i| !self.slots[i].is_active()).map(|_| s);
         }
         self.slots
             .iter()
@@ -499,7 +506,7 @@ impl Manager {
                 if let Err(m) = self.check_lan(&addr) {
                     return self.toast(Some(ErrorCode::NotLan), m);
                 }
-                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
+                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, self.slots_full()) };
                 self.suppressed.remove(&addr);
                 self.feed(slot, SlotEvent::Connect { addr, transport, expect_serial: None, silent: false });
             }
@@ -509,7 +516,7 @@ impl Manager {
                     return self.toast(Some(ErrorCode::PairFailed), "That pairing request is no longer advertised; reopen it on the phone");
                 };
                 let addr = n.dev.addr;
-                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
+                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, self.slots_full()) };
                 self.feed(slot, SlotEvent::PairCode { addr, code, connect: None });
             }
             UiCommand::PairAddr { slot, pair_addr, code, connect } => {
@@ -527,21 +534,21 @@ impl Manager {
                         _ => return self.toast(None, format!("“{c}” is not a port or IP:port")),
                     },
                 };
-                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
+                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, self.slots_full()) };
                 if let Some(c) = &connect {
                     self.suppressed.remove(c);
                 }
                 self.feed(slot, SlotEvent::PairCode { addr, code, connect });
             }
             UiCommand::PairQr { slot } => {
-                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
+                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, self.slots_full()) };
                 let secret = QrSecret::generate(&mut rand::rng());
                 let payload = secret.payload();
                 self.feed(slot, SlotEvent::PairQr { secret });
                 self.send(UiEvent::QrCode { slot, payload, expires_in: PAIR_QR_TIMEOUT });
             }
             UiCommand::CancelPairing { slot } => {
-                if let Some(i) = Self::idx(slot)
+                if let Some(i) = self.idx(slot)
                     && matches!(self.slots[i].phase, Phase::Pairing { .. })
                 {
                     self.feed(slot, SlotEvent::Disconnect);
@@ -549,7 +556,7 @@ impl Manager {
             }
             UiCommand::EnableWifiAdb { usb_serial, slot } => self.enable_wifi_adb(usb_serial, slot),
             UiCommand::Disconnect { slot } => {
-                if let Some(i) = Self::idx(slot) {
+                if let Some(i) = self.idx(slot) {
                     let s = &self.slots[i];
                     self.suppressed.extend(s.device_id().map(str::to_owned));
                     self.suppressed.extend(s.adb_serial.clone());
@@ -557,7 +564,7 @@ impl Manager {
                 }
             }
             UiCommand::Reconnect { slot } => {
-                let Some(i) = Self::idx(slot) else { return };
+                let Some(i) = self.idx(slot) else { return };
                 let s = &self.slots[i];
                 let Some(addr) = s.addr.clone() else {
                     return self.toast(None, "No known address — pair again or enter IP:port");
@@ -571,7 +578,7 @@ impl Manager {
             }
             UiCommand::Forget { slot } => self.feed(slot, SlotEvent::Forget),
             UiCommand::Rename { slot, alias } => {
-                let Some(i) = Self::idx(slot) else { return };
+                let Some(i) = self.idx(slot) else { return };
                 self.slots[i].alias = alias.trim().to_owned();
                 if let Some(id) = self.slots[i].device_id().map(str::to_owned)
                     && let Some(rec) = self.devices.get_mut(&id)
@@ -617,7 +624,7 @@ impl Manager {
             }
             Msg::AdbDevices(list) => {
                 let old = std::mem::replace(&mut self.adb_snapshot, list);
-                for i in 0..MAX_SLOTS {
+                for i in 0..self.slots.len() {
                     let Some(serial) = self.slots[i].adb_serial.clone() else { continue };
                     if old.iter().any(|d| d.serial == serial) && !self.adb_snapshot.iter().any(|d| d.serial == serial) {
                         self.feed(self.slots[i].id, SlotEvent::AdbGone { serial });
@@ -683,7 +690,7 @@ impl Manager {
     }
 
     fn on_identified(&mut self, slot: SlotId, info: DeviceInfo) {
-        let Some(i) = Self::idx(slot) else { return };
+        let Some(i) = self.idx(slot) else { return };
         // Same phone already live in another slot (e.g. two transports).
         if let Some(other) = self.slots.iter().find(|s| {
             s.id != slot && matches!(s.phase, Phase::Online { .. }) && s.device_id() == Some(info.id.as_str())
@@ -697,7 +704,7 @@ impl Manager {
             return;
         }
         // The phone moves here from a remembered (inactive) slot.
-        for j in 0..MAX_SLOTS {
+        for j in 0..self.slots.len() {
             if j != i && !self.slots[j].is_active() && self.slots[j].device_id() == Some(info.id.as_str()) {
                 if self.slots[i].alias.is_empty() {
                     self.slots[i].alias = std::mem::take(&mut self.slots[j].alias);

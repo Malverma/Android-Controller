@@ -1,7 +1,7 @@
 # Android Controller
 
 Native Arch Linux (GTK4 + libadwaita) app for viewing and controlling up to
-five Android phones over Wi-Fi. The full design is in [`spec.md`](spec.md).
+four Android phones over Wi-Fi (five with `max_slots = 5`). The full design is in [`spec.md`](spec.md).
 
 ## Status: Milestone 1 — ADB LAN manager & discovery
 
@@ -16,13 +16,13 @@ Working now:
   connect with backoff and retry, identity binding by `ro.serialno`,
   heartbeat, automatic reconnect after Wi-Fi drops, mDNS port/IP changes for
   TLS devices, ARP lookup by MAC for legacy devices, and give-up after 300 s.
-- **Dashboard**: 5 slot cards with battery, Wi-Fi RSSI and ADB round-trip time,
+- **Dashboard**: 4 slot cards with battery, Wi-Fi RSSI and ADB round-trip time,
   plus a Nearby list and toasts.
 - **Persistence**: `~/.config/android-controller/devices.toml` (saved devices
   and slots, auto-connect on launch) and `config.toml` (every setting from
   spec §7.3, all optional).
 
-Not yet: screen mirroring and input (Milestone 2), the 5-device video grid and
+Not yet: screen mirroring and input (Milestone 2), the multi-device video grid and
 broadcast input (Milestone 3), and file drag-and-drop (Milestone 4). An online
 slot currently shows a placeholder where the mirror will go.
 

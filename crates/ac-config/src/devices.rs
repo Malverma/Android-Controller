@@ -18,7 +18,7 @@ pub struct DeviceRecord {
     pub model: String,
     #[serde(default)]
     pub sdk: u32,
-    /// 1..=5, or 0 for saved but unassigned.
+    /// 1..=max_slots, or 0 for saved but unassigned.
     #[serde(default)]
     pub slot: SlotId,
     pub transport: TransportKind,

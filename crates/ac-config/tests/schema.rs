@@ -72,6 +72,7 @@ fn invalid_keys(text: &str) -> Vec<String> {
 #[test]
 fn each_validation_rule_rejects() {
     assert_eq!(invalid_keys("[general]\nmax_slots = 6"), ["general.max_slots"]);
+    assert_eq!(Config::default().general.max_slots, 4, "four phones by default; 5 is the hard limit");
     assert_eq!(invalid_keys("[connection]\nreconnect_backoff_ms = []"), ["connection.reconnect_backoff_ms"]);
     assert_eq!(invalid_keys("[connection]\nreconnect_jitter_pct = 101"), ["connection.reconnect_jitter_pct"]);
     assert_eq!(invalid_keys("[connection]\nheartbeat_interval_ms = 10"), ["connection.heartbeat_interval_ms"]);

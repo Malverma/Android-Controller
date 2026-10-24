@@ -3,7 +3,7 @@
 pkgname=android-controller
 pkgver=0.1.0.r2.gf9fb8fa
 pkgrel=1
-pkgdesc="Mirror and control up to five Android phones over Wi-Fi (GTK4)"
+pkgdesc="Mirror and control up to four Android phones over Wi-Fi (GTK4)"
 url='https://github.com/Malverma/Android-Controller'
 arch=('x86_64' 'aarch64')
 license=('Apache-2.0')

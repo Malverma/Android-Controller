@@ -1,9 +1,9 @@
-//! Main window: five slot cards, the "Nearby" list, and a status bar.
+//! Main window: one card per slot (`general.max_slots`), the "Nearby" list, and a status bar.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ac_core::{MAX_SLOTS, SlotId};
+use ac_core::SlotId;
 use ac_device::{ManagerHandle, NearbyView, PhaseView, SlotView, UiCommand, UiEvent, UsbDeviceView};
 use ac_discovery::ServiceKind;
 use adw::prelude::*;
@@ -45,7 +45,8 @@ pub struct App {
     pairing: RefCell<Option<Rc<PairingDialog>>>,
 }
 
-pub fn build(app: &adw::Application, manager: ManagerHandle, config_error: Option<String>) {
+
+pub fn build(app: &adw::Application, manager: ManagerHandle, slots: u8, config_error: Option<String>) {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(
@@ -91,7 +92,7 @@ pub fn build(app: &adw::Application, manager: ManagerHandle, config_error: Optio
     status.add_css_class("dim-label");
     status.add_css_class("statusbar");
 
-    // Five cards need ~900 px; scroll sideways rather than clip when a tiling
+    // Five cards need ~900 px (four ~720 px); scroll sideways rather than clip when a tiling
     // compositor gives the window less.
     let grid_scroll = gtk::ScrolledWindow::builder()
         .child(&grid)
@@ -120,7 +121,7 @@ pub fn build(app: &adw::Application, manager: ManagerHandle, config_error: Optio
                 }
             })
         };
-        let cards: Vec<SlotCard> = (1..=MAX_SLOTS as SlotId).map(|s| SlotCard::new(s, on_action.clone())).collect();
+        let cards: Vec<SlotCard> = (1..=slots).map(|s| SlotCard::new(s, on_action.clone())).collect();
         for c in &cards {
             grid.append(&c.root);
         }
@@ -131,7 +132,7 @@ pub fn build(app: &adw::Application, manager: ManagerHandle, config_error: Optio
             nearby_list,
             status,
             commands: manager.commands.clone(),
-            state: RefCell::new(State { slots: vec![None; MAX_SLOTS], ..Default::default() }),
+            state: RefCell::new(State { slots: vec![None; slots as usize], ..Default::default() }),
             pairing: RefCell::new(None),
         }
     });
@@ -194,6 +195,10 @@ fn install_actions(app: &Rc<App>, gapp: &adw::Application) {
 }
 
 impl App {
+    pub fn slot_count(&self) -> usize {
+        self.cards.len()
+    }
+
     pub fn send(&self, cmd: UiCommand) {
         // Unbounded channel: try_send only fails if the manager is gone.
         if self.commands.try_send(cmd).is_err() {
@@ -276,7 +281,8 @@ impl App {
             UiEvent::Slot(v) => {
                 let prev = self.slot_view(v.slot);
                 let was = prev.as_ref().map(|p| p.phase);
-                self.cards[v.slot as usize - 1].update(&v);
+                let Some(card) = self.cards.get(v.slot as usize - 1) else { return };
+                card.update(&v);
                 if let Some(dlg) = self.pairing_dialog() {
                     if was == Some(PhaseView::Pairing) && v.phase != PhaseView::Pairing {
                         dlg.qr_slot_left_pairing(v.slot, v.error.as_deref());
@@ -293,7 +299,11 @@ impl App {
                 self.render_status();
                 self.render_nearby();
             }
-            UiEvent::Stats { slot, stats } => self.cards[slot as usize - 1].update_stats(&stats),
+            UiEvent::Stats { slot, stats } => {
+                if let Some(card) = self.cards.get(slot as usize - 1) {
+                    card.update_stats(&stats);
+                }
+            }
             UiEvent::Nearby(list) => {
                 self.state.borrow_mut().nearby = list.clone();
                 self.render_nearby();
@@ -344,7 +354,7 @@ impl App {
             Some(e) => format!("mDNS discovery off ({e})"),
         };
         let online = st.slots.iter().flatten().filter(|v| v.phase == PhaseView::Online).count();
-        self.status.set_label(&format!("{adb}  ·  {disc}  ·  {online}/{MAX_SLOTS} connected"));
+        self.status.set_label(&format!("{adb}  ·  {disc}  ·  {online}/{} connected", self.cards.len()));
     }
 
     fn render_nearby(&self) {

@@ -1,5 +1,5 @@
 //! Device management: discovery routing, pairing, connection lifecycle,
-//! heartbeat and telemetry for up to five slots.
+//! heartbeat and telemetry for up to `general.max_slots` slots (default 4, at most 5).
 
 mod api;
 mod manager;

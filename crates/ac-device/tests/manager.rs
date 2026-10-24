@@ -21,7 +21,12 @@ fn phone(serial: &str, model: &str) -> MockDevice {
 }
 
 fn start(mock: &MockAdbHandle) -> ManagerHandle {
+    start_with(mock, |_| {})
+}
+
+fn start_with(mock: &MockAdbHandle, tweak: impl FnOnce(&mut Config)) -> ManagerHandle {
     let mut cfg = Config::default();
+    tweak(&mut cfg);
     cfg.general.adb_server = mock.addr;
     cfg.general.start_adb_server = false;
     cfg.connection.heartbeat_interval_ms = 250;
@@ -279,23 +284,39 @@ async fn adopts_existing_transports_and_respects_user_disconnect() {
 }
 
 #[tokio::test]
-async fn sixth_device_gets_no_slot() {
+async fn device_beyond_max_slots_gets_no_slot() {
     let mock = MockAdb::start().await;
     mock.with_state(|s| {
-        for i in 1..=6 {
+        for i in 1..=5 {
             s.connectable.insert(format!("192.168.1.{i}:5555"), phone(&format!("SER{i}"), &format!("Phone {i}")));
         }
     });
     let h = start(&mock);
-    for i in 1..=5u8 {
+    // Default `general.max_slots` is 4.
+    for i in 1..=4u8 {
         h.commands.send(UiCommand::Connect { slot: None, addr: format!("192.168.1.{i}") }).await.unwrap();
         wait_phase(&h, i, PhaseView::Online).await;
     }
-    h.commands.send(UiCommand::Connect { slot: None, addr: "192.168.1.6".into() }).await.unwrap();
+    h.commands.send(UiCommand::Connect { slot: None, addr: "192.168.1.5".into() }).await.unwrap();
     let msg = wait_for(&h, "toast", |e| match e {
         UiEvent::Toast { message, .. } => Some(message.clone()),
         _ => None,
     })
     .await;
-    assert_eq!(msg, "All 5 slots are in use");
+    assert_eq!(msg, "All 4 slots are in use");
+}
+
+#[tokio::test]
+async fn max_slots_five_allows_a_fifth_device() {
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        for i in 1..=5 {
+            s.connectable.insert(format!("192.168.1.{i}:5555"), phone(&format!("SER{i}"), &format!("Phone {i}")));
+        }
+    });
+    let h = start_with(&mock, |c| c.general.max_slots = 5);
+    for i in 1..=5u8 {
+        h.commands.send(UiCommand::Connect { slot: None, addr: format!("192.168.1.{i}") }).await.unwrap();
+        wait_phase(&h, i, PhaseView::Online).await;
+    }
 }
