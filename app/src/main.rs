@@ -1,6 +1,8 @@
+mod mirror;
 mod pairing;
 mod qr;
 mod slot_card;
+mod texture;
 mod window;
 
 use std::cell::RefCell;
@@ -37,7 +39,7 @@ fn main() -> glib::ExitCode {
     let slots = config.general.max_slots.clamp(1, ac_core::MAX_SLOTS as u8);
     let manager = {
         let _guard = runtime.enter();
-        ac_device::spawn(ac_device::ManagerOptions::new(config, paths))
+        ac_device::spawn(ac_device::ManagerOptions::new(config.clone(), paths))
     };
 
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -48,7 +50,7 @@ fn main() -> glib::ExitCode {
             return;
         }
         if let Some(m) = manager.borrow_mut().take() {
-            window::build(app, m, slots, config_error.clone());
+            window::build(app, m, &config, slots, config_error.clone());
         }
     });
     let code = app.run();

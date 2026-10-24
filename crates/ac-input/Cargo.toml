@@ -1,0 +1,10 @@
+[package]
+name = "ac-input"
+description = "Host → Android input mapping: keymap, meta state, letterbox coordinates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

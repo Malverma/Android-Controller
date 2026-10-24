@@ -1,0 +1,14 @@
+[package]
+name = "ac-media"
+description = "Video decoding (FFmpeg, VA-API dma-buf / copy / software) and frame mailboxes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ac-scrcpy.workspace = true
+ffmpeg-sys-next = { version = "9.0.1", default-features = false, features = ["avcodec"] }
+thiserror.workspace = true
+tracing.workspace = true

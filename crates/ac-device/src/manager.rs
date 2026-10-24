@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ac_adb::{AdbClient, ConnectOutcome, DeviceEntry, DeviceState, PairOutcome};
@@ -17,7 +18,9 @@ use tokio::task::JoinHandle;
 use crate::api::*;
 use crate::probe::{IDENTIFY_CMD, STATS_CMD, parse_identity, parse_stats};
 use crate::qr::QrSecret;
-use crate::slot::{DeviceInfo, Effect, PAIR_QR_TIMEOUT, Phase, Slot, SlotEvent, TimerKind};
+use crate::slot::{DeviceInfo, Effect, PAIR_QR_TIMEOUT, Phase, Slot, SlotEvent, StreamPhase, TimerKind};
+use crate::stream::{SessionHandle, SessionMsg, SlotIo, StreamEnv, server_params, spawn_session};
+use ac_media::MediaContext;
 
 /// Stale mDNS entries are kept this long so brief flaps don't flicker the UI.
 const NEARBY_GRACE: Duration = Duration::from_secs(30);
@@ -31,11 +34,15 @@ pub struct ManagerOptions {
     pub paths: Option<Paths>,
     pub discovery: bool,
     pub arp_table: PathBuf,
+    /// Mirror online devices with scrcpy-server (off in tests).
+    pub streaming: bool,
+    /// Decoding setup; created (with a VA-API probe) when `None`.
+    pub media: Option<Arc<MediaContext>>,
 }
 
 impl ManagerOptions {
     pub fn new(config: Config, paths: Option<Paths>) -> Self {
-        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into() }
+        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None }
     }
 }
 
@@ -44,6 +51,9 @@ pub struct ManagerHandle {
     pub events: async_channel::Receiver<UiEvent>,
     /// Lets tests inject discovery events.
     pub discovery_tx: mpsc::UnboundedSender<DiscoveryEvent>,
+    /// Per-slot frame mailbox and control channel, indexed by `slot - 1`.
+    pub io: Vec<Arc<SlotIo>>,
+    pub media: Option<Arc<MediaContext>>,
     task: JoinHandle<()>,
 }
 
@@ -62,6 +72,7 @@ enum Msg {
     Stats(SlotId, DeviceStats),
     Toast(Option<ErrorCode>, String),
     Prune,
+    Session(SessionMsg),
 }
 
 struct Nearby {
@@ -74,11 +85,36 @@ pub fn spawn(opts: ManagerOptions) -> ManagerHandle {
     let (ev_tx, ev_rx) = async_channel::unbounded();
     let (disc_tx, disc_rx) = mpsc::unbounded_channel();
     let discovery_tx = disc_tx.clone();
+    let n = opts.config.general.max_slots.clamp(1, MAX_SLOTS as u8) as usize;
+    let io: Vec<Arc<SlotIo>> = (0..n).map(|_| Arc::new(SlotIo::default())).collect();
+    let (stream, media) = if opts.streaming { stream_env(&opts) } else { (Err(String::new()), None) };
+    let handle_io = io.clone();
     let task = tokio::spawn(async move {
-        let mut m = Manager::new(opts, ev_tx);
+        let mut m = Manager::new(opts, ev_tx, stream, io);
         m.run(cmd_rx, disc_tx, disc_rx).await;
     });
-    ManagerHandle { commands: cmd_tx, events: ev_rx, discovery_tx, task }
+    ManagerHandle { commands: cmd_tx, events: ev_rx, discovery_tx, io: handle_io, media, task }
+}
+
+/// Checks scrcpy (spec §1.4 version coupling) and sets up decoding.
+fn stream_env(opts: &ManagerOptions) -> (Result<StreamEnv, String>, Option<Arc<MediaContext>>) {
+    let g = &opts.config.general;
+    let version = match ac_scrcpy::detect_version(&g.scrcpy_binary) {
+        Ok(v) if ac_scrcpy::is_compatible(&v) => v,
+        Ok(v) => return (Err(format!("Installed scrcpy {v} is not supported (need 4.x)")), None),
+        Err(e) => return (Err(format!("Mirroring unavailable: {e}")), None),
+    };
+    if !g.scrcpy_server.is_file() {
+        return (Err(format!("Mirroring unavailable: {} not found", g.scrcpy_server.display())), None);
+    }
+    let media = opts
+        .media
+        .clone()
+        .unwrap_or_else(|| Arc::new(MediaContext::new(&opts.config.video.decoder, &opts.config.video.vaapi_device)));
+    tracing::info!("scrcpy-server {version}, decoder {}", media.backend());
+    let adb = AdbClient::new(g.adb_server).with_timeout(Duration::from_secs(10));
+    let env = StreamEnv { adb, server_jar: g.scrcpy_server.clone(), server_version: version, media: media.clone() };
+    (Ok(env), Some(media))
 }
 
 struct Manager {
@@ -99,6 +135,13 @@ struct Manager {
     /// Device ids / adb serials the user disconnected: never auto-adopt or
     /// auto-connect them until the user connects again.
     suppressed: HashSet<String>,
+    /// `Err(reason)` when mirroring is unavailable.
+    stream_env: Result<StreamEnv, String>,
+    io: Vec<Arc<SlotIo>>,
+    sessions: Vec<Option<SessionHandle>>,
+    tile_px: Vec<Option<u32>>,
+    session_tx: mpsc::UnboundedSender<SessionMsg>,
+    session_rx: Option<mpsc::UnboundedReceiver<SessionMsg>>,
     /// Asks the Avahi browser to query the network again.
     rescan: Option<mpsc::UnboundedSender<ServiceKind>>,
     tx: mpsc::UnboundedSender<Msg>,
@@ -107,7 +150,12 @@ struct Manager {
 }
 
 impl Manager {
-    fn new(opts: ManagerOptions, ui: async_channel::Sender<UiEvent>) -> Self {
+    fn new(
+        opts: ManagerOptions,
+        ui: async_channel::Sender<UiEvent>,
+        stream_env: Result<StreamEnv, String>,
+        io: Vec<Arc<SlotIo>>,
+    ) -> Self {
         let devices = match &opts.paths {
             Some(p) => ac_config::load_devices(&p.devices).unwrap_or_else(|e| {
                 tracing::warn!("{e}; starting with no saved devices");
@@ -124,7 +172,11 @@ impl Manager {
             s.alias = rec.alias.clone();
             slots[rec.slot as usize - 1] = s;
         }
+        for s in &mut slots {
+            s.stream_enabled = stream_env.is_ok();
+        }
         let (tx, rx) = mpsc::unbounded_channel();
+        let (session_tx, session_rx) = mpsc::unbounded_channel();
         let adb = AdbClient::new(opts.config.general.adb_server)
             .with_timeout(Duration::from_millis(opts.config.connection.connect_timeout_ms.max(1000) * 2));
         Self {
@@ -142,6 +194,12 @@ impl Manager {
             adb_snapshot: Vec::new(),
             last_usb: Vec::new(),
             suppressed: HashSet::new(),
+            stream_env,
+            io,
+            sessions: (0..n).map(|_| None).collect(),
+            tile_px: vec![None; n as usize],
+            session_tx,
+            session_rx: Some(session_rx),
             rescan: None,
             tx,
             rx: Some(rx),
@@ -157,6 +215,13 @@ impl Manager {
         mut disc_rx: mpsc::UnboundedReceiver<DiscoveryEvent>,
     ) {
         let mut rx = self.rx.take().expect("run called once");
+        let mut session_rx = self.session_rx.take().expect("run called once");
+        if let Err(reason) = &self.stream_env
+            && !reason.is_empty()
+        {
+            tracing::warn!("{reason}");
+            self.toast(Some(ErrorCode::ServerIncompatible), reason.clone());
+        }
         let _tracker = tokio::spawn(track_devices(self.adb.clone(), self.cfg.clone(), self.tx.clone()));
         let _discovery = (self.discovery && self.cfg.discovery.avahi).then(|| {
             let (rescan, rescan_rx) = mpsc::unbounded_channel();
@@ -186,6 +251,7 @@ impl Manager {
                     Err(_) => return, // UI gone
                 },
                 Some(msg) = rx.recv() => self.on_msg(msg),
+                Some(msg) = session_rx.recv() => self.on_msg(Msg::Session(msg)),
                 Some(ev) = disc_rx.recv() => self.on_discovery(ev),
             }
             self.emit_changed();
@@ -239,6 +305,13 @@ impl Manager {
             error: match &s.phase {
                 Phase::Disconnected { error } => error.clone(),
                 _ => None,
+            },
+            stream: match (&self.stream_env, &s.phase, &s.stream) {
+                (Err(reason), Phase::Online { .. }, _) if !reason.is_empty() => StreamView::Unavailable(reason.clone()),
+                (_, Phase::Online { .. }, StreamPhase::Starting { .. }) => StreamView::Starting,
+                (_, Phase::Online { .. }, StreamPhase::Live { width, height }) => StreamView::Live { width: *width, height: *height },
+                (_, Phase::Online { .. }, StreamPhase::Failed { error }) => StreamView::Failed(error.clone()),
+                _ => StreamView::Off,
             },
         }
     }
@@ -362,6 +435,27 @@ impl Manager {
                 }
                 let (tx, c) = (self.tx.clone(), self.cfg.connection.clone());
                 self.monitors[i] = Some(tokio::spawn(monitor(adb, serial, shell_v2, slot, c, tx)));
+            }
+            Effect::StartStream { id, serial, profile, shell_v2 } => {
+                if let Some(old) = self.sessions[i].take() {
+                    old.stop();
+                }
+                match &self.stream_env {
+                    Ok(env) => {
+                        let params = server_params(&self.cfg, profile, self.tile_px[i], None);
+                        let io = self.io[i].clone();
+                        let h = spawn_session(env.clone(), serial, shell_v2, params, slot, id, io, self.session_tx.clone());
+                        self.sessions[i] = Some(h);
+                    }
+                    Err(reason) => {
+                        let _ = self.tx.send(Msg::Slot(slot, SlotEvent::StreamEnded { id, error: Some(reason.clone()) }));
+                    }
+                }
+            }
+            Effect::StopStream => {
+                if let Some(old) = self.sessions[i].take() {
+                    old.stop();
+                }
             }
             Effect::StopMonitor => {
                 if let Some(h) = self.monitors[i].take() {
@@ -587,6 +681,13 @@ impl Manager {
                     self.save_devices();
                 }
             }
+            UiCommand::SetProfile { slot, profile } => self.feed(slot, SlotEvent::SetProfile(profile)),
+            UiCommand::RestartStream { slot } => self.feed(slot, SlotEvent::RestartStream),
+            UiCommand::SetTileSize { slot, px } => {
+                if let Some(i) = self.idx(slot) {
+                    self.tile_px[i] = Some(px);
+                }
+            }
         }
     }
 
@@ -614,6 +715,8 @@ impl Manager {
             Msg::Ui(cmd) => self.on_ui(cmd),
             Msg::Slot(slot, SlotEvent::Identified(info)) => self.on_identified(slot, info),
             Msg::Slot(slot, ev) => self.feed(slot, ev),
+            Msg::Session(SessionMsg::Slot(slot, ev)) => self.feed(slot, ev),
+            Msg::Session(SessionMsg::DeviceClipboard(slot, text)) => self.send(UiEvent::DeviceClipboard { slot, text }),
             Msg::ConnectResult(slot, r) => {
                 let ok = r.is_ok();
                 self.feed(slot, SlotEvent::ConnectDone(r));

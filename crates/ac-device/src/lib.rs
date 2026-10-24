@@ -6,6 +6,9 @@ mod manager;
 pub mod probe;
 pub mod qr;
 pub mod slot;
+pub mod stream;
 
 pub use api::*;
 pub use manager::{ManagerHandle, ManagerOptions, normalize_addr, parse_inet, spawn};
+pub use slot::StreamProfile;
+pub use stream::SlotIo;

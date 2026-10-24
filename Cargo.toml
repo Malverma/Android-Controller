@@ -15,6 +15,9 @@ ac-config = { path = "crates/ac-config" }
 ac-adb = { path = "crates/ac-adb" }
 ac-discovery = { path = "crates/ac-discovery" }
 ac-device = { path = "crates/ac-device" }
+ac-scrcpy = { path = "crates/ac-scrcpy" }
+ac-input = { path = "crates/ac-input" }
+ac-media = { path = "crates/ac-media" }
 adb-mock = { path = "crates/adb-mock" }
 
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
@@ -31,7 +34,7 @@ rand = "0.9"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 qrcode = { version = "0.14", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_20"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 
 [profile.release]

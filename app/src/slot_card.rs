@@ -1,11 +1,11 @@
-//! One device slot in the dashboard. Milestone 2 replaces the placeholder
-//! phone frame with the live mirror.
+//! One device slot in the dashboard: header, live mirror (or a placeholder
+//! while not streaming), telemetry and actions.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use ac_core::{DeviceStats, SlotId, TransportKind};
-use ac_device::{PhaseView, SlotView};
+use ac_device::{PhaseView, SlotView, StreamView};
 use adw::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +15,8 @@ pub enum CardAction {
     Cancel,
     Disconnect,
     Forget,
+    Focus,
+    RetryStream,
 }
 
 pub struct SlotCard {
@@ -33,6 +35,11 @@ pub struct SlotCard {
     rtt: gtk::Label,
     primary: gtk::Button,
     forget: gtk::Button,
+    focus: gtk::Button,
+    retry: gtk::Button,
+    frame_stack: gtk::Stack,
+    pub picture: gtk::Picture,
+    video_info: gtk::Label,
     phase: Rc<Cell<PhaseView>>,
 }
 
@@ -43,7 +50,7 @@ fn dim_label(text: &str) -> gtk::Label {
 }
 
 impl SlotCard {
-    pub fn new(slot: SlotId, on_action: Rc<dyn Fn(SlotId, CardAction)>) -> Self {
+    pub fn new(slot: SlotId, on_action: Rc<dyn Fn(SlotId, CardAction)>, picture: gtk::Picture, video: gtk::Widget) -> Self {
         let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).hexpand(true).build();
         root.add_css_class("card");
         root.add_css_class("slot-card");
@@ -59,10 +66,14 @@ impl SlotCard {
         header.append(&number);
         header.append(&title);
         header.append(&badge);
+        let focus = gtk::Button::from_icon_name("view-fullscreen-symbolic");
+        focus.set_tooltip_text(Some("Focus this phone (Alt+F)"));
+        focus.add_css_class("flat");
+        focus.set_visible(false);
+        header.append(&focus);
 
-        // Placeholder for the mirror.
+        // The mirror, or a placeholder while not streaming.
         let frame = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).vexpand(true).valign(gtk::Align::Fill).build();
-        frame.add_css_class("phone-frame");
         let inner = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).vexpand(true).valign(gtk::Align::Center).build();
         let frame_icon = gtk::Image::from_icon_name("phone-symbolic");
         frame_icon.set_pixel_size(56);
@@ -72,7 +83,14 @@ impl SlotCard {
         inner.append(&frame_icon);
         inner.append(&spinner);
         inner.append(&status);
+        let retry = gtk::Button::builder().label("Retry mirroring").halign(gtk::Align::Center).visible(false).build();
+        inner.append(&retry);
         frame.append(&inner);
+        frame.add_css_class("phone-frame");
+        let frame_stack = gtk::Stack::builder().vexpand(true).transition_type(gtk::StackTransitionType::Crossfade).build();
+        frame_stack.add_named(&frame, Some("placeholder"));
+        video.add_css_class("video-frame");
+        frame_stack.add_named(&video, Some("video"));
 
         let detail = dim_label("");
         detail.add_css_class("caption");
@@ -85,9 +103,18 @@ impl SlotCard {
         let wifi_icon = gtk::Image::from_icon_name("network-wireless-signal-none-symbolic");
         wifi_icon.set_margin_start(8);
         let wifi = gtk::Label::new(None);
+        let video_info = dim_label("");
+        video_info.add_css_class("caption");
+        video_info.add_css_class("numeric");
         let rtt = gtk::Label::builder().hexpand(true).xalign(1.0).build();
         rtt.add_css_class("numeric");
-        for w in [battery_icon.upcast_ref::<gtk::Widget>(), battery.upcast_ref(), wifi_icon.upcast_ref(), wifi.upcast_ref(), rtt.upcast_ref()] {
+        for w in [
+            battery_icon.upcast_ref::<gtk::Widget>(),
+            battery.upcast_ref(),
+            wifi_icon.upcast_ref(),
+            wifi.upcast_ref(),
+            rtt.upcast_ref(),
+        ] {
             stats_row.append(w);
         }
         stats_row.set_visible(false);
@@ -115,11 +142,20 @@ impl SlotCard {
                 on_action(slot, action);
             });
         }
+        {
+            let on_action = on_action.clone();
+            focus.connect_clicked(move |_| on_action(slot, CardAction::Focus));
+        }
+        {
+            let on_action = on_action.clone();
+            retry.connect_clicked(move |_| on_action(slot, CardAction::RetryStream));
+        }
         forget.connect_clicked(move |_| on_action(slot, CardAction::Forget));
 
         root.append(&header);
-        root.append(&frame);
+        root.append(&frame_stack);
         root.append(&detail);
+        root.append(&video_info);
         root.append(&stats_row);
         root.append(&buttons);
 
@@ -139,6 +175,11 @@ impl SlotCard {
             rtt,
             primary,
             forget,
+            focus,
+            retry,
+            frame_stack,
+            picture,
+            video_info,
             phase,
         };
         card.update(&SlotView {
@@ -153,6 +194,7 @@ impl SlotCard {
             transport: TransportKind::Tls,
             detail: String::new(),
             error: None,
+            stream: StreamView::Off,
         });
         card
     }
@@ -169,7 +211,12 @@ impl SlotCard {
             ),
             PhaseView::Pairing => ("Pairing", "pairing", "Cancel", v.detail.clone()),
             PhaseView::Connecting => ("Connecting", "connecting", "Cancel", v.detail.clone()),
-            PhaseView::Online => ("Online", "online", "Disconnect", "Connected — mirroring arrives in Milestone 2".into()),
+            PhaseView::Online => ("Online", "online", "Disconnect", match &v.stream {
+                StreamView::Off | StreamView::Starting => "Starting mirroring…".into(),
+                StreamView::Live { .. } => String::new(),
+                StreamView::Failed(e) => format!("Mirroring failed: {e}"),
+                StreamView::Unavailable(e) => format!("Mirroring unavailable: {e}"),
+            }),
             PhaseView::Reconnecting => ("Reconnecting", "reconnecting", "Stop", v.detail.clone()),
         };
         for c in ["empty", "disconnected", "pairing", "connecting", "online", "reconnecting"] {
@@ -188,7 +235,24 @@ impl SlotCard {
         }
         self.forget.set_visible(v.device_id.is_some());
 
-        let busy = matches!(v.phase, PhaseView::Pairing | PhaseView::Connecting | PhaseView::Reconnecting);
+        let online = v.phase == PhaseView::Online;
+        let starting = online && matches!(v.stream, StreamView::Off | StreamView::Starting);
+        // Keep the last frame on screen across a restart (profile switch, rotation retry).
+        let show_video = online
+            && match v.stream {
+                StreamView::Live { .. } => true,
+                StreamView::Starting => self.picture.paintable().is_some(),
+                _ => false,
+            };
+        if !online {
+            self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
+        }
+        self.frame_stack.set_visible_child_name(if show_video { "video" } else { "placeholder" });
+        self.focus.set_visible(online && matches!(v.stream, StreamView::Live { .. } | StreamView::Starting));
+        self.retry.set_visible(online && matches!(v.stream, StreamView::Failed(_)));
+        self.video_info.set_visible(show_video);
+
+        let busy = starting || matches!(v.phase, PhaseView::Pairing | PhaseView::Connecting | PhaseView::Reconnecting);
         self.spinner.set_visible(busy);
         self.spinner.set_spinning(busy);
         self.frame_icon.set_opacity(if v.phase == PhaseView::Online { 1.0 } else { 0.5 });
@@ -212,6 +276,11 @@ impl SlotCard {
         if v.phase != PhaseView::Online {
             self.stats_row.set_visible(false);
         }
+    }
+
+    /// `fps · backend · lag` under the mirror, refreshed once a second.
+    pub fn set_video_info(&self, text: &str) {
+        self.video_info.set_label(text);
     }
 
     pub fn update_stats(&self, s: &DeviceStats) {

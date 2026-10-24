@@ -3,8 +3,10 @@
 //! effects and feeds results back as events, so every transition is unit
 //! testable without sockets.
 //!
-//! Milestone 1 ends at `Online` (ADB transport up and identified). Milestone 2
-//! inserts `PushingServer` and `Streaming` after it.
+//! `Online` means the ADB transport is up and identified. Mirroring runs as
+//! a sub-state of `Online` ([`StreamPhase`]): spec §3.3's `PushingServer` is
+//! `Starting`, `Streaming` is `Live`. Losing the transport always tears the
+//! stream down first.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -25,6 +27,29 @@ pub const AWAIT_ONLINE: Duration = Duration::from_secs(10);
 pub const AWAIT_AUTHORIZATION: Duration = Duration::from_secs(30);
 /// Legacy devices: start ARP re-resolution from this reconnect attempt on.
 pub const LEGACY_LOOKUP_FROM_ATTEMPT: u32 = 2;
+/// Stream launch retries before `E_SERVER_START` (§3.3.2 #14–15).
+pub const STREAM_RETRIES: u32 = 2;
+pub const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Which stream profile a slot runs (spec §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamProfile {
+    #[default]
+    Grid,
+    Focus,
+}
+
+/// Mirroring state while `Online`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StreamPhase {
+    #[default]
+    Off,
+    /// Pushing / launching / handshaking (`PushingServer`).
+    Starting { attempt: u32 },
+    /// Video is arriving (`Streaming`).
+    Live { width: u32, height: u32 },
+    Failed { error: String },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -100,6 +125,7 @@ pub enum TimerKind {
     PairDeadline,
     AwaitOnline,
     AwaitConnectService,
+    StreamRetry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +153,13 @@ pub enum SlotEvent {
     Timer { kind: TimerKind, generation: u64 },
     Disconnect,
     Forget,
+    /// Stream `id` produced its first session packet, or a new one (rotation).
+    StreamLive { id: u64, width: u32, height: u32 },
+    /// Stream `id` ended; `error` is `None` when it was stopped on purpose.
+    StreamEnded { id: u64, error: Option<String> },
+    SetProfile(StreamProfile),
+    /// User retry after `Failed`.
+    RestartStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +181,8 @@ pub enum Effect {
     Persist,
     Forget { id: String },
     Toast { code: ErrorCode, message: String },
+    StartStream { id: u64, serial: String, profile: StreamProfile, shell_v2: bool },
+    StopStream,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +202,11 @@ pub struct Slot {
     /// Device serial we expect from mDNS (pairing guid, or devices.toml).
     pub expect_serial: Option<String>,
     pub wifi_mac: Option<String>,
+    /// Mirroring is available (scrcpy-server found and compatible).
+    pub stream_enabled: bool,
+    pub stream: StreamPhase,
+    pub profile: StreamProfile,
+    stream_id: u64,
     /// Address to connect to once pairing succeeds (manual pairing).
     pair_connect: Option<String>,
     identify_inflight: bool,
@@ -186,6 +226,10 @@ impl Slot {
             adb_serial: None,
             expect_serial: None,
             wifi_mac: None,
+            stream_enabled: false,
+            stream: StreamPhase::Off,
+            profile: StreamProfile::Grid,
+            stream_id: 0,
             pair_connect: None,
             identify_inflight: false,
             generation: 0,
@@ -283,8 +327,33 @@ impl Slot {
     }
 
     fn enter_reconnecting(&mut self, cause: ReconnectCause, now: Instant, cfg: &Connection) -> Vec<Effect> {
+        let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
         self.set_phase(Phase::Reconnecting { attempt: 0, since: now, cause });
-        vec![Effect::StopMonitor, self.timer(TimerKind::Backoff, Self::backoff(cfg, 0))]
+        fx.extend([Effect::StopMonitor, self.timer(TimerKind::Backoff, Self::backoff(cfg, 0))]);
+        fx
+    }
+
+    /// Tears the stream down if one is running or starting.
+    fn stop_stream(&mut self) -> Option<Effect> {
+        let running = matches!(self.stream, StreamPhase::Starting { .. } | StreamPhase::Live { .. });
+        self.stream = StreamPhase::Off;
+        running.then_some(Effect::StopStream)
+    }
+
+    fn start_stream(&mut self, attempt: u32) -> Effect {
+        self.stream_id += 1;
+        self.stream = StreamPhase::Starting { attempt };
+        Effect::StartStream {
+            id: self.stream_id,
+            serial: self.adb_serial.clone().or_else(|| self.addr.clone()).unwrap_or_default(),
+            profile: self.profile,
+            shell_v2: self.device.as_ref().is_some_and(DeviceInfo::shell_v2),
+        }
+    }
+
+    /// The id of the stream currently starting or running.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
     }
 
     fn identify(&mut self, serial: String) -> Vec<Effect> {
@@ -506,10 +575,63 @@ impl Slot {
                 )
             }
 
+            // ---- streaming (while online) ----------------------------------------
+            (P::Online { .. }, E::StreamLive { id, width, height }) if id == self.stream_id => {
+                self.stream = StreamPhase::Live { width, height };
+                Vec::new()
+            }
+            (P::Online { .. }, E::StreamEnded { id, error }) if id == self.stream_id => match error {
+                None => {
+                    self.stream = StreamPhase::Off;
+                    Vec::new()
+                }
+                Some(error) => {
+                    let attempt = match self.stream {
+                        // A stream that was running restarts from scratch.
+                        StreamPhase::Live { .. } => 0,
+                        StreamPhase::Starting { attempt } => attempt + 1,
+                        _ => return Vec::new(),
+                    };
+                    if attempt > STREAM_RETRIES {
+                        self.stream = StreamPhase::Failed { error: error.clone() };
+                        return vec![Effect::Toast {
+                            code: ErrorCode::ServerStart,
+                            message: format!("Mirroring {} failed: {error}", self.display_name()),
+                        }];
+                    }
+                    self.stream = StreamPhase::Starting { attempt };
+                    vec![self.timer(TimerKind::StreamRetry, STREAM_RETRY_DELAY)]
+                }
+            },
+            (P::Online { .. }, E::Timer { kind: TimerKind::StreamRetry, generation })
+                if generation == self.generation && matches!(self.stream, StreamPhase::Starting { .. }) =>
+            {
+                let StreamPhase::Starting { attempt } = self.stream else { unreachable!() };
+                vec![self.start_stream(attempt)]
+            }
+            (phase, E::SetProfile(profile)) => {
+                if profile == self.profile {
+                    return Vec::new();
+                }
+                self.profile = profile;
+                let running = matches!(self.stream, StreamPhase::Starting { .. } | StreamPhase::Live { .. });
+                if matches!(phase, P::Online { .. }) && running {
+                    vec![Effect::StopStream, self.start_stream(0)]
+                } else {
+                    Vec::new()
+                }
+            }
+            (P::Online { .. }, E::RestartStream) if self.stream_enabled => {
+                let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+                fx.push(self.start_stream(0));
+                fx
+            }
+
             // ---- teardown ----------------------------------------------------------
             (P::Empty, E::Disconnect | E::Forget) => Vec::new(),
             (_, E::Disconnect) => {
-                let mut fx = vec![Effect::StopMonitor];
+                let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+                fx.push(Effect::StopMonitor);
                 fx.extend(self.disconnect_effect());
                 self.adb_serial = None;
                 let phase = if self.device_id().is_some() { P::Disconnected { error: None } } else { P::Empty };
@@ -517,13 +639,19 @@ impl Slot {
                 fx
             }
             (_, E::Forget) => {
-                let mut fx = vec![Effect::StopMonitor];
+                let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+                fx.push(Effect::StopMonitor);
                 fx.extend(self.disconnect_effect());
                 if let Some(id) = self.device_id() {
                     fx.push(Effect::Forget { id: id.to_owned() });
                 }
                 let id = self.id;
-                *self = Slot { generation: self.generation + 1, ..Slot::new(id) };
+                *self = Slot {
+                    generation: self.generation + 1,
+                    stream_enabled: self.stream_enabled,
+                    stream_id: self.stream_id,
+                    ..Slot::new(id)
+                };
                 fx
             }
 
@@ -563,7 +691,11 @@ impl Slot {
         self.expect_serial = Some(info.id.clone());
         self.device = Some(info);
         self.set_phase(Phase::Online { heartbeat_failures: 0 });
-        vec![Effect::StartMonitor { serial, shell_v2 }, Effect::Persist]
+        let mut fx = vec![Effect::StartMonitor { serial, shell_v2 }, Effect::Persist];
+        if self.stream_enabled {
+            fx.push(self.start_stream(0));
+        }
+        fx
     }
 
     pub fn display_name(&self) -> String {

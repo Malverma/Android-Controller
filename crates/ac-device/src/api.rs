@@ -28,6 +28,12 @@ pub enum UiCommand {
     Reconnect { slot: SlotId },
     Forget { slot: SlotId },
     Rename { slot: SlotId, alias: String },
+    /// Grid ⇄ focus (spec §4.4): restarts only this slot's stream.
+    SetProfile { slot: SlotId, profile: crate::StreamProfile },
+    /// Retry mirroring after it failed.
+    RestartStream { slot: SlotId },
+    /// Grid tile's longest side in device pixels, for `max_size = "auto"`.
+    SetTileSize { slot: SlotId, px: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +61,19 @@ pub struct SlotView {
     /// Human-readable sub-status ("attempt 3", "waiting for phone…").
     pub detail: String,
     pub error: Option<String>,
+    pub stream: StreamView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StreamView {
+    /// Not online, or mirroring not started.
+    #[default]
+    Off,
+    Starting,
+    Live { width: u32, height: u32 },
+    Failed(String),
+    /// scrcpy-server missing or incompatible.
+    Unavailable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,4 +105,6 @@ pub enum UiEvent {
     Toast { code: Option<ErrorCode>, message: String },
     AdbStatus { version: Option<u32>, error: Option<String> },
     DiscoveryStatus { available: bool, message: String },
+    /// The phone's clipboard changed (scrcpy clipboard autosync).
+    DeviceClipboard { slot: SlotId, text: String },
 }

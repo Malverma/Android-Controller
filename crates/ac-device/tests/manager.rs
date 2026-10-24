@@ -35,6 +35,7 @@ fn start_with(mock: &MockAdbHandle, tweak: impl FnOnce(&mut Config)) -> ManagerH
     cfg.connection.reconnect_jitter_pct = 0;
     let mut opts = ManagerOptions::new(cfg, None);
     opts.discovery = false;
+    opts.streaming = false; // the mock cannot run scrcpy-server
     ac_device::spawn(opts)
 }
 

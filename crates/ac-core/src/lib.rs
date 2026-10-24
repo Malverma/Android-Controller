@@ -30,6 +30,12 @@ pub enum ErrorCode {
     ConnectFailed,
     Unauthorized,
     ReconnectGaveUp,
+    ServerIncompatible,
+    ServerStart,
+    StreamInit,
+    Protocol,
+    Decoder,
+    ClipboardTruncated,
     AvahiMissing,
 }
 
@@ -43,6 +49,12 @@ impl ErrorCode {
             Self::ConnectFailed => "E_CONNECT_FAILED",
             Self::Unauthorized => "E_UNAUTHORIZED",
             Self::ReconnectGaveUp => "E_RECONNECT_GAVE_UP",
+            Self::ServerIncompatible => "E_SERVER_INCOMPATIBLE",
+            Self::ServerStart => "E_SERVER_START",
+            Self::StreamInit => "E_STREAM_INIT",
+            Self::Protocol => "E_PROTOCOL",
+            Self::Decoder => "E_DECODER",
+            Self::ClipboardTruncated => "W_CLIPBOARD_TRUNCATED",
             Self::AvahiMissing => "W_AVAHI_MISSING",
         }
     }

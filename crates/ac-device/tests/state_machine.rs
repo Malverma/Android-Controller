@@ -379,3 +379,120 @@ fn stale_timer_generations_are_ignored() {
     assert!(ev(&mut s, SlotEvent::Timer { kind, generation }).is_empty());
     assert!(matches!(s.phase, Phase::Online { .. }));
 }
+
+// ---- streaming (Online sub-state, §3.3.2 #13–16) ----------------------------
+
+fn streaming_slot() -> (Slot, u64) {
+    let mut s = Slot::new(1);
+    s.stream_enabled = true;
+    connect(&mut s, "10.0.0.7:37115");
+    ev(&mut s, SlotEvent::ConnectDone(Ok(())));
+    ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.7:37115".into(), state: DeviceState::Device });
+    let fx = ev(&mut s, SlotEvent::Identified(info("SER1")));
+    let id = fx
+        .iter()
+        .find_map(|f| match f {
+            Effect::StartStream { id, serial, profile, shell_v2 } => {
+                assert_eq!(serial, "10.0.0.7:37115");
+                assert_eq!(*profile, StreamProfile::Grid);
+                assert!(*shell_v2);
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("identified starts the stream");
+    assert_eq!(s.stream, StreamPhase::Starting { attempt: 0 });
+    (s, id)
+}
+
+#[test]
+fn t13_stream_starts_on_identify_and_goes_live() {
+    let (mut s, id) = streaming_slot();
+    assert!(ev(&mut s, SlotEvent::StreamLive { id, width: 720, height: 1440 }).is_empty());
+    assert_eq!(s.stream, StreamPhase::Live { width: 720, height: 1440 });
+    // Rotation: a new session size on the same stream.
+    ev(&mut s, SlotEvent::StreamLive { id, width: 1440, height: 720 });
+    assert_eq!(s.stream, StreamPhase::Live { width: 1440, height: 720 });
+    // Events from an older stream are ignored.
+    ev(&mut s, SlotEvent::StreamLive { id: id - 1, width: 1, height: 1 });
+    assert_eq!(s.stream, StreamPhase::Live { width: 1440, height: 720 });
+}
+
+#[test]
+fn stream_disabled_does_not_start() {
+    let mut s = Slot::new(1);
+    connect(&mut s, "10.0.0.7:37115");
+    ev(&mut s, SlotEvent::ConnectDone(Ok(())));
+    ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.7:37115".into(), state: DeviceState::Device });
+    let fx = ev(&mut s, SlotEvent::Identified(info("SER1")));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::StartStream { .. })));
+}
+
+#[test]
+fn t14_t15_launch_retries_twice_then_fails() {
+    let (mut s, mut id) = streaming_slot();
+    for attempt in 1..=STREAM_RETRIES {
+        let fx = ev(&mut s, SlotEvent::StreamEnded { id, error: Some("the server exited".into()) });
+        assert_eq!(s.stream, StreamPhase::Starting { attempt });
+        assert_eq!(current_timer(&fx).0, TimerKind::StreamRetry);
+        let fx = fire(&mut s, &fx);
+        let Some(Effect::StartStream { id: next, .. }) = fx.first() else { panic!("retry starts again: {fx:?}") };
+        assert!(*next > id);
+        id = *next;
+    }
+    let fx = ev(&mut s, SlotEvent::StreamEnded { id, error: Some("the server exited".into()) });
+    assert!(has_toast(&fx, ErrorCode::ServerStart));
+    assert!(matches!(&s.stream, StreamPhase::Failed { error } if error == "the server exited"));
+    assert!(matches!(s.phase, Phase::Online { .. }), "ADB stays up; only mirroring failed");
+
+    // The user retries.
+    let fx = ev(&mut s, SlotEvent::RestartStream);
+    assert!(matches!(fx.as_slice(), [Effect::StartStream { .. }]), "{fx:?}");
+}
+
+#[test]
+fn live_stream_ending_restarts_from_scratch() {
+    let (mut s, id) = streaming_slot();
+    ev(&mut s, SlotEvent::StreamLive { id, width: 720, height: 1440 });
+    let fx = ev(&mut s, SlotEvent::StreamEnded { id, error: Some("the video stream ended".into()) });
+    assert_eq!(s.stream, StreamPhase::Starting { attempt: 0 });
+    assert_eq!(current_timer(&fx).0, TimerKind::StreamRetry);
+    // A deliberate stop is not retried.
+    let (mut s, id) = streaming_slot();
+    assert!(ev(&mut s, SlotEvent::StreamEnded { id, error: None }).is_empty());
+    assert_eq!(s.stream, StreamPhase::Off);
+}
+
+#[test]
+fn t16_profile_change_restarts_only_a_running_stream() {
+    let (mut s, id) = streaming_slot();
+    ev(&mut s, SlotEvent::StreamLive { id, width: 720, height: 1440 });
+    let fx = ev(&mut s, SlotEvent::SetProfile(StreamProfile::Focus));
+    assert_eq!(fx[0], Effect::StopStream);
+    assert!(matches!(fx[1], Effect::StartStream { profile: StreamProfile::Focus, .. }));
+    assert!(ev(&mut s, SlotEvent::SetProfile(StreamProfile::Focus)).is_empty(), "no-op when unchanged");
+
+    // Not online: remembered for the next start.
+    let mut idle = Slot::new(2);
+    assert!(ev(&mut idle, SlotEvent::SetProfile(StreamProfile::Focus)).is_empty());
+    assert_eq!(idle.profile, StreamProfile::Focus);
+}
+
+#[test]
+fn t17_losing_the_transport_stops_the_stream() {
+    let (mut s, id) = streaming_slot();
+    ev(&mut s, SlotEvent::StreamLive { id, width: 720, height: 1440 });
+    let fx = ev(&mut s, SlotEvent::AdbGone { serial: "10.0.0.7:37115".into() });
+    assert_eq!(fx[0], Effect::StopStream);
+    assert_eq!(s.stream, StreamPhase::Off);
+    // A late end report from the stopped stream changes nothing.
+    assert!(ev(&mut s, SlotEvent::StreamEnded { id, error: Some("eof".into()) }).is_empty());
+
+    let (mut s, _) = streaming_slot();
+    let fx = ev(&mut s, SlotEvent::Disconnect);
+    assert_eq!(fx[0], Effect::StopStream);
+    let (mut s, _) = streaming_slot();
+    let fx = ev(&mut s, SlotEvent::Forget);
+    assert_eq!(fx[0], Effect::StopStream);
+    assert!(s.stream_enabled, "forgetting a device keeps the slot able to stream");
+}
