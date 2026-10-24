@@ -111,6 +111,8 @@ enum Msg {
     DirectLinked { slot: SlotId, conn: u64, result: Result<DirectLink, String> },
     /// The no-ADB link `conn` broke.
     DirectGone { slot: SlotId, conn: u64 },
+    /// The helper's touch control (accessibility service) came on or went off.
+    DirectInput { slot: SlotId, conn: u64, on: bool },
 }
 
 /// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
@@ -389,6 +391,14 @@ impl Manager {
                 _ => None,
             },
             stay_awake: self.stay_awake[i],
+            warning: match (&self.direct[i], &s.phase) {
+                (Some(l), Phase::Online { .. }) if !l.hello.input => Some(
+                    "Touch control is off on the phone, so it only shows the screen. On the phone open Wireless Debugging Keeper, \
+tap “Turn on touch control” and switch on “Android Controller touch control”."
+                        .into(),
+                ),
+                _ => None,
+            },
             stream: match (&self.stream_env, &s.phase, &s.stream) {
                 (Err(reason), Phase::Online { .. }, _) if !reason.is_empty() => StreamView::Unavailable(reason.clone()),
                 (_, Phase::Online { .. }, StreamPhase::Starting { .. }) => StreamView::Starting,
@@ -805,15 +815,6 @@ impl Manager {
         match result {
             Ok(l) => {
                 let addr = l.addr.to_string();
-                if !l.hello.input {
-                    self.toast(
-                        None,
-                        format!(
-                            "Touch control is off on {}: on the phone open Wireless Debugging Keeper and tap \"Turn on touch control\"",
-                            l.hello.model
-                        ),
-                    );
-                }
                 self.direct_pending[i] = 0;
                 self.direct[i] = Some(l);
                 self.feed(slot, SlotEvent::ConnectDone(Ok(())));
@@ -1231,6 +1232,15 @@ impl Manager {
             }
             Msg::DirectPaired { slot, addr, result } => self.on_direct_paired(slot, addr, result),
             Msg::DirectLinked { slot, conn, result } => self.on_direct_linked(slot, conn, result),
+            Msg::DirectInput { slot, conn, on } => {
+                let Some(i) = self.idx(slot) else { return };
+                let Some(l) = self.direct[i].as_mut().filter(|l| l.conn == conn) else { return };
+                l.hello.input = on;
+                if on {
+                    let msg = format!("Touch control is on for {}", l.hello.model);
+                    self.toast(None, msg);
+                }
+            }
             Msg::DirectGone { slot, conn } => {
                 let Some(i) = self.idx(slot) else { return };
                 if let Some(l) = self.direct[i].take_if(|l| l.conn == conn) {
@@ -1541,10 +1551,15 @@ async fn run_direct_link(
     let mut tick = tokio::time::interval(Duration::from_millis(cfg.heartbeat_interval_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline = Duration::from_millis(cfg.heartbeat_timeout_ms);
+    let mut input = link.hello.input;
     loop {
         tokio::select! {
             _ = tick.tick() => match link.ping(deadline).await {
                 Ok((pong, rtt)) => {
+                    if pong.input != input {
+                        input = pong.input;
+                        let _ = tx.send(Msg::DirectInput { slot, conn, on: input });
+                    }
                     let rtt_ms = rtt.as_millis() as u32;
                     let _ = tx.send(Msg::Slot(slot, SlotEvent::Heartbeat(Ok(rtt_ms))));
                     let stats = DeviceStats {

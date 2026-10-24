@@ -783,6 +783,7 @@ impl App {
             CardAction::SendFiles => self.pick_files(slot, false),
             CardAction::SendFolder => self.pick_files(slot, true),
             CardAction::CancelTransfers => self.send(UiCommand::CancelTransfers { slot }),
+            CardAction::Rename => self.ask_rename(slot),
             CardAction::Forget => {
                 let name = self.slot_view(slot).map(|v| v.title).unwrap_or_default();
                 let alert = adw::AlertDialog::new(
@@ -804,6 +805,27 @@ impl App {
                 alert.present(Some(&self.window));
             }
         }
+    }
+
+    /// Asks for a new name; an empty name goes back to the phone's model.
+    fn ask_rename(self: &Rc<Self>, slot: SlotId) {
+        let Some(v) = self.slot_view(slot) else { return };
+        let alert = adw::AlertDialog::new(Some("Rename phone"), Some("Leave empty to show the phone's model name."));
+        let entry = gtk::Entry::builder().text(&v.title).activates_default(true).build();
+        alert.set_extra_child(Some(&entry));
+        alert.add_response("cancel", "Cancel");
+        alert.add_response("rename", "Rename");
+        alert.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        alert.set_default_response(Some("rename"));
+        let weak = Rc::downgrade(self);
+        alert.connect_response(None, move |_, resp| {
+            if resp == "rename"
+                && let Some(app) = weak.upgrade()
+            {
+                app.send(UiCommand::Rename { slot, alias: entry.text().to_string() });
+            }
+        });
+        alert.present(Some(&self.window));
     }
 
     fn slot_view(&self, slot: SlotId) -> Option<SlotView> {

@@ -73,6 +73,8 @@ pub struct SlotView {
     pub error: Option<String>,
     /// "Keep screen on" while Online; `None` until read from the phone.
     pub stay_awake: Option<bool>,
+    /// Something the user should fix on the phone (e.g. touch control off).
+    pub warning: Option<String>,
     pub stream: StreamView,
 }
 

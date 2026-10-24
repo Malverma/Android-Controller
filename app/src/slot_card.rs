@@ -25,6 +25,7 @@ pub enum CardAction {
     SendFiles,
     SendFolder,
     CancelTransfers,
+    Rename,
 }
 
 pub struct SlotCard {
@@ -52,6 +53,8 @@ pub struct SlotCard {
     target_warning: gtk::Image,
     send: gtk::MenuButton,
     stay_awake: gtk::ToggleButton,
+    rename: gtk::Button,
+    warning: gtk::Label,
     /// Set while `update` moves the toggle, so it doesn't echo a command.
     syncing: Rc<Cell<bool>>,
     drop_hint: gtk::Label,
@@ -144,6 +147,15 @@ impl SlotCard {
                 }
             });
         }
+        let rename = gtk::Button::from_icon_name("document-edit-symbolic");
+        rename.set_tooltip_text(Some("Rename this phone"));
+        rename.add_css_class("flat");
+        rename.set_visible(false);
+        {
+            let on_action = on_action.clone();
+            rename.connect_clicked(move |_| on_action(slot, CardAction::Rename));
+        }
+        header.append(&rename);
         header.append(&stay_awake);
         header.append(&send);
         header.append(&focus);
@@ -205,6 +217,9 @@ impl SlotCard {
 
         let detail = dim_label("");
         detail.add_css_class("caption");
+        let warning = gtk::Label::builder().wrap(true).xalign(0.0).visible(false).build();
+        warning.add_css_class("caption");
+        warning.add_css_class("warning");
 
         // Telemetry.
         let stats_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -281,6 +296,7 @@ impl SlotCard {
         root.append(&header);
         root.append(&frame_overlay);
         root.append(&transfer_row);
+        root.append(&warning);
         root.append(&detail);
         root.append(&video_info);
         root.append(&stats_row);
@@ -311,6 +327,8 @@ impl SlotCard {
             target_warning,
             send,
             stay_awake,
+            rename,
+            warning,
             syncing,
             drop_hint,
             transfer_row,
@@ -332,6 +350,7 @@ impl SlotCard {
             detail: String::new(),
             error: None,
             stay_awake: None,
+            warning: None,
             stream: StreamView::Off,
         });
         card
@@ -373,6 +392,9 @@ impl SlotCard {
             self.primary.add_css_class("suggested-action");
         }
         self.forget.set_visible(v.device_id.is_some());
+        self.rename.set_visible(v.device_id.is_some() && v.phase != PhaseView::Empty);
+        self.warning.set_label(v.warning.as_deref().unwrap_or_default());
+        self.warning.set_visible(v.warning.is_some());
 
         let online = v.phase == PhaseView::Online;
         let starting = online && matches!(v.stream, StreamView::Off | StreamView::Starting);
