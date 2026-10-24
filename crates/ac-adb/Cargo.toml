@@ -1,0 +1,16 @@
+[package]
+name = "ac-adb"
+description = "Native client for the ADB server smart-socket protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+adb-mock.workspace = true

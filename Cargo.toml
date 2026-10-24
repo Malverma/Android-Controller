@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Malverma/Android-Controller"
+
+[workspace.dependencies]
+ac-core = { path = "crates/ac-core" }
+ac-config = { path = "crates/ac-config" }
+ac-adb = { path = "crates/ac-adb" }
+ac-discovery = { path = "crates/ac-discovery" }
+ac-device = { path = "crates/ac-device" }
+adb-mock = { path = "crates/adb-mock" }
+
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+async-channel = "2.5"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+directories = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+anyhow = "1"
+rand = "0.9"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+qrcode = { version = "0.14", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+strip = "debuginfo"

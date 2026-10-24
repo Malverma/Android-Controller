@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Android Controller
+Comment=Mirror and control Android phones over Wi-Fi
+Exec=android-controller
+Icon=phone
+Terminal=false
+Categories=Utility;GTK;
+Keywords=android;adb;scrcpy;mirror;phone;
+StartupNotify=true

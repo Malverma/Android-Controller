@@ -1,0 +1,17 @@
+[package]
+name = "ac-discovery"
+description = "mDNS discovery of Android wireless-debugging services (Avahi), LAN filtering, ARP lookup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+zbus.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

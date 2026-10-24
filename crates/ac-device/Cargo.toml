@@ -1,0 +1,22 @@
+[package]
+name = "ac-device"
+description = "Device manager: per-slot connection state machine, pairing, heartbeat, stats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ac-core.workspace = true
+ac-config.workspace = true
+ac-adb.workspace = true
+ac-discovery.workspace = true
+tokio = { workspace = true, features = ["process"] }
+async-channel.workspace = true
+tracing.workspace = true
+rand.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+adb-mock.workspace = true

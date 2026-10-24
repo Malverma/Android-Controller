@@ -1,0 +1,4 @@
+post_install() {
+  echo ">> Enable mDNS discovery: sudo systemctl enable --now avahi-daemon.service"
+}
+post_upgrade() { post_install; }

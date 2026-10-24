@@ -1,0 +1,12 @@
+[package]
+name = "adb-mock"
+description = "In-process fake ADB server for integration tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true

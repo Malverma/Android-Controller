@@ -1,0 +1,43 @@
+# Local build from this repository: cd packaging/arch && makepkg -si
+# Builds the last *committed* state (git+file:// source).
+pkgname=android-controller
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Mirror and control up to five Android phones over Wi-Fi (GTK4)"
+url='https://github.com/Malverma/Android-Controller'
+arch=('x86_64' 'aarch64')
+license=('Apache-2.0')
+depends=('gtk4' 'libadwaita' 'glib2' 'android-tools' 'scrcpy' 'avahi' 'dbus' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+optdepends=('nss-mdns: resolve .local hostnames')
+install=android-controller.install
+options=('!lto')
+source=("$pkgname::git+file://$(realpath "$startdir/../..")")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  CARGO_TARGET_DIR=target cargo build --frozen --release --package android-controller
+}
+
+check() {
+  cd "$pkgname"
+  CARGO_TARGET_DIR=target cargo test --frozen --release --workspace --exclude android-controller
+}
+
+package() {
+  cd "$pkgname"
+  local appid=org.androidcontroller.AndroidController
+  install -Dm755 target/release/android-controller "$pkgdir/usr/bin/android-controller"
+  install -Dm644 "data/$appid.desktop" "$pkgdir/usr/share/applications/$appid.desktop"
+}
