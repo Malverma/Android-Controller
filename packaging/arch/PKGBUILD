@@ -1,7 +1,7 @@
 # Local build from this repository: cd packaging/arch && makepkg -si
 # Builds the last *committed* state (git+file:// source).
 pkgname=android-controller
-pkgver=0.1.0
+pkgver=0.1.0.r2.gf9fb8fa
 pkgrel=1
 pkgdesc="Mirror and control up to five Android phones over Wi-Fi (GTK4)"
 url='https://github.com/Malverma/Android-Controller'
@@ -11,7 +11,7 @@ depends=('gtk4' 'libadwaita' 'glib2' 'android-tools' 'scrcpy' 'avahi' 'dbus' 'gc
 makedepends=('cargo' 'git')
 optdepends=('nss-mdns: resolve .local hostnames')
 install=android-controller.install
-options=('!lto')
+options=('!lto' '!debug')  # debug remap flags break on paths with spaces
 source=("$pkgname::git+file://$(realpath "$startdir/../..")")
 sha256sums=('SKIP')
 
