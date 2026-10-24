@@ -19,6 +19,8 @@ use gtk::gdk;
 use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
 
+use crate::broadcast::Broadcast;
+
 /// A host-side action bound to a mouse button or toolbar button (the
 /// `input.right_click` … `input.button9` values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,8 @@ pub struct SlotInput {
     pub slot: SlotId,
     pub io: Arc<SlotIo>,
     prefs: Rc<InputPrefs>,
+    /// Fans input out to the other selected phones while broadcast is on.
+    broadcast: Rc<Broadcast>,
     /// Android keycode → repeat count, for keys sent DOWN and not yet UP.
     pressed: RefCell<HashMap<u32, u32>>,
     /// Called when a mirror of this slot takes keyboard focus.
@@ -87,13 +91,19 @@ pub struct SlotInput {
 }
 
 impl SlotInput {
-    pub fn new(slot: SlotId, io: Arc<SlotIo>, prefs: Rc<InputPrefs>, on_activate: Rc<dyn Fn(SlotId)>) -> Rc<Self> {
-        Rc::new(Self { slot, io, prefs, pressed: RefCell::default(), on_activate })
+    pub fn new(
+        slot: SlotId,
+        io: Arc<SlotIo>,
+        prefs: Rc<InputPrefs>,
+        broadcast: Rc<Broadcast>,
+        on_activate: Rc<dyn Fn(SlotId)>,
+    ) -> Rc<Self> {
+        Rc::new(Self { slot, io, prefs, broadcast, pressed: RefCell::default(), on_activate })
     }
 
     fn send(&self, msg: ControlMsg) {
         tracing::debug!(target: "input", slot = self.slot, ?msg);
-        self.io.send(msg);
+        self.broadcast.send(self.slot, msg);
     }
 
     pub fn key(&self, action: KeyAction, keycode: u32, metastate: u32) {
@@ -156,9 +166,9 @@ fn mirrored(lb: &Letterbox, (x, y): (i32, i32)) -> (i32, i32) {
     (lb.frame_w as i32 - 1 - x, lb.frame_h as i32 - 1 - y)
 }
 
-/// Builds the picture (wrapped for graphics offload) and attaches input.
-/// Returns `(picture, widget to place)`.
-pub fn new_mirror(input: &Rc<SlotInput>) -> (gtk::Picture, gtk::Widget) {
+/// Builds the picture (wrapped for graphics offload, spec §2.4 step 6) and
+/// attaches input. Returns `(picture, widget to place)`.
+pub fn new_mirror(input: &Rc<SlotInput>, offload: bool) -> (gtk::Picture, gtk::Widget) {
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
@@ -171,9 +181,10 @@ pub fn new_mirror(input: &Rc<SlotInput>) -> (gtk::Picture, gtk::Widget) {
     attach_pointer(&w, input);
     attach_scroll(&w, input);
     attach_keys(&w, input);
-    let offload = gtk::GraphicsOffload::new(Some(&picture));
-    offload.set_black_background(true);
-    (picture, offload.upcast())
+    let wrapper = gtk::GraphicsOffload::new(Some(&picture));
+    wrapper.set_black_background(true);
+    wrapper.set_enabled(if offload { gtk::GraphicsOffloadEnabled::Enabled } else { gtk::GraphicsOffloadEnabled::Disabled });
+    (picture, wrapper.upcast())
 }
 
 fn attach_pointer(w: &gtk::Widget, input: &Rc<SlotInput>) {

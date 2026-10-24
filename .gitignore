@@ -4,3 +4,6 @@
 /packaging/arch/pkg/
 /packaging/arch/android-controller/
 /packaging/arch/*.pkg.tar.*
+
+# Android helper build output
+android-helper/build/

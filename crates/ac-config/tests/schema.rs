@@ -149,3 +149,36 @@ fn missing_files_give_defaults() {
     assert_eq!(load_config(&dir.join("config.toml")).unwrap(), Config::default());
     assert!(load_devices(&dir.join("devices.toml")).unwrap().devices.is_empty());
 }
+
+#[test]
+fn state_round_trip_and_normalize() {
+    // The spec §7.6 example.
+    let text = r#"
+schema_version = 1
+window = { width = 1680, height = 960, maximized = false }
+view = "focus"
+focused_slot = 2
+broadcast = { enabled = false, targets = [1, 2, 3] }
+last_pair_tab = "qr"
+"#;
+    let dir = std::env::temp_dir().join(format!("ac-state-test-{}", std::process::id()));
+    let path = dir.join("state.toml");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, text).unwrap();
+    let mut st = load_state(&path).unwrap();
+    assert_eq!((st.window.width, st.window.height), (1680, 960));
+    assert_eq!((st.view.as_str(), st.focused_slot), ("focus", 2));
+    assert_eq!(st.broadcast.targets, vec![1, 2, 3]);
+
+    st.broadcast.targets = vec![5, 1, 1, 9];
+    st.normalize(4);
+    assert_eq!(st.broadcast.targets, vec![1]);
+    st.focused_slot = 5;
+    st.normalize(4);
+    assert_eq!((st.view.as_str(), st.focused_slot), ("grid", 0), "focused slot beyond max_slots");
+
+    save_state(&path, &st).unwrap();
+    assert_eq!(load_state(&path).unwrap(), st);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(load_state(Path::new("/nonexistent/state.toml")).unwrap(), AppState::default());
+}

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ac_adb::AdbClient;
-use ac_config::{Config, MaxSize, Profile};
+use ac_config::{Config, DeviceRecord, MaxSize, Profile};
 use ac_core::SlotId;
 use ac_media::{Backend, Mailbox, MediaContext, StreamEvents};
 use ac_scrcpy::{ControlMsg, DeviceMsg, ServerParams, VideoCodec};
@@ -24,6 +24,16 @@ pub struct SlotIo {
     pub mailbox: Mailbox,
     control: Mutex<Option<mpsc::UnboundedSender<ControlMsg>>>,
     backend: Mutex<Option<Backend>>,
+    info: Mutex<Option<StreamInfo>>,
+}
+
+/// What the running session asked the phone for (shown in the status strip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub codec: VideoCodec,
+    pub max_size: u32,
+    pub bit_rate: u32,
+    pub max_fps: u32,
 }
 
 impl SlotIo {
@@ -39,6 +49,11 @@ impl SlotIo {
     /// Backend decoding this slot's stream, while it runs.
     pub fn backend(&self) -> Option<Backend> {
         *self.backend.lock().unwrap()
+    }
+
+    /// Parameters of the running session.
+    pub fn info(&self) -> Option<StreamInfo> {
+        *self.info.lock().unwrap()
     }
 }
 
@@ -57,21 +72,40 @@ pub struct StreamEnv {
     pub media: Arc<MediaContext>,
 }
 
-/// Launch parameters for a profile (spec §4.3). `tile_px` is the grid
-/// tile's longest side in device pixels, for `max_size = "auto"`.
-pub fn server_params(cfg: &Config, profile: StreamProfile, tile_px: Option<u32>, bitrate_kbps: Option<u32>) -> ServerParams {
+/// The `[profiles.*]` table a slot runs, with the device's
+/// `profile_overrides` for it applied (spec §7.4). An override that does not
+/// fit the schema is reported and ignored.
+pub fn resolve_profile(cfg: &Config, profile: StreamProfile, record: Option<&DeviceRecord>) -> (Profile, Option<String>) {
     let name = match profile {
         StreamProfile::Grid => &cfg.video.grid_profile,
         StreamProfile::Focus => &cfg.video.focus_profile,
     };
-    let p: Profile = cfg.profiles.get(name).cloned().unwrap_or_default();
-    let max_size = match p.max_size {
+    let base = cfg.profiles.get(name).cloned().unwrap_or_default();
+    match record.map(|r| r.profile(name, &base)) {
+        None => (base, None),
+        Some(Ok(p)) => (p, None),
+        Some(Err(e)) => {
+            let who = record.map(|r| r.display_name().to_owned()).unwrap_or_default();
+            (base, Some(format!("Ignoring {who}'s profile_overrides.{name}: {}", e.message())))
+        }
+    }
+}
+
+/// `max_size` for a profile: fixed, or for `"auto"` the grid tile's longest
+/// side in device pixels, rounded up to 16 and clamped (spec §4.3).
+pub fn max_size_for(p: &Profile, tile_px: Option<u32>) -> u32 {
+    match p.max_size {
         MaxSize::Px(px) => px,
         MaxSize::Auto(_) => {
             let px = tile_px.unwrap_or(p.max_size_max);
             px.div_ceil(16).saturating_mul(16).clamp(p.max_size_min, p.max_size_max)
         }
-    };
+    }
+}
+
+/// Launch parameters for a resolved profile (spec §4.3).
+pub fn server_params(cfg: &Config, p: &Profile, tile_px: Option<u32>, bitrate_kbps: Option<u32>) -> ServerParams {
+    let max_size = max_size_for(p, tile_px);
     let codec = match p.codec.as_str() {
         "h265" => VideoCodec::H265,
         "av1" => VideoCodec::Av1,
@@ -201,6 +235,12 @@ async fn run_session(
     let (read_half, write_half) = launched.control.into_split();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     *io.control.lock().unwrap() = Some(ctl_tx);
+    *io.info.lock().unwrap() = Some(StreamInfo {
+        codec: params.codec,
+        max_size: params.max_size,
+        bit_rate: params.bit_rate,
+        max_fps: params.max_fps,
+    });
     let mut writer = tokio::spawn(control_writer(write_half, ctl_rx));
     let mut reader = tokio::spawn(control_reader(read_half, slot, tx.clone()));
 
@@ -219,6 +259,7 @@ async fn run_session(
     // Teardown (spec §3.5): sockets, server, forward.
     *io.control.lock().unwrap() = None;
     *io.backend.lock().unwrap() = None;
+    *io.info.lock().unwrap() = None;
     if let Some(v) = video_shutdown {
         let _ = v.shutdown(Shutdown::Both);
     }
@@ -361,14 +402,79 @@ mod tests {
     #[test]
     fn auto_max_size_follows_the_tile() {
         let cfg = Config::default();
-        let p = server_params(&cfg, StreamProfile::Grid, Some(700), None);
+        let grid = resolve_profile(&cfg, StreamProfile::Grid, None).0;
+        let p = server_params(&cfg, &grid, Some(700), None);
         assert_eq!(p.max_size, 704, "rounded up to 16");
-        assert_eq!(server_params(&cfg, StreamProfile::Grid, Some(100), None).max_size, 640, "min");
-        assert_eq!(server_params(&cfg, StreamProfile::Grid, Some(4000), None).max_size, 1280, "max");
-        assert_eq!(server_params(&cfg, StreamProfile::Grid, None, None).max_size, 1280);
-        let f = server_params(&cfg, StreamProfile::Focus, None, None);
+        assert_eq!(server_params(&cfg, &grid, Some(100), None).max_size, 640, "min");
+        assert_eq!(server_params(&cfg, &grid, Some(4000), None).max_size, 1280, "max");
+        assert_eq!(server_params(&cfg, &grid, None, None).max_size, 1280);
+        let focus = resolve_profile(&cfg, StreamProfile::Focus, None).0;
+        let f = server_params(&cfg, &focus, None, None);
         assert_eq!((f.max_size, f.bit_rate, f.max_fps), (1920, 12_000_000, 60));
         assert_eq!(f.codec, VideoCodec::H264);
-        assert_eq!(server_params(&cfg, StreamProfile::Grid, None, Some(1800)).bit_rate, 1_800_000);
+        assert_eq!(server_params(&cfg, &grid, None, Some(1800)).bit_rate, 1_800_000);
+    }
+
+    #[test]
+    fn per_device_profile_overrides() {
+        let cfg = Config::default();
+        let mut rec = DeviceRecord::new("SER1", ac_core::TransportKind::Tls, chrono::Utc::now());
+        rec.profile_overrides.insert("grid".into(), toml::toml! { bitrate_kbps = 2000 });
+        rec.profile_overrides.insert("focus".into(), toml::toml! { codec = "h264"
+            max_fps = 45 });
+        let (grid, err) = resolve_profile(&cfg, StreamProfile::Grid, Some(&rec));
+        assert!(err.is_none());
+        assert_eq!(grid.bitrate_kbps, 2000);
+        assert_eq!(grid.max_fps, 30, "untouched keys keep the profile's value");
+        let (focus, _) = resolve_profile(&cfg, StreamProfile::Focus, Some(&rec));
+        assert_eq!((focus.codec.as_str(), focus.max_fps, focus.bitrate_kbps), ("h264", 45, 12000));
+
+        // A device without overrides, and a broken override.
+        assert_eq!(resolve_profile(&cfg, StreamProfile::Grid, None).0, cfg.profiles["grid"]);
+        rec.profile_overrides.insert("grid".into(), toml::toml! { bitrate_kbps = "fast" });
+        let (grid, err) = resolve_profile(&cfg, StreamProfile::Grid, Some(&rec));
+        assert_eq!(grid, cfg.profiles["grid"]);
+        assert!(err.unwrap().contains("profile_overrides.grid"));
+    }
+
+    #[test]
+    fn coalescing_never_drops_down_or_up_under_a_flood() {
+        // Spec §9 M3: 10 000 events, DOWN/UP never dropped, order kept.
+        let f = POINTER_GENERIC_FINGER;
+        let mut batch = Vec::new();
+        let mut expected_edges = Vec::new();
+        for i in 0..10_000 {
+            let action = match i % 50 {
+                0 => MotionAction::Down,
+                49 => MotionAction::Up,
+                _ => MotionAction::Move,
+            };
+            if action != MotionAction::Move {
+                expected_edges.push((action, i));
+            }
+            let id = if i % 7 == 0 { POINTER_MOUSE } else { f };
+            let id = if action == MotionAction::Move { id } else { f };
+            batch.push(touch(action, id, i));
+        }
+        coalesce_moves(&mut batch);
+        let edges: Vec<_> = batch
+            .iter()
+            .filter_map(|m| match m {
+                ControlMsg::InjectTouch { action, position, .. } if *action != MotionAction::Move => Some((*action, position.x)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edges, expected_edges);
+        // Each stroke keeps at most one finger move (the last before UP).
+        let finger_moves = batch.iter().filter(|m| m.coalescible_move() == Some(f)).count();
+        assert!(finger_moves <= 200, "{finger_moves}");
+        let xs: Vec<i32> = batch
+            .iter()
+            .map(|m| match m {
+                ControlMsg::InjectTouch { position, .. } => position.x,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(xs.windows(2).all(|w| w[0] < w[1]), "order preserved");
     }
 }

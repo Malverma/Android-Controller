@@ -15,6 +15,7 @@ ac-discovery.workspace = true
 ac-input.workspace = true
 ac-media.workspace = true
 ac-scrcpy.workspace = true
+ac-transfer.workspace = true
 gtk.workspace = true
 adw.workspace = true
 tokio.workspace = true

@@ -111,6 +111,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SyncSession<S> {
         Ok(sent)
     }
 
+    /// Starts a `SEND`; follow with [`Self::send_data`] and [`Self::send_done`].
+    pub async fn send_start(&mut self, path: &str, mode: u32) -> Result<(), AdbError> {
+        check_path(path)?;
+        let header = format!("{path},{mode}");
+        self.stream.write_all(&encode(b"SEND", header.as_bytes())).await?;
+        Ok(())
+    }
+
+    /// Writes `data` as `DATA` packets of at most [`SYNC_DATA_MAX`] bytes.
+    pub async fn send_data(&mut self, data: &[u8]) -> Result<(), AdbError> {
+        for chunk in data.chunks(SYNC_DATA_MAX) {
+            let mut hdr = [0u8; 8];
+            hdr[..4].copy_from_slice(b"DATA");
+            hdr[4..].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+            self.stream.write_all(&hdr).await?;
+            self.stream.write_all(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Ends a `SEND` and waits for adbd's verdict.
+    pub async fn send_done(&mut self, mtime: u32) -> Result<(), AdbError> {
+        let mut done = [0u8; 8];
+        done[..4].copy_from_slice(b"DONE");
+        done[4..].copy_from_slice(&mtime.to_le_bytes());
+        self.stream.write_all(&done).await?;
+        self.stream.flush().await?;
+        self.read_okay().await
+    }
+
     async fn read_okay(&mut self) -> Result<(), AdbError> {
         let mut header = [0u8; 8];
         self.stream.read_exact(&mut header).await?;

@@ -1,0 +1,10 @@
+[package]
+name = "ac-transfer"
+description = "File transfer planning: segments, remote naming, APK detection, rate limiting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

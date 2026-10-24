@@ -3,6 +3,7 @@
 
 mod config;
 mod devices;
+mod state;
 mod validate;
 
 use std::fs;
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 pub use config::*;
 pub use devices::{DeviceRecord, Devices};
+pub use state::{AppState, BroadcastState, WindowState};
 pub use validate::{ValidationError, validate};
 
 const APP_DIR: &str = "android-controller";
@@ -32,6 +34,7 @@ pub struct Paths {
     pub config: PathBuf,
     pub devices: PathBuf,
     pub state_dir: PathBuf,
+    pub state: PathBuf,
 }
 
 impl Paths {
@@ -52,6 +55,7 @@ impl Paths {
             config: config_dir.join("config.toml"),
             devices: config_dir.join("devices.toml"),
             state_dir: state_dir.to_path_buf(),
+            state: state_dir.join("state.toml"),
         }
     }
 }
@@ -99,6 +103,22 @@ pub fn load_devices(path: &Path) -> Result<Devices, ConfigError> {
     check_schema(path, devices.schema_version)?;
     devices.normalize();
     Ok(devices)
+}
+
+/// Loads `state.toml`. It is only a convenience, so anything unreadable
+/// yields the defaults (logged by the caller).
+pub fn load_state(path: &Path) -> Result<AppState, ConfigError> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(AppState::default());
+    };
+    let state: AppState = toml::from_str(&text).map_err(|source| ConfigError::Parse { path: path.into(), source })?;
+    check_schema(path, state.schema_version)?;
+    Ok(state)
+}
+
+pub fn save_state(path: &Path, state: &AppState) -> Result<(), ConfigError> {
+    let text = toml::to_string_pretty(state).expect("AppState serializes");
+    write_atomic(path, text.as_bytes())
 }
 
 pub fn save_config(path: &Path, cfg: &Config) -> Result<(), ConfigError> {

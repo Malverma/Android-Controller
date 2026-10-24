@@ -34,6 +34,12 @@ pub enum UiCommand {
     RestartStream { slot: SlotId },
     /// Grid tile's longest side in device pixels, for `max_size = "auto"`.
     SetTileSize { slot: SlotId, px: u32 },
+    /// Send files and folders to each slot's phone (spec §5). APKs at the top
+    /// level are installed when `install_apks`, copied otherwise.
+    SendFiles { slots: Vec<SlotId>, paths: Vec<std::path::PathBuf>, install_apks: bool },
+    CancelTransfers { slot: SlotId },
+    /// Keep the phone's screen on (never time out) or restore its timeout.
+    SetStayAwake { slot: SlotId, on: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,8 @@ pub struct SlotView {
     /// Human-readable sub-status ("attempt 3", "waiting for phone…").
     pub detail: String,
     pub error: Option<String>,
+    /// "Keep screen on" while Online; `None` until read from the phone.
+    pub stay_awake: Option<bool>,
     pub stream: StreamView,
 }
 
@@ -107,4 +115,27 @@ pub enum UiEvent {
     DiscoveryStatus { available: bool, message: String },
     /// The phone's clipboard changed (scrcpy clipboard autosync).
     DeviceClipboard { slot: SlotId, text: String },
+    /// A slot's transfer progress, ~4 Hz while active and once when it ends.
+    Transfer(TransferView),
+}
+
+/// Aggregate progress of one slot's queued transfers (spec §5.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferView {
+    pub slot: SlotId,
+    /// False once everything finished or was cancelled.
+    pub active: bool,
+    /// File being sent (the most recently started one).
+    pub file: String,
+    pub installing: bool,
+    /// 1-based position among `count` files.
+    pub index: u32,
+    pub count: u32,
+    pub sent: u64,
+    pub total: u64,
+    pub rate_bps: u64,
+    /// `None` for the first 2 s and while stalled.
+    pub eta_s: Option<u64>,
+    /// Paused until the phone reconnects.
+    pub waiting: bool,
 }

@@ -1,3 +1,6 @@
+mod broadcast;
+mod dnd;
+mod grid_layout;
 mod mirror;
 mod pairing;
 mod qr;
@@ -37,6 +40,16 @@ fn main() -> glib::ExitCode {
         .build()
         .expect("failed to start the tokio runtime");
     let slots = config.general.max_slots.clamp(1, ac_core::MAX_SLOTS as u8);
+    let state_path = paths.as_ref().map(|p| p.state.clone());
+    let mut state = match state_path.as_deref().map(ac_config::load_state) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            tracing::warn!("{e}; using the default window state");
+            ac_config::AppState::default()
+        }
+        None => ac_config::AppState::default(),
+    };
+    state.normalize(slots);
     let manager = {
         let _guard = runtime.enter();
         ac_device::spawn(ac_device::ManagerOptions::new(config.clone(), paths))
@@ -50,7 +63,8 @@ fn main() -> glib::ExitCode {
             return;
         }
         if let Some(m) = manager.borrow_mut().take() {
-            window::build(app, m, &config, slots, config_error.clone());
+            let restore = window::Restore { state: state.clone(), path: state_path.clone() };
+            window::build(app, m, &config, slots, config_error.clone(), restore);
         }
     });
     let code = app.run();

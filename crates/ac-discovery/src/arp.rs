@@ -37,6 +37,11 @@ pub fn find_ip_by_mac(arp_table: &str, mac: &str) -> Option<Ipv4Addr> {
     parse_arp_table(arp_table).into_iter().find(|(_, m, _)| *m == want).map(|(ip, _, _)| ip)
 }
 
+/// The MAC the kernel has for `ip` (the reverse of [`find_ip_by_mac`]).
+pub fn find_mac_by_ip(arp_table: &str, ip: Ipv4Addr) -> Option<String> {
+    parse_arp_table(arp_table).into_iter().find(|(i, _, _)| *i == ip).map(|(_, m, _)| m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +60,8 @@ IP address       HW type     Flags       HW address            Mask     Device
         assert_eq!(find_ip_by_mac(TABLE, "a6-3b-91-0c-4e-12"), Some("192.168.1.57".parse().unwrap()));
         assert_eq!(find_ip_by_mac(TABLE, "11:22:33:44:55:66"), None);
         assert_eq!(find_ip_by_mac(TABLE, "garbage"), None);
+        assert_eq!(find_mac_by_ip(TABLE, "192.168.1.57".parse().unwrap()).as_deref(), Some("a6:3b:91:0c:4e:12"));
+        assert_eq!(find_mac_by_ip(TABLE, "192.168.1.99".parse().unwrap()), None, "incomplete entry");
     }
 
     #[test]

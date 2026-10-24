@@ -14,6 +14,8 @@ ac-adb.workspace = true
 ac-discovery.workspace = true
 ac-scrcpy.workspace = true
 ac-media.workspace = true
+ac-transfer.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["process"] }
 async-channel.workspace = true
 tracing.workspace = true
@@ -22,3 +24,4 @@ chrono.workspace = true
 
 [dev-dependencies]
 adb-mock.workspace = true
+toml.workspace = true

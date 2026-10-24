@@ -18,14 +18,28 @@ use tokio::task::JoinHandle;
 use crate::api::*;
 use crate::probe::{IDENTIFY_CMD, STATS_CMD, parse_identity, parse_stats};
 use crate::qr::QrSecret;
-use crate::slot::{DeviceInfo, Effect, PAIR_QR_TIMEOUT, Phase, Slot, SlotEvent, StreamPhase, TimerKind};
-use crate::stream::{SessionHandle, SessionMsg, SlotIo, StreamEnv, server_params, spawn_session};
+use crate::slot::{DeviceInfo, Effect, PAIR_QR_TIMEOUT, Phase, Slot, SlotEvent, StreamPhase, StreamProfile, TimerKind};
+use crate::transfer::{Link, Transfers};
+use crate::stream::{SessionHandle, SessionMsg, SlotIo, StreamEnv, max_size_for, resolve_profile, server_params, spawn_session};
 use ac_media::MediaContext;
+
+/// Phone-side copy of the user's screen timeout while "keep screen on" is
+/// active. Living on the phone, it survives app crashes and restarts.
+const STAY_AWAKE_FILE: &str = "/data/local/tmp/android-controller-screen-timeout";
+/// `Integer.MAX_VALUE` ms: the screen never times out.
+const STAY_AWAKE_TIMEOUT: u32 = i32::MAX as u32;
+
+/// How often a given-up `adb tcpip` phone is checked for being back (it
+/// does not announce itself over mDNS, so nothing else would notice).
+const LEGACY_PROBE_EVERY: Duration = Duration::from_secs(30);
 
 /// Stale mDNS entries are kept this long so brief flaps don't flicker the UI.
 const NEARBY_GRACE: Duration = Duration::from_secs(30);
 /// Run the stats command every N heartbeats.
 const STATS_EVERY: u32 = 5;
+/// A grid `max_size: auto` change restarts the stream only past this
+/// fraction of the running value (spec §4.3 hysteresis).
+const TILE_RESTART_RATIO: f64 = 0.25;
 
 #[derive(Debug, Clone)]
 pub struct ManagerOptions {
@@ -73,6 +87,10 @@ enum Msg {
     Toast(Option<ErrorCode>, String),
     Prune,
     Session(SessionMsg),
+    /// "Keep screen on" state read from or set on the phone `device_id`.
+    StayAwake { slot: SlotId, device_id: String, on: Option<bool> },
+    /// A disconnected slot's `adb tcpip` port accepts connections again.
+    LegacyAlive { slot: SlotId, addr: String },
 }
 
 struct Nearby {
@@ -140,6 +158,8 @@ struct Manager {
     io: Vec<Arc<SlotIo>>,
     sessions: Vec<Option<SessionHandle>>,
     tile_px: Vec<Option<u32>>,
+    /// `max_size` of a running grid session whose profile says `"auto"`.
+    auto_max_size: Vec<Option<u32>>,
     session_tx: mpsc::UnboundedSender<SessionMsg>,
     session_rx: Option<mpsc::UnboundedReceiver<SessionMsg>>,
     /// Asks the Avahi browser to query the network again.
@@ -147,6 +167,12 @@ struct Manager {
     tx: mpsc::UnboundedSender<Msg>,
     rx: Option<mpsc::UnboundedReceiver<Msg>>,
     ui: async_channel::Sender<UiEvent>,
+    transfers: Transfers,
+    /// Per slot: "keep screen on" (`None` = not known yet) and whether a
+    /// query or change is in flight.
+    stay_awake: Vec<Option<bool>>,
+    stay_awake_busy: Vec<bool>,
+    last_legacy_probe: Instant,
 }
 
 impl Manager {
@@ -195,16 +221,21 @@ impl Manager {
             last_usb: Vec::new(),
             suppressed: HashSet::new(),
             stream_env,
-            io,
             sessions: (0..n).map(|_| None).collect(),
             tile_px: vec![None; n as usize],
+            auto_max_size: vec![None; n as usize],
             session_tx,
             session_rx: Some(session_rx),
             rescan: None,
             tx,
             rx: Some(rx),
+            transfers: Transfers::new(opts.config.transfer.clone(), opts.config.general.adb_server, io.clone(), ui.clone()),
+            io,
             ui,
             cfg: opts.config,
+            stay_awake: vec![None; n as usize],
+            stay_awake_busy: vec![false; n as usize],
+            last_legacy_probe: Instant::now(),
         }
     }
 
@@ -306,6 +337,7 @@ impl Manager {
                 Phase::Disconnected { error } => error.clone(),
                 _ => None,
             },
+            stay_awake: self.stay_awake[i],
             stream: match (&self.stream_env, &s.phase, &s.stream) {
                 (Err(reason), Phase::Online { .. }, _) if !reason.is_empty() => StreamView::Unavailable(reason.clone()),
                 (_, Phase::Online { .. }, StreamPhase::Starting { .. }) => StreamView::Starting,
@@ -322,6 +354,25 @@ impl Manager {
     }
 
     fn emit_changed(&mut self) {
+        for i in 0..self.slots.len() {
+            if !matches!(self.slots[i].phase, Phase::Online { .. }) {
+                self.stay_awake[i] = None;
+            } else if self.stay_awake[i].is_none() && !self.stay_awake_busy[i] {
+                self.run_stay_awake(i, None);
+            }
+        }
+        for (i, s) in self.slots.iter().enumerate() {
+            let link = match (&s.phase, &s.adb_serial, &s.device) {
+                (Phase::Online { .. }, Some(serial), Some(d)) => Some(Link {
+                    serial: serial.clone(),
+                    device_id: d.id.clone(),
+                    shell_v2: d.shell_v2(),
+                    sdk: d.sdk,
+                }),
+                _ => None,
+            };
+            self.transfers.set_link(i as SlotId + 1, link);
+        }
         for i in 0..self.slots.len() {
             let v = self.view(i);
             if self.views[i].as_ref() != Some(&v) {
@@ -427,7 +478,8 @@ impl Manager {
             }
             Effect::Identify { serial } => {
                 let low_latency = self.cfg.connection.phone_low_latency_wifi;
-                self.spawn_msg(async move { Msg::Slot(slot, identify(&adb, &serial, low_latency).await) });
+                let arp = self.arp_table.clone();
+                self.spawn_msg(async move { Msg::Slot(slot, identify(&adb, &serial, low_latency, &arp).await) });
             }
             Effect::StartMonitor { serial, shell_v2 } => {
                 if let Some(h) = self.monitors[i].take() {
@@ -440,9 +492,19 @@ impl Manager {
                 if let Some(old) = self.sessions[i].take() {
                     old.stop();
                 }
+                self.auto_max_size[i] = None;
                 match &self.stream_env {
                     Ok(env) => {
-                        let params = server_params(&self.cfg, profile, self.tile_px[i], None);
+                        let record = self.slots[i].device_id().and_then(|id| self.devices.get(id));
+                        let (p, err) = resolve_profile(&self.cfg, profile, record);
+                        if let Some(err) = err {
+                            tracing::warn!(slot, "{err}");
+                            self.toast(None, err);
+                        }
+                        let params = server_params(&self.cfg, &p, self.tile_px[i], None);
+                        if profile == StreamProfile::Grid && matches!(p.max_size, ac_config::MaxSize::Auto(_)) {
+                            self.auto_max_size[i] = Some(params.max_size);
+                        }
                         let io = self.io[i].clone();
                         let h = spawn_session(env.clone(), serial, shell_v2, params, slot, id, io, self.session_tx.clone());
                         self.sessions[i] = Some(h);
@@ -453,6 +515,7 @@ impl Manager {
                 }
             }
             Effect::StopStream => {
+                self.auto_max_size[i] = None;
                 if let Some(old) = self.sessions[i].take() {
                     old.stop();
                 }
@@ -508,6 +571,62 @@ impl Manager {
             }
             Effect::Toast { code, message } => self.toast(Some(code), message),
         }
+    }
+
+    /// Checks the `adb tcpip` port of remembered phones the reconnect loop gave
+    /// up on, and reconnects the ones that answer (spec §3.5 legacy transports).
+    fn probe_legacy(&self) {
+        if !self.cfg.discovery.auto_connect_known {
+            return;
+        }
+        for s in &self.slots {
+            let Phase::Disconnected { .. } = s.phase else { continue };
+            let Some(id) = s.device_id() else { continue };
+            if self.suppressed.contains(id) || self.devices.get(id).is_some_and(|r| !r.auto_connect) {
+                continue;
+            }
+            let addr = match (&s.legacy_addr, s.transport, &s.addr) {
+                (Some(a), _, _) => a.clone(),
+                (None, TransportKind::Legacy, Some(a)) => a.clone(),
+                _ => continue,
+            };
+            if self.suppressed.contains(&addr) {
+                continue;
+            }
+            let Ok(sock) = addr.parse::<SocketAddr>() else { continue };
+            let slot = s.id;
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let open = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(sock)).await;
+                if matches!(open, Ok(Ok(_))) {
+                    let _ = tx.send(Msg::LegacyAlive { slot, addr });
+                }
+            });
+        }
+    }
+
+    /// Reads (`set = None`) or changes the phone's "keep screen on" state.
+    fn run_stay_awake(&mut self, i: usize, set: Option<bool>) {
+        let s = &self.slots[i];
+        let (Some(serial), Some(d)) = (s.adb_serial.clone(), s.device.as_ref()) else { return };
+        let (slot, device_id, shell_v2) = (s.id, d.id.clone(), d.shell_v2());
+        let cmd = stay_awake_cmd(set);
+        self.stay_awake_busy[i] = true;
+        let adb = self.adb.clone();
+        self.spawn_msg(async move {
+            let on = match adb.shell(&serial, &cmd, shell_v2).await {
+                Ok(out) if out.stdout.lines().any(|l| l.trim() == "@ok") => Some(out.stdout.lines().any(|l| l.trim() == "@on")),
+                Ok(out) => {
+                    tracing::warn!(slot, "keep screen on: {}{}", out.stdout, out.stderr);
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(slot, "keep screen on: {e}");
+                    None
+                }
+            };
+            Msg::StayAwake { slot, device_id, on }
+        });
     }
 
     fn rescan(&self, kind: ServiceKind) {
@@ -670,7 +789,10 @@ impl Manager {
                 self.suppressed.remove(&addr);
                 self.feed(slot, SlotEvent::Connect { addr, transport, expect_serial: expect, silent: false });
             }
-            UiCommand::Forget { slot } => self.feed(slot, SlotEvent::Forget),
+            UiCommand::Forget { slot } => {
+                self.transfers.cancel(slot);
+                self.feed(slot, SlotEvent::Forget);
+            }
             UiCommand::Rename { slot, alias } => {
                 let Some(i) = self.idx(slot) else { return };
                 self.slots[i].alias = alias.trim().to_owned();
@@ -683,9 +805,41 @@ impl Manager {
             }
             UiCommand::SetProfile { slot, profile } => self.feed(slot, SlotEvent::SetProfile(profile)),
             UiCommand::RestartStream { slot } => self.feed(slot, SlotEvent::RestartStream),
+            UiCommand::SendFiles { slots, paths, install_apks } => {
+                for slot in slots {
+                    let Some(i) = self.idx(slot) else { continue };
+                    let s = &self.slots[i];
+                    match (&s.phase, s.device.as_ref()) {
+                        (Phase::Online { .. }, Some(d)) => {
+                            let title = self.views[i].as_ref().map_or_else(|| s.display_name(), |v| v.title.clone());
+                            self.transfers.submit(slot, d.id.clone(), title, paths.clone(), install_apks);
+                        }
+                        _ => self.toast(None, format!("Slot {slot} has no connected phone")),
+                    }
+                }
+            }
+            UiCommand::CancelTransfers { slot } => self.transfers.cancel(slot),
+            UiCommand::SetStayAwake { slot, on } => {
+                if let Some(i) = self.idx(slot)
+                    && matches!(self.slots[i].phase, Phase::Online { .. })
+                {
+                    self.run_stay_awake(i, Some(on));
+                }
+            }
             UiCommand::SetTileSize { slot, px } => {
-                if let Some(i) = self.idx(slot) {
-                    self.tile_px[i] = Some(px);
+                let Some(i) = self.idx(slot) else { return };
+                self.tile_px[i] = Some(px);
+                // Restart a live grid stream only for a big change (spec §4.3);
+                // the UI sends this once the window has been still for 1 s.
+                let Some(running) = self.auto_max_size[i] else { return };
+                if !matches!(self.slots[i].stream, StreamPhase::Live { .. }) {
+                    return;
+                }
+                let record = self.slots[i].device_id().and_then(|id| self.devices.get(id));
+                let want = max_size_for(&resolve_profile(&self.cfg, StreamProfile::Grid, record).0, Some(px));
+                if tile_change_needs_restart(running, want) {
+                    tracing::info!(slot, running, want, "grid tile resized; restarting the stream");
+                    self.feed(slot, SlotEvent::RestartStream);
                 }
             }
         }
@@ -752,9 +906,34 @@ impl Manager {
             Msg::AdbStatus(version, error) => self.send(UiEvent::AdbStatus { version, error }),
             Msg::Stats(slot, stats) => self.send(UiEvent::Stats { slot, stats }),
             Msg::Toast(code, message) => self.toast(code, message),
+            Msg::StayAwake { slot, device_id, on } => {
+                let Some(i) = self.idx(slot) else { return };
+                self.stay_awake_busy[i] = false;
+                // Ignore answers about a phone that has since left the slot.
+                if self.slots[i].device_id() == Some(device_id.as_str()) && matches!(self.slots[i].phase, Phase::Online { .. }) {
+                    if on.is_none() {
+                        self.toast(None, "Could not change the phone's screen timeout");
+                    }
+                    // Unknown after a failure: show "off" rather than re-querying in a loop.
+                    self.stay_awake[i] = Some(on.unwrap_or(false));
+                }
+            }
             Msg::Prune => {
                 let now = Instant::now();
                 self.nearby.retain(|_, n| n.stale_since.is_none_or(|t| now.duration_since(t) < NEARBY_GRACE));
+                if now.duration_since(self.last_legacy_probe) >= LEGACY_PROBE_EVERY {
+                    self.last_legacy_probe = now;
+                    self.probe_legacy();
+                }
+            }
+            Msg::LegacyAlive { slot, addr } => {
+                let Some(i) = self.idx(slot) else { return };
+                let s = &self.slots[i];
+                if matches!(s.phase, Phase::Disconnected { .. }) && s.device_id().is_some() {
+                    tracing::info!(slot, "{addr} answers again; reconnecting");
+                    let expect = s.device_id().map(str::to_owned);
+                    self.feed(slot, SlotEvent::Connect { addr, transport: TransportKind::Legacy, expect_serial: expect, silent: true });
+                }
             }
         }
     }
@@ -804,6 +983,30 @@ impl Manager {
             if self.slots[i].device_id().is_none() {
                 self.slots[i] = Slot::new(slot);
             }
+            return;
+        }
+        // The same phone is being reconnected in another slot (e.g. its
+        // wireless-debugging port died and it came back on `adb tcpip`): hand
+        // this transport to that slot instead of showing the phone twice.
+        if let Some(j) = self.slots.iter().position(|s| {
+            s.id != slot
+                && matches!(s.phase, Phase::Reconnecting { .. } | Phase::ConnectingAdb { .. })
+                && s.device_id() == Some(info.id.as_str())
+        }) && let Some(serial) = self.slots[i].adb_serial.clone()
+        {
+            if let Some(h) = self.timers[i].take() {
+                h.abort();
+            }
+            self.slots[i] = Slot::new(slot);
+            let target = &mut self.slots[j];
+            if serial.ends_with(":5555") {
+                target.legacy_addr = Some(serial.clone());
+            } else {
+                target.addr = Some(serial.clone());
+            }
+            let owner = target.id;
+            tracing::info!(slot = owner, "{} came back as {serial}", info.model);
+            self.feed(owner, SlotEvent::AdbState { serial, state: DeviceState::Device });
             return;
         }
         // The phone moves here from a remembered (inactive) slot.
@@ -882,12 +1085,35 @@ impl Manager {
 
 // ---- free functions running on worker tasks -------------------------------------------
 
+/// Shell command that reads (`None`) or sets "keep screen on". Prints `@on`
+/// when it is on afterwards, and always ends with `@ok`.
+fn stay_awake_cmd(set: Option<bool>) -> String {
+    let f = STAY_AWAKE_FILE;
+    match set {
+        None => format!("[ -e {f} ] && echo @on; echo @ok"),
+        // Save the user's timeout once, then never time out; wake the screen.
+        Some(true) => format!(
+            "[ -e {f} ] || settings get system screen_off_timeout > {f}; \
+             settings put system screen_off_timeout {STAY_AWAKE_TIMEOUT} && input keyevent KEYCODE_WAKEUP && echo @on; echo @ok"
+        ),
+        // Restore it (Android's 1-minute default if the copy is missing).
+        Some(false) => format!(
+            "v=$(cat {f} 2>/dev/null); case \"$v\" in ''|*[!0-9]*) v=60000;; esac; \
+             settings put system screen_off_timeout $v && rm -f {f}; [ -e {f} ] && echo @on; echo @ok"
+        ),
+    }
+}
+
 async fn connect(adb: &AdbClient, addr: &str) -> Result<(), String> {
     match adb.connect_device(addr).await {
         Ok(ConnectOutcome::Connected | ConnectOutcome::AlreadyConnected) => Ok(()),
         Ok(ConnectOutcome::Failed(m)) => Err(m),
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn tile_change_needs_restart(running: u32, want: u32) -> bool {
+    running > 0 && (want as f64 - running as f64).abs() / running as f64 > TILE_RESTART_RATIO
 }
 
 /// Digits only, spaces allowed (`482 913`).
@@ -905,7 +1131,7 @@ fn connect_addr_for(pair: SocketAddr, typed: &str) -> Option<String> {
     typed.parse::<SocketAddr>().ok().map(|a| a.to_string())
 }
 
-async fn identify(adb: &AdbClient, serial: &str, low_latency_wifi: bool) -> SlotEvent {
+async fn identify(adb: &AdbClient, serial: &str, low_latency_wifi: bool, arp_table: &std::path::Path) -> SlotEvent {
     let features = match adb.features(serial).await {
         Ok(f) => f,
         Err(e) => return SlotEvent::IdentifyFailed(e.to_string()),
@@ -928,7 +1154,18 @@ async fn identify(adb: &AdbClient, serial: &str, low_latency_wifi: bool) -> Slot
         manufacturer: id.manufacturer,
         sdk: id.sdk,
         features,
-        wifi_mac: id.wifi_mac,
+        wifi_mac: match id.wifi_mac {
+            Some(mac) => Some(mac),
+            // Android 11+ hides the MAC from the shell; the host's neighbour
+            // table knows it for a phone reached over Wi-Fi.
+            None => match serial.parse::<SocketAddr>() {
+                Ok(SocketAddr::V4(a)) => tokio::fs::read_to_string(arp_table)
+                    .await
+                    .ok()
+                    .and_then(|t| ac_discovery::find_mac_by_ip(&t, *a.ip())),
+                _ => None,
+            },
+        },
     })
 }
 
@@ -1058,6 +1295,30 @@ mod tests {
         let out = "30: wlan0    inet 192.168.1.57/24 brd 192.168.1.255 scope global wlan0\\       valid_lft forever";
         assert_eq!(parse_inet(out), Some("192.168.1.57".parse().unwrap()));
         assert_eq!(parse_inet(""), None);
+    }
+
+    #[test]
+    fn stay_awake_commands() {
+        let f = "/data/local/tmp/android-controller-screen-timeout";
+        assert_eq!(stay_awake_cmd(None), format!("[ -e {f} ] && echo @on; echo @ok"));
+        assert_eq!(
+            stay_awake_cmd(Some(true)),
+            format!("[ -e {f} ] || settings get system screen_off_timeout > {f}; settings put system screen_off_timeout 2147483647 && input keyevent KEYCODE_WAKEUP && echo @on; echo @ok")
+        );
+        assert_eq!(
+            stay_awake_cmd(Some(false)),
+            format!("v=$(cat {f} 2>/dev/null); case \"$v\" in ''|*[!0-9]*) v=60000;; esac; settings put system screen_off_timeout $v && rm -f {f}; [ -e {f} ] && echo @on; echo @ok")
+        );
+    }
+
+    #[test]
+    fn tile_hysteresis() {
+        assert!(!tile_change_needs_restart(1280, 1280));
+        assert!(!tile_change_needs_restart(1280, 1000), "22 % smaller");
+        assert!(tile_change_needs_restart(1280, 944), "26 % smaller");
+        assert!(!tile_change_needs_restart(640, 800), "exactly 25 % larger");
+        assert!(tile_change_needs_restart(640, 816));
+        assert!(!tile_change_needs_restart(0, 640));
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! Host → Android input mapping (spec §4.5, §4.7, §4.8). Pure functions over
+//! Host → Android input mapping (spec §4.5, §4.7, §4.8, §4.10). Pure functions over
 //! GDK keyvals and modifier bits, so this crate needs no GTK.
 
+pub mod broadcast;
 pub mod keymap;
 pub mod letterbox;
 pub mod meta;

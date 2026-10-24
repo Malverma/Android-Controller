@@ -199,6 +199,10 @@ pub struct Slot {
     pub addr: Option<String>,
     /// Current adb transport serial (`ip:port` or mDNS form).
     pub adb_serial: Option<String>,
+    /// The phone's `adb tcpip` address while it is reached another way
+    /// (wireless debugging also came up): retried with every reconnect, since
+    /// the wireless-debugging port dies whenever Wi-Fi drops.
+    pub legacy_addr: Option<String>,
     /// Device serial we expect from mDNS (pairing guid, or devices.toml).
     pub expect_serial: Option<String>,
     pub wifi_mac: Option<String>,
@@ -224,6 +228,7 @@ impl Slot {
             transport: TransportKind::Tls,
             addr: None,
             adb_serial: None,
+            legacy_addr: None,
             expect_serial: None,
             wifi_mac: None,
             stream_enabled: false,
@@ -272,7 +277,10 @@ impl Slot {
 
     /// Does an adb transport with this serial belong to this slot?
     pub fn wants_adb_serial(&self, serial: &str) -> bool {
-        if self.adb_serial.as_deref() == Some(serial) || self.addr.as_deref() == Some(serial) {
+        if self.adb_serial.as_deref() == Some(serial)
+            || self.addr.as_deref() == Some(serial)
+            || self.legacy_addr.as_deref() == Some(serial)
+        {
             return true;
         }
         let Some(mdns_serial) = serial_from_instance(serial) else { return false };
@@ -316,6 +324,7 @@ impl Slot {
     }
 
     fn start_connect(&mut self, addr: String, transport: TransportKind, expect_serial: Option<String>, silent: bool) -> Vec<Effect> {
+        self.remember_legacy(&addr, transport);
         self.addr = Some(addr.clone());
         self.adb_serial = None;
         self.transport = transport;
@@ -324,6 +333,19 @@ impl Slot {
         }
         self.set_phase(Phase::ConnectingAdb { attempt: 0, connected: false, silent, unauthorized_warned: false });
         vec![Effect::Connect { addr }]
+    }
+
+    /// Keeps the `adb tcpip` address when switching to a different one.
+    fn remember_legacy(&mut self, new_addr: &str, new_transport: TransportKind) {
+        if self.transport == TransportKind::Legacy
+            && new_transport != TransportKind::Legacy
+            && let Some(old) = self.addr.clone().filter(|a| a != new_addr)
+        {
+            self.legacy_addr = Some(old);
+        }
+        if new_transport == TransportKind::Legacy {
+            self.legacy_addr = None;
+        }
     }
 
     fn enter_reconnecting(&mut self, cause: ReconnectCause, now: Instant, cfg: &Connection) -> Vec<Effect> {
@@ -463,6 +485,12 @@ impl Slot {
                 self.start_connect(addr.to_string(), TransportKind::Tls, expect, silent)
             }
             (P::ConnectingAdb { .. } | P::Reconnecting { .. }, E::AdbState { serial, state: DeviceState::Device }) => {
+                if self.legacy_addr.as_deref() == Some(serial.as_str()) {
+                    // The `adb tcpip` port answered first: use it from now on.
+                    self.legacy_addr = None;
+                    self.addr = Some(serial.clone());
+                    self.transport = TransportKind::Legacy;
+                }
                 self.identify(serial)
             }
             (P::ConnectingAdb { attempt, silent, unauthorized_warned: false, .. }, E::AdbState { state: DeviceState::Unauthorized, .. }) => {
@@ -515,6 +543,9 @@ impl Slot {
                 if let Some(addr) = self.addr.clone() {
                     fx.push(Effect::Reconnect { addr });
                 }
+                if let Some(legacy) = self.legacy_addr.clone() {
+                    fx.push(Effect::Connect { addr: legacy });
+                }
                 if self.transport == TransportKind::Tls {
                     // The port may have changed; only a fresh mDNS answer tells us.
                     fx.push(Effect::RescanConnect);
@@ -537,6 +568,8 @@ impl Slot {
                 {
                     fx.push(Effect::Disconnect { serial });
                 }
+                self.remember_legacy(&addr, TransportKind::Tls);
+                self.transport = TransportKind::Tls;
                 self.addr = Some(addr.clone());
                 self.adb_serial = Some(addr.clone());
                 fx.push(Effect::Connect { addr });

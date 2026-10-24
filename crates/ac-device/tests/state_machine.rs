@@ -496,3 +496,34 @@ fn t17_losing_the_transport_stops_the_stream() {
     assert_eq!(fx[0], Effect::StopStream);
     assert!(s.stream_enabled, "forgetting a device keeps the slot able to stream");
 }
+
+/// A legacy (`adb tcpip`) phone that also comes up on wireless debugging,
+/// then loses that port when Wi-Fi drops: the 5555 address is still retried.
+#[test]
+fn t19c_tcpip_address_is_kept_and_retried_after_tls() {
+    let mut s = Slot::new(1);
+    ev(&mut s, SlotEvent::Connect { addr: "10.0.0.7:5555".into(), transport: TransportKind::Legacy, expect_serial: None, silent: false });
+    ev(&mut s, SlotEvent::ConnectDone(Ok(())));
+    ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.7:5555".into(), state: DeviceState::Device });
+    ev(&mut s, SlotEvent::Identified(info("SER1")));
+    let backoff = ev(&mut s, SlotEvent::AdbGone { serial: "10.0.0.7:5555".into() });
+
+    // Wireless debugging is announced while reconnecting: switch to it…
+    ev(&mut s, SlotEvent::ConnectSeen { addr: sa("10.0.0.7:37717") });
+    assert_eq!(s.transport, TransportKind::Tls);
+    assert_eq!(s.legacy_addr.as_deref(), Some("10.0.0.7:5555"));
+    assert!(s.wants_adb_serial("10.0.0.7:5555"));
+
+    // …which dies again; every backoff attempt also tries 5555.
+    ev(&mut s, SlotEvent::AdbGone { serial: "10.0.0.7:37717".into() });
+    let fx = fire(&mut s, &backoff);
+    assert!(fx.contains(&Effect::Reconnect { addr: "10.0.0.7:37717".into() }));
+    assert!(fx.contains(&Effect::Connect { addr: "10.0.0.7:5555".into() }));
+
+    // 5555 answers first: the slot goes back to it.
+    let fx = ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.7:5555".into(), state: DeviceState::Device });
+    assert_eq!(fx, vec![Effect::Identify { serial: "10.0.0.7:5555".into() }]);
+    ev(&mut s, SlotEvent::Identified(info("SER1")));
+    assert!(matches!(s.phase, Phase::Online { .. }));
+    assert_eq!((s.addr.as_deref(), s.transport, s.legacy_addr.as_deref()), (Some("10.0.0.7:5555"), TransportKind::Legacy, None));
+}

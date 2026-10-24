@@ -7,7 +7,7 @@ mod lan;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-pub use arp::{find_ip_by_mac, parse_arp_table, normalize_mac};
+pub use arp::{find_ip_by_mac, find_mac_by_ip, parse_arp_table, normalize_mac};
 pub use avahi::spawn_avahi;
 pub use lan::is_lan;
 

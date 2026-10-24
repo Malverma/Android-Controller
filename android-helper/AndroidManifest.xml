@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.androidcontroller.keeper"
+    android:versionCode="2"
+    android:versionName="0.2.0">
+
+    <!-- Target 28 on purpose: since Android 10, only apps targeting 28 or lower
+         may switch Wi-Fi off and on (WifiManager.setWifiEnabled), which is how
+         the Wi-Fi watchdog gets a phone back onto a network Android gave up on. -->
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="28" />
+
+    <!-- Granted once from the PC: adb shell pm grant org.androidcontroller.keeper android.permission.WRITE_SECURE_SETTINGS -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:label="Wireless Debugging Keeper"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault.DayNight">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".KeeperService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps Android's wireless debugging switched on so a paired PC can reconnect" />
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <!-- Sent by setup.sh to start (or resume) keeping wireless debugging on. -->
+                <action android:name="org.androidcontroller.keeper.START" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

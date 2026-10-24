@@ -18,6 +18,7 @@ ac-device = { path = "crates/ac-device" }
 ac-scrcpy = { path = "crates/ac-scrcpy" }
 ac-input = { path = "crates/ac-input" }
 ac-media = { path = "crates/ac-media" }
+ac-transfer = { path = "crates/ac-transfer" }
 adb-mock = { path = "crates/adb-mock" }
 
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
@@ -30,6 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 anyhow = "1"
+sha2 = "0.10"
 rand = "0.9"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 qrcode = { version = "0.14", default-features = false }
