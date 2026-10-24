@@ -54,6 +54,11 @@ Started in Milestone 4:
   Wi-Fi when a router drop leaves the phone disconnected), so phones
   reconnect without anyone touching them. `android-helper/setup.sh`
   installs it over adb.
+- **Phones without ADB** (Android 10 and older, no USB cable): the helper's
+  *PC connection without ADB* mirrors the screen (Android screen capture,
+  H.264 in scrcpy's stream format), takes taps, swipes and typing through an
+  accessibility service, and receives files and APKs. Pair it under
+  **Add Device › No ADB** with the code the phone shows (`crates/ac-direct`).
 
 Not yet: transfers resuming after an app restart (the journal), adaptive
 bitrate (§3.6), audio, preferences UI. The 2-hour, 5-phone soak test from

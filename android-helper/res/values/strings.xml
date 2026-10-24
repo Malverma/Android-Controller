@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_label">Android Controller touch control</string>
+    <string name="accessibility_description">Lets Android Controller on your paired PC tap, swipe and type on this phone while it mirrors the screen without ADB. It only acts on input from a PC you paired in Wireless Debugging Keeper.</string>
+</resources>

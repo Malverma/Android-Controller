@@ -19,16 +19,20 @@ pub enum ServiceKind {
     Connect,
     /// `_adb._tcp`: some legacy ROMs/emulators after `adb tcpip`.
     Legacy,
+    /// `_acdirect._tcp`: the Android helper's connection without ADB. TXT
+    /// `id` is the device id, `pair=1` while "Pair with PC" is open.
+    Direct,
 }
 
 impl ServiceKind {
-    pub const ALL: [ServiceKind; 3] = [Self::Pairing, Self::Connect, Self::Legacy];
+    pub const ALL: [ServiceKind; 4] = [Self::Pairing, Self::Connect, Self::Legacy, Self::Direct];
 
     pub fn service_type(self) -> &'static str {
         match self {
             Self::Pairing => "_adb-tls-pairing._tcp",
             Self::Connect => "_adb-tls-connect._tcp",
             Self::Legacy => "_adb._tcp",
+            Self::Direct => "_acdirect._tcp",
         }
     }
 
@@ -47,9 +51,18 @@ pub struct DiscoveredDevice {
 }
 
 impl DiscoveredDevice {
-    /// Device serial embedded in `adb-<serial>-<suffix>` instance names.
+    /// Device serial embedded in `adb-<serial>-<suffix>` instance names (for
+    /// the helper's service: the device id in its TXT record).
     pub fn serial(&self) -> Option<&str> {
-        serial_from_instance(&self.instance)
+        match self.kind {
+            ServiceKind::Direct => self.txt.get("id").map(String::as_str).filter(|s| !s.is_empty()),
+            _ => serial_from_instance(&self.instance),
+        }
+    }
+
+    /// The helper's "Pair with PC" window is open.
+    pub fn pairing_open(&self) -> bool {
+        self.kind == ServiceKind::Direct && self.txt.get("pair").is_some_and(|v| v == "1")
     }
 }
 
@@ -86,6 +99,22 @@ mod tests {
         assert_eq!(serial_from_instance("studio-a1b2c3d4e5"), None);
         assert_eq!(serial_from_instance("adb-nosuffix"), None);
         assert_eq!(serial_from_instance("adb--x"), None);
+    }
+
+    #[test]
+    fn helper_service_carries_its_id() {
+        let mut d = DiscoveredDevice {
+            instance: "AC-LM-X120-1a2b".into(),
+            kind: ServiceKind::Direct,
+            addr: "192.168.0.50:27190".parse().unwrap(),
+            host: String::new(),
+            txt: [("id".to_owned(), "direct:1a2b".to_owned()), ("pair".to_owned(), "1".to_owned())].into(),
+        };
+        assert_eq!(d.serial(), Some("direct:1a2b"));
+        assert!(d.pairing_open());
+        d.txt.insert("pair".into(), "0".into());
+        assert!(!d.pairing_open());
+        assert_eq!(ServiceKind::from_service_type("_acdirect._tcp."), Some(ServiceKind::Direct));
     }
 
     #[test]

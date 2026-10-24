@@ -274,6 +274,134 @@ async fn run_session(
     ended
 }
 
+/// Where a no-ADB session connects (the Android helper, see `ac_direct`).
+#[derive(Clone)]
+pub struct DirectEnv {
+    pub media: Arc<MediaContext>,
+    pub addr: std::net::SocketAddr,
+    pub creds: ac_direct::Credentials,
+    pub device_id: String,
+}
+
+/// Mirroring without ADB: the helper encodes the screen itself and sends
+/// the same video format, so decoding is shared with scrcpy sessions.
+pub fn spawn_direct_session(
+    env: DirectEnv,
+    params: ServerParams,
+    slot: SlotId,
+    id: u64,
+    io: Arc<SlotIo>,
+    tx: mpsc::UnboundedSender<SessionMsg>,
+) -> SessionHandle {
+    let (stop_tx, stop_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let error = run_direct_session(&env, &params, slot, id, &io, &tx, stop_rx).await;
+        let _ = tx.send(SessionMsg::Slot(slot, SlotEvent::StreamEnded { id, error }));
+    });
+    SessionHandle { stop: Some(stop_tx) }
+}
+
+async fn run_direct_session(
+    env: &DirectEnv,
+    params: &ServerParams,
+    slot: SlotId,
+    id: u64,
+    io: &Arc<SlotIo>,
+    tx: &mpsc::UnboundedSender<SessionMsg>,
+    mut stop: oneshot::Receiver<()>,
+) -> Option<String> {
+    tracing::info!(slot, max_size = params.max_size, bit_rate = params.bit_rate, "starting mirroring without ADB");
+    let p = ac_direct::StreamParams {
+        max_size: params.max_size,
+        bit_rate: params.bit_rate,
+        max_fps: params.max_fps,
+        power_on: params.power_on,
+    };
+    let opened = tokio::select! {
+        r = ac_direct::open_stream(env.addr, &env.creds, &env.device_id, p) => r,
+        _ = &mut stop => return None,
+    };
+    let socket = match opened {
+        Ok((s, _input)) => s,
+        Err(e) => {
+            tracing::warn!(slot, "mirroring without ADB failed to start: {e}");
+            return Some(e.to_string());
+        }
+    };
+    // Both directions run on blocking threads: video in, control out.
+    let video = match socket.into_std().and_then(|s| s.set_nonblocking(false).map(|()| s)) {
+        Ok(s) => s,
+        Err(e) => return Some(format!("video socket: {e}")),
+    };
+    let (Ok(control), Ok(shutdown)) = (video.try_clone(), video.try_clone()) else {
+        return Some("video socket: cannot share it".into());
+    };
+    let (done_tx, done_rx) = oneshot::channel();
+    let decode = {
+        let (io, media) = (io.clone(), env.media.clone());
+        let mut events = DecodeEvents { slot, id, io: io.clone(), tx: tx.clone() };
+        std::thread::Builder::new().name(format!("video-decode-{slot}")).spawn(move || {
+            let r = ac_media::stream::run(video, &io.mailbox, &media, &mut events);
+            let _ = done_tx.send(r);
+        })
+    };
+    if let Err(e) = decode {
+        return Some(format!("decode thread: {e}"));
+    }
+    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let writer = std::thread::Builder::new().name(format!("direct-control-{slot}")).spawn(move || blocking_control_writer(control, ctl_rx));
+    if let Err(e) = writer {
+        let _ = shutdown.shutdown(Shutdown::Both);
+        return Some(format!("control thread: {e}"));
+    }
+    *io.control.lock().unwrap() = Some(ctl_tx);
+    *io.info.lock().unwrap() = Some(StreamInfo {
+        codec: VideoCodec::H264,
+        max_size: params.max_size,
+        bit_rate: params.bit_rate,
+        max_fps: params.max_fps,
+    });
+    let ended = tokio::select! {
+        _ = &mut stop => None,
+        r = done_rx => Some(match r {
+            Ok(Ok(())) => "the video stream ended".to_owned(),
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "the decode thread stopped".to_owned(),
+        }),
+    };
+    // Dropping the sender ends the writer thread; the shutdown ends the reader.
+    *io.control.lock().unwrap() = None;
+    *io.backend.lock().unwrap() = None;
+    *io.info.lock().unwrap() = None;
+    let _ = shutdown.shutdown(Shutdown::Both);
+    io.mailbox.clear();
+    if let Some(reason) = &ended {
+        tracing::info!(slot, "mirroring ended: {reason}");
+    }
+    ended
+}
+
+/// `control_writer` for a blocking socket.
+fn blocking_control_writer(mut w: std::net::TcpStream, mut rx: mpsc::UnboundedReceiver<ControlMsg>) {
+    use std::io::Write;
+    let mut batch: Vec<ControlMsg> = Vec::new();
+    let mut buf = Vec::new();
+    while let Some(first) = rx.blocking_recv() {
+        batch.push(first);
+        while let Ok(m) = rx.try_recv() {
+            batch.push(m);
+        }
+        coalesce_moves(&mut batch);
+        buf.clear();
+        for m in batch.drain(..) {
+            m.encode(&mut buf);
+        }
+        if w.write_all(&buf).is_err() {
+            return;
+        }
+    }
+}
+
 fn server_exit_reason(output: &str) -> String {
     match output.lines().rev().find(|l| l.contains("ERROR") || l.contains("Exception")) {
         Some(line) => format!("the mirroring agent stopped: {}", line.trim()),

@@ -15,6 +15,7 @@ ac-discovery.workspace = true
 ac-scrcpy.workspace = true
 ac-media.workspace = true
 ac-transfer.workspace = true
+ac-direct.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["process"] }
 async-channel.workspace = true

@@ -19,6 +19,7 @@ ac-scrcpy = { path = "crates/ac-scrcpy" }
 ac-input = { path = "crates/ac-input" }
 ac-media = { path = "crates/ac-media" }
 ac-transfer = { path = "crates/ac-transfer" }
+ac-direct = { path = "crates/ac-direct" }
 adb-mock = { path = "crates/adb-mock" }
 
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }

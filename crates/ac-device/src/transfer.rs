@@ -45,6 +45,14 @@ pub struct Link {
     pub device_id: String,
     pub shell_v2: bool,
     pub sdk: u32,
+    /// Set for a phone reached without ADB: files go through the helper.
+    pub direct: Option<DirectTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectTarget {
+    pub addr: std::net::SocketAddr,
+    pub creds: ac_direct::Credentials,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,9 +422,10 @@ impl Ctx {
         let mut checksum_retries = 0;
         loop {
             let link = self.link(slot, id, &job.device_id).await;
-            let r = match job.kind {
-                Kind::Push => self.push(slot, &link, &mut job).await,
-                Kind::Install => self.install(slot, &link, &job).await,
+            let r = match (job.kind, &link.direct) {
+                (Kind::Push, None) => self.push(slot, &link, &mut job).await,
+                (Kind::Install, None) => self.install(slot, &link, &job).await,
+                (kind, Some(d)) => self.send_direct(slot, &link, d, &job, kind == Kind::Install).await,
             };
             match r {
                 Ok(o) => {
@@ -431,7 +440,9 @@ impl Ctx {
                     job.hash = Some(Sha256::new());
                 }
                 Err(JobError::Fatal(why)) => {
-                    let _ = self.rm(&link, &[&job.part, &job.seg]).await;
+                    if link.direct.is_none() {
+                        let _ = self.rm(&link, &[&job.part, &job.seg]).await;
+                    }
                     if let Some(f) = &job.final_path {
                         self.reserved.lock().unwrap().remove(&(job.device_id.clone(), f.clone()));
                     }
@@ -444,7 +455,9 @@ impl Ctx {
                     if self.still_linked(slot, &link) {
                         retries += 1;
                         if retries > MAX_RETRIES {
-                            let _ = self.rm(&link, &[&job.part, &job.seg]).await;
+                            if link.direct.is_none() {
+                                let _ = self.rm(&link, &[&job.part, &job.seg]).await;
+                            }
                             return Outcome::Failed(why);
                         }
                     }
@@ -690,6 +703,68 @@ impl Ctx {
             Ok(()) => Ok(Outcome::Installed),
             Err(why) => Err(JobError::Fatal(why)),
         }
+    }
+}
+
+impl Ctx {
+    /// A file or APK through the Android helper (no ADB): one resumable
+    /// upload; the phone picks the final name and reports its checksum.
+    async fn send_direct(&self, slot: SlotId, link: &Link, d: &DirectTarget, job: &Job, install: bool) -> Result<Outcome, JobError> {
+        self.check_local(job).await?;
+        let base = self.cfg.default_target_dir.trim_end_matches('/');
+        let dir = job.remote_dir.strip_prefix(base).unwrap_or("").trim_matches('/').to_owned();
+        let req = ac_direct::PushRequest {
+            name: job.name.clone(),
+            dir,
+            size: job.size,
+            job: job.id,
+            install,
+            conflict: self.cfg.on_conflict.clone(),
+        };
+        let (mut s, start) = ac_direct::open_push(d.addr, &d.creds, &link.device_id, &req).await.map_err(direct_err)?;
+        let offset = match start {
+            ac_direct::PushStart::Skip => return Ok(Outcome::Skipped),
+            ac_direct::PushStart::From(o) => o,
+        };
+        self.set_progress(slot, job.id, offset);
+        let mut file = tokio::fs::File::open(&job.local).await.map_err(|e| JobError::Fatal(format!("Can't read {}: {e}", job.local.display())))?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut bucket = TokenBucket::new(self.rate(slot), Instant::now());
+        let mut buf = vec![0u8; READ_BLOCK];
+        let mut sent = offset;
+        while sent < job.size {
+            let n = (job.size - sent).min(READ_BLOCK as u64) as usize;
+            file.read_exact(&mut buf[..n]).await.map_err(|e| JobError::Fatal(format!("Can't read {}: {e}", job.local.display())))?;
+            bucket.set_rate(self.rate(slot), Instant::now());
+            let wait = bucket.take(n as u64, Instant::now());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            tokio::time::timeout(STALL, s.write_all(&buf[..n])).await.map_err(|_| JobError::Retry("stalled".into()))??;
+            sent += n as u64;
+            self.set_progress(slot, job.id, sent);
+        }
+        s.flush().await?;
+        // An install waits for the user to confirm on the phone.
+        let limit = if install { Duration::from_secs(6 * 60) } else { Duration::from_secs(120) };
+        let done = ac_direct::finish_push(&mut s, limit).await.map_err(direct_err)?;
+        if install {
+            return if done.installed { Ok(Outcome::Installed) } else { Err(JobError::Fatal("the phone did not install it".into())) };
+        }
+        if job.hash.is_some() {
+            let want = hex(&hash_prefix(&job.local, job.size).await?.finalize());
+            if done.sha256.as_deref() != Some(want.as_str()) {
+                return Err(JobError::Fatal(format!("{CHECKSUM} (the phone kept {})", done.path.unwrap_or_default())));
+            }
+        }
+        Ok(Outcome::Sent)
+    }
+}
+
+fn direct_err(e: ac_direct::Error) -> JobError {
+    match e {
+        ac_direct::Error::Refused { message, .. } => JobError::Fatal(message),
+        other => JobError::Retry(other.to_string()),
     }
 }
 

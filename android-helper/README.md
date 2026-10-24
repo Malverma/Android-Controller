@@ -1,7 +1,8 @@
 # Wireless Debugging Keeper (Android helper)
 
-A small app for the phones (Android 6+; wireless debugging needs Android 11, older phones get only the Wi-Fi watchdog) that keeps **Wireless debugging**
-on, so Android Controller can reconnect by itself:
+A small app for the phones (Android 6+) that keeps **Wireless debugging**
+on (Android 11+), so Android Controller can reconnect by itself, and that
+lets phones **without** wireless debugging connect without ADB at all:
 
 - Android turns wireless debugging off whenever Wi-Fi drops and after a
   reboot. The keeper turns it back on as soon as Wi-Fi is connected, and
@@ -13,6 +14,8 @@ on, so Android Controller can reconnect by itself:
   and on (then waits 1, 2, 4, 8, up to 15 minutes between further tries).
   It never touches Wi-Fi you switched off yourself.
 - A silent notification shows what it is doing, with a **Pause** button.
+- **PC connection without ADB** (off by default): for Android 10 and older
+  when no USB data cable is at hand. See below.
 
 ## Install on a new phone (download link)
 
@@ -28,6 +31,45 @@ on, so Android Controller can reconnect by itself:
 3. That's it: when the phone connects, Android Controller grants the
    helper its permission and starts it, and shows a toast. Until then the
    helper's notification says it needs setup from the PC.
+
+## Phones without wireless debugging: PC connection without ADB
+
+Android 10 and older have no wireless debugging, and without a USB cable
+`adb tcpip` can't be switched on either. The helper can then be the
+connection itself:
+
+1. Install the app from the link above and open it.
+2. Switch on **Allow PC connection without ADB** and allow storing files.
+3. Tap **Turn on touch control** and enable *Android Controller touch
+   control* under Accessibility (without it the PC can only watch).
+4. Tap **Pair with PC**. In Android Controller open **Add Device › No ADB**,
+   pick the phone (or type the IP shown on the phone) and enter the 6-digit
+   code.
+5. The first time the PC mirrors, Android asks to start capturing: tap
+   **Start now** (on Android 9 and older tick **Don't show again**, and it
+   won't ask after a reboot either).
+
+What works compared with ADB phones:
+
+| | ADB (wireless debugging / tcpip) | Without ADB |
+|---|---|---|
+| Mirroring | scrcpy | Android screen capture, H.264, slightly more delay |
+| Taps, swipes, long press, scrolling | yes | yes (accessibility gestures, Android 7+) |
+| Multi-touch / pinch | yes | no |
+| Typing | key events | text put into the focused field; Enter, Backspace, arrows |
+| Back / Home / Recents / volume / power | yes | yes |
+| Files to Download | yes | yes (resumable, checksummed) |
+| APK install | silent | Android's installer asks on the phone |
+| Clipboard from the phone | yes | no (PC → phone works) |
+
+Security: only PCs paired with the on-screen code are accepted (P-256 key
+exchange confirmed by the code, then an HMAC challenge on every
+connection). The video and input are not encrypted on the network, like
+`adb tcpip`. Pairing is open only while the pairing screen shows, for two
+minutes. **Forget paired PCs** in the app revokes them.
+
+The helper listens on TCP port 27190 and announces `_acdirect._tcp` over
+mDNS. Keys on the PC are in `~/.config/android-controller/direct-keys.toml`.
 
 ## Install from the PC
 
@@ -54,7 +96,9 @@ for networks it has not seen.
 with `~/.android/debug.keystore` (created if missing).
 
 The app targets SDK 28 on purpose: since Android 10 only apps targeting 28
-or lower may switch Wi-Fi off and on, which the watchdog needs.
+or lower may switch Wi-Fi off and on, which the watchdog needs. (It also
+keeps screen capture and file access simple on the older phones that use
+the connection without ADB.)
 
 ## Remove
 

@@ -1,5 +1,6 @@
-//! "Add device" dialog: QR pairing, 6-digit code pairing, and manual /
-//! legacy (USB → `adb tcpip`) connection.
+//! "Add device" dialog: QR pairing, 6-digit code pairing, manual / legacy
+//! (USB → `adb tcpip`) connection, and pairing with the Android helper's
+//! connection without ADB.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -18,6 +19,7 @@ pub enum Page {
     Qr,
     Code,
     Manual,
+    Direct,
 }
 
 impl Page {
@@ -26,6 +28,7 @@ impl Page {
             Self::Qr => "qr",
             Self::Code => "code",
             Self::Manual => "manual",
+            Self::Direct => "direct",
         }
     }
 }
@@ -41,6 +44,7 @@ pub struct PairingDialog {
     qr_slot: Cell<Option<SlotId>>,
     qr_deadline: Cell<Option<Instant>>,
     code_list: gtk::ListBox,
+    direct_list: gtk::ListBox,
     usb_list: gtk::ListBox,
     /// Code entries keyed by service instance, preserved across list rebuilds.
     typed_codes: RefCell<Vec<(String, String)>>,
@@ -138,7 +142,7 @@ the pairing dialog's IP address &amp; port and code, and the port from the top o
         manual_group.add(&addr_row);
         let usb_group = adw::PreferencesGroup::builder()
             .title("Legacy phones over USB")
-            .description("Android 10 and older: plug the phone in once to switch it to Wi-Fi ADB (adb tcpip 5555).")
+            .description("Android 10 and older: plug the phone in once to switch it to Wi-Fi ADB (adb tcpip 5555). No USB data cable? Use the No ADB tab.")
             .build();
         let usb_list = gtk::ListBox::new();
         usb_list.add_css_class("boxed-list");
@@ -147,10 +151,37 @@ the pairing dialog's IP address &amp; port and code, and the port from the top o
         manual_page.append(&manual_group);
         manual_page.append(&usb_group);
 
+        // --- No-ADB page ---
+        let direct_page = page_box();
+        direct_page.append(&instructions(
+            "For phones <b>without wireless debugging</b> (Android 10 and older) when no USB cable is at hand. \
+On the phone install <b>Wireless Debugging Keeper</b> (android-helper in this project), open it, switch on \
+<b>Allow PC connection without ADB</b> and tap <b>Pair with PC</b>. The phone appears below; type the code it shows.\n\
+Touch control needs the app turned on under the phone's <b>Settings › Accessibility</b>.",
+        ));
+        let direct_list = gtk::ListBox::new();
+        direct_list.add_css_class("boxed-list");
+        direct_list.set_selection_mode(gtk::SelectionMode::None);
+        direct_page.append(&direct_list);
+        let direct_typed = adw::PreferencesGroup::builder()
+            .title("Phone not listed?")
+            .description("Type the address and code from the phone's \"Pair with PC\" screen.")
+            .build();
+        let direct_addr_row = adw::EntryRow::builder().title("IP address, e.g. 192.168.0.84").build();
+        let direct_code_row = adw::EntryRow::builder().title("Pairing code").input_purpose(gtk::InputPurpose::Digits).build();
+        direct_typed.add(&direct_addr_row);
+        direct_typed.add(&direct_code_row);
+        let direct_pair = gtk::Button::builder().label("Pair").halign(gtk::Align::End).margin_top(6).margin_bottom(6).build();
+        direct_pair.add_css_class("suggested-action");
+        direct_pair.add_css_class("pill");
+        direct_page.append(&direct_typed);
+        direct_page.append(&direct_pair);
+
         let scrolled = |child: &gtk::Box| gtk::ScrolledWindow::builder().child(child).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
         stack.add_titled_with_icon(&scrolled(&qr_page), Some(Page::Qr.name()), "QR Code", "view-grid-symbolic");
         stack.add_titled_with_icon(&scrolled(&code_page), Some(Page::Code.name()), "Code", "dialog-password-symbolic");
         stack.add_titled_with_icon(&scrolled(&manual_page), Some(Page::Manual.name()), "Manual", "network-wired-symbolic");
+        stack.add_titled_with_icon(&scrolled(&direct_page), Some(Page::Direct.name()), "No ADB", "phone-symbolic");
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&stack);
@@ -175,6 +206,7 @@ the pairing dialog's IP address &amp; port and code, and the port from the top o
             qr_slot: Cell::new(None),
             qr_deadline: Cell::new(None),
             code_list,
+            direct_list,
             usb_list,
             typed_codes: RefCell::new(Vec::new()),
         });
@@ -200,6 +232,17 @@ the pairing dialog's IP address &amp; port and code, and the port from the top o
                 });
             };
             typed_pair.connect_clicked(move |_| submit());
+        }
+        {
+            let weak = Rc::downgrade(&this);
+            direct_pair.connect_clicked(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                this.send(UiCommand::PairDirect {
+                    slot: this.chosen_slot(),
+                    addr: direct_addr_row.text().to_string(),
+                    code: direct_code_row.text().to_string(),
+                });
+            });
         }
         {
             let weak = Rc::downgrade(&this);
@@ -310,15 +353,18 @@ the pairing dialog's IP address &amp; port and code, and the port from the top o
     pub fn update_nearby(&self, nearby: &[NearbyView]) {
         // Keep anything already typed into code entries.
         let mut typed = Vec::new();
-        let mut child = self.code_list.first_child();
-        while let Some(row) = child {
-            if let (Some(instance), Some(entry)) = (row.widget_name().strip_prefix("pair:").map(str::to_owned), find_entry(&row)) {
-                typed.push((instance, entry.text().to_string()));
+        for list in [&self.code_list, &self.direct_list] {
+            let mut child = list.first_child();
+            while let Some(row) = child {
+                if let (Some(instance), Some(entry)) = (row.widget_name().strip_prefix("pair:").map(str::to_owned), find_entry(&row)) {
+                    typed.push((instance, entry.text().to_string()));
+                }
+                child = row.next_sibling();
             }
-            child = row.next_sibling();
         }
         *self.typed_codes.borrow_mut() = typed;
         self.code_list.remove_all();
+        self.update_direct(nearby);
 
         let pairing: Vec<&NearbyView> = nearby.iter().filter(|n| n.kind == ServiceKind::Pairing && !n.instance.starts_with("studio-")).collect();
         if pairing.is_empty() {
@@ -362,6 +408,54 @@ the pairing dialog's IP address &amp; port and code, and the port from the top o
             row.add_suffix(&entry);
             row.add_suffix(&button);
             self.code_list.append(&row);
+        }
+    }
+
+    /// Phones running the helper's connection without ADB, not yet paired.
+    fn update_direct(&self, nearby: &[NearbyView]) {
+        self.direct_list.remove_all();
+        let phones: Vec<&NearbyView> = nearby.iter().filter(|n| n.kind == ServiceKind::Direct && !n.paired).collect();
+        if phones.is_empty() {
+            let row = adw::ActionRow::builder()
+                .title("Waiting for a phone…")
+                .subtitle("Phones appear here while Wireless Debugging Keeper allows the PC connection")
+                .build();
+            row.add_prefix(&gtk::Spinner::builder().spinning(true).build());
+            self.direct_list.append(&row);
+            return;
+        }
+        for n in phones {
+            let title = n.known_name.clone().unwrap_or_else(|| n.instance.clone());
+            let subtitle = if n.pairing_open { n.addr.to_string() } else { format!("{} · tap Pair with PC on the phone", n.addr) };
+            let row = adw::ActionRow::builder().title(&title).subtitle(subtitle).build();
+            row.set_widget_name(&format!("pair:direct/{}", n.instance));
+            let entry = gtk::Entry::builder()
+                .placeholder_text("000000")
+                .max_length(7)
+                .width_chars(7)
+                .input_purpose(gtk::InputPurpose::Digits)
+                .valign(gtk::Align::Center)
+                .build();
+            let key = format!("direct/{}", n.instance);
+            if let Some((_, code)) = self.typed_codes.borrow().iter().find(|(i, _)| *i == key) {
+                entry.set_text(code);
+            }
+            let button = gtk::Button::builder().label("Pair").valign(gtk::Align::Center).build();
+            button.add_css_class("suggested-action");
+            let submit = {
+                let (app, addr, entry, choice) = (self.app.clone(), n.addr.to_string(), entry.clone(), self.slot_choice.clone());
+                move || {
+                    if let Some(app) = app.upgrade() {
+                        app.send(UiCommand::PairDirect { slot: slot_from(&choice), addr: addr.clone(), code: entry.text().to_string() });
+                    }
+                }
+            };
+            let s = submit.clone();
+            entry.connect_activate(move |_| s());
+            button.connect_clicked(move |_| submit());
+            row.add_suffix(&entry);
+            row.add_suffix(&button);
+            self.direct_list.append(&row);
         }
     }
 

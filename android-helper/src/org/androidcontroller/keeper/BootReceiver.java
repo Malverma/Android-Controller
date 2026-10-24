@@ -4,7 +4,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 
-/** Starts the keeper after a reboot or an update of this app, or when setup asks. */
+/** Starts the keeper (and the no-ADB PC connection) after a reboot or an update, or when setup asks. */
 public final class BootReceiver extends BroadcastReceiver {
     static final String ACTION_START = "org.androidcontroller.keeper.START";
 
@@ -15,9 +15,9 @@ public final class BootReceiver extends BroadcastReceiver {
             Keeper.setActive(context, true);
             return;
         }
-        if ((Intent.ACTION_BOOT_COMPLETED.equals(a) || Intent.ACTION_MY_PACKAGE_REPLACED.equals(a))
-                && Keeper.active(context)) {
-            Keeper.start(context);
+        if (Intent.ACTION_BOOT_COMPLETED.equals(a) || Intent.ACTION_MY_PACKAGE_REPLACED.equals(a)) {
+            if (Keeper.active(context)) Keeper.start(context);
+            if (Direct.enabled(context)) Direct.start(context);
         }
     }
 }

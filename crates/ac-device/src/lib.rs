@@ -13,3 +13,4 @@ pub use api::*;
 pub use manager::{ManagerHandle, ManagerOptions, normalize_addr, parse_inet, spawn};
 pub use slot::StreamProfile;
 pub use stream::{SlotIo, StreamInfo};
+pub use ac_direct::PORT as DIRECT_PORT;

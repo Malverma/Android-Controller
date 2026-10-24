@@ -19,8 +19,10 @@ use crate::api::*;
 use crate::probe::{IDENTIFY_CMD, STATS_CMD, parse_identity, parse_stats};
 use crate::qr::QrSecret;
 use crate::slot::{DeviceInfo, Effect, PAIR_QR_TIMEOUT, Phase, Slot, SlotEvent, StreamPhase, StreamProfile, TimerKind};
-use crate::transfer::{Link, Transfers};
-use crate::stream::{SessionHandle, SessionMsg, SlotIo, StreamEnv, max_size_for, resolve_profile, server_params, spawn_session};
+use crate::transfer::{DirectTarget, Link, Transfers};
+use crate::stream::{
+    DirectEnv, SessionHandle, SessionMsg, SlotIo, StreamEnv, max_size_for, resolve_profile, server_params, spawn_direct_session, spawn_session,
+};
 use ac_media::MediaContext;
 
 /// Phone-side copy of the user's screen timeout while "keep screen on" is
@@ -101,8 +103,28 @@ enum Msg {
     Session(SessionMsg),
     /// "Keep screen on" state read from or set on the phone `device_id`.
     StayAwake { slot: SlotId, device_id: String, on: Option<bool> },
-    /// A disconnected slot's `adb tcpip` port accepts connections again.
+    /// A disconnected slot's `adb tcpip` (or helper) port accepts connections again.
     LegacyAlive { slot: SlotId, addr: String },
+    /// A no-ADB pairing finished.
+    DirectPaired { slot: SlotId, addr: SocketAddr, result: Result<ac_direct::Paired, String> },
+    /// A no-ADB link attempt `conn` finished.
+    DirectLinked { slot: SlotId, conn: u64, result: Result<DirectLink, String> },
+    /// The no-ADB link `conn` broke.
+    DirectGone { slot: SlotId, conn: u64 },
+}
+
+/// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
+/// and "keep screen on" run on it; mirroring and files open their own.
+struct DirectLink {
+    conn: u64,
+    addr: SocketAddr,
+    hello: ac_direct::Hello,
+    cmds: mpsc::UnboundedSender<LinkCmd>,
+    task: JoinHandle<()>,
+}
+
+enum LinkCmd {
+    StayAwake { set: Option<bool>, device_id: String },
 }
 
 struct Nearby {
@@ -187,6 +209,12 @@ struct Manager {
     last_legacy_probe: Instant,
     /// Per slot: the helper check ran for the phone currently online.
     helper_checked: Vec<bool>,
+    /// Keys of phones paired for the connection without ADB.
+    keys: ac_direct::KeyStore,
+    direct: Vec<Option<DirectLink>>,
+    /// Per slot: the link attempt whose answer is still wanted (0 = none).
+    direct_pending: Vec<u64>,
+    direct_conn: u64,
 }
 
 impl Manager {
@@ -215,6 +243,10 @@ impl Manager {
         for s in &mut slots {
             s.stream_enabled = stream_env.is_ok();
         }
+        let keys = match &opts.paths {
+            Some(p) => ac_direct::KeyStore::load(&p.devices.with_file_name("direct-keys.toml")),
+            None => ac_direct::KeyStore::in_memory(),
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let (session_tx, session_rx) = mpsc::unbounded_channel();
         let adb = AdbClient::new(opts.config.general.adb_server)
@@ -251,6 +283,10 @@ impl Manager {
             stay_awake_busy: vec![false; n as usize],
             last_legacy_probe: Instant::now(),
             helper_checked: vec![false; n as usize],
+            keys,
+            direct: (0..n).map(|_| None).collect(),
+            direct_pending: vec![0; n as usize],
+            direct_conn: 0,
         }
     }
 
@@ -390,9 +426,15 @@ impl Manager {
                     device_id: d.id.clone(),
                     shell_v2: d.shell_v2(),
                     sdk: d.sdk,
+                    direct: match (&self.direct[i], s.transport) {
+                        (Some(l), TransportKind::Direct) => Some(DirectTarget { addr: l.addr, creds: self.keys.credentials() }),
+                        _ => None,
+                    },
                 }),
                 _ => None,
             };
+            // A no-ADB slot without its link has nothing to send files over.
+            let link = link.filter(|l| s.transport != TransportKind::Direct || l.direct.is_some());
             self.transfers.set_link(i as SlotId + 1, link);
         }
         for i in 0..self.slots.len() {
@@ -417,13 +459,20 @@ impl Manager {
                 let in_slot = serial.as_deref().and_then(|s| {
                     self.slots.iter().find(|sl| sl.is_active() && sl.device_id() == Some(s)).map(|sl| sl.id)
                 });
+                let paired = n.dev.kind == ServiceKind::Direct && serial.as_deref().is_some_and(|s| self.keys.is_paired(s));
                 NearbyView {
                     instance: n.dev.instance.clone(),
                     kind: n.dev.kind,
                     addr: n.dev.addr,
-                    known_name: serial.as_deref().and_then(|s| self.devices.get(s)).map(|r| r.display_name().to_owned()),
+                    known_name: serial
+                        .as_deref()
+                        .and_then(|s| self.devices.get(s))
+                        .map(|r| r.display_name().to_owned())
+                        .or_else(|| n.dev.txt.get("model").filter(|_| n.dev.kind == ServiceKind::Direct).cloned()),
                     serial,
                     in_slot,
+                    pairing_open: n.dev.pairing_open(),
+                    paired,
                 }
             })
             .collect()
@@ -471,6 +520,13 @@ impl Manager {
 
     fn apply(&mut self, i: usize, fx: Effect) {
         let slot = self.slots[i].id;
+        // `Forget` resets the slot before its effects run: a helper link may
+        // still be open on a slot that no longer says Direct.
+        let direct = self.slots[i].transport == TransportKind::Direct
+            || matches!(fx, Effect::Disconnect { .. }) && (self.direct[i].is_some() || self.direct_pending[i] != 0);
+        if direct && self.apply_direct(i, &fx) {
+            return;
+        }
         let adb = self.adb.clone();
         match fx {
             Effect::Pair { code, addr } => self.spawn_msg(async move {
@@ -590,8 +646,183 @@ impl Manager {
             Effect::Forget { id } => {
                 self.devices.remove(&id);
                 self.save_devices();
+                if self.keys.remove(&id)
+                    && let Err(e) = self.keys.save()
+                {
+                    tracing::error!("saving direct-keys.toml: {e}");
+                }
             }
             Effect::Toast { code, message } => self.toast(Some(code), message),
+        }
+    }
+
+    /// Effects that work differently without ADB. Returns false for the ones
+    /// handled the usual way (timers, toasts, persistence, …).
+    fn apply_direct(&mut self, i: usize, fx: &Effect) -> bool {
+        let slot = self.slots[i].id;
+        match fx {
+            Effect::Connect { addr } | Effect::Reconnect { addr } => self.connect_direct(i, addr),
+            Effect::Disconnect { .. } => self.drop_direct(i),
+            Effect::Identify { .. } => {
+                let ev = match &self.direct[i] {
+                    Some(l) => SlotEvent::Identified(DeviceInfo {
+                        id: l.hello.id.clone(),
+                        model: l.hello.model.clone(),
+                        manufacturer: l.hello.manufacturer.clone(),
+                        sdk: l.hello.sdk,
+                        features: Vec::new(),
+                        wifi_mac: None,
+                    }),
+                    None => SlotEvent::IdentifyFailed("the helper connection closed".into()),
+                };
+                let _ = self.tx.send(Msg::Slot(slot, ev));
+            }
+            // The link itself is the heartbeat.
+            Effect::StartMonitor { .. } | Effect::StopMonitor => {}
+            Effect::StartStream { id, profile, .. } => {
+                if let Some(old) = self.sessions[i].take() {
+                    old.stop();
+                }
+                self.auto_max_size[i] = None;
+                let (media, link, device_id) = match (&self.stream_env, &self.direct[i], self.slots[i].device_id()) {
+                    (Ok(env), Some(l), Some(d)) => (env.media.clone(), l, d.to_owned()),
+                    (Err(reason), ..) => {
+                        let _ = self.tx.send(Msg::Slot(slot, SlotEvent::StreamEnded { id: *id, error: Some(reason.clone()) }));
+                        return true;
+                    }
+                    _ => {
+                        let error = Some("the helper connection closed".to_owned());
+                        let _ = self.tx.send(Msg::Slot(slot, SlotEvent::StreamEnded { id: *id, error }));
+                        return true;
+                    }
+                };
+                let record = self.devices.get(&device_id);
+                let (p, _) = resolve_profile(&self.cfg, *profile, record);
+                let params = server_params(&self.cfg, &p, self.tile_px[i], None);
+                if *profile == StreamProfile::Grid && matches!(p.max_size, ac_config::MaxSize::Auto(_)) {
+                    self.auto_max_size[i] = Some(params.max_size);
+                }
+                let env = DirectEnv { media, addr: link.addr, creds: self.keys.credentials(), device_id };
+                let h = spawn_direct_session(env, params, slot, *id, self.io[i].clone(), self.session_tx.clone());
+                self.sessions[i] = Some(h);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Opens the helper link (replacing any previous one) and reports back as
+    /// `ConnectDone` and an `AdbState`, like an ADB transport would.
+    fn connect_direct(&mut self, i: usize, addr: &str) {
+        let slot = self.slots[i].id;
+        self.drop_direct(i);
+        let sa = match addr.parse::<SocketAddr>() {
+            Ok(sa) if self.check_lan(addr).is_ok() => sa,
+            _ => {
+                let _ = self.tx.send(Msg::ConnectResult(slot, Err(format!("{addr} is not a local IP:port"))));
+                return;
+            }
+        };
+        self.direct_conn += 1;
+        let conn = self.direct_conn;
+        self.direct_pending[i] = conn;
+        let creds = self.keys.credentials();
+        let expect = self.slots[i].device_id().map(str::to_owned).or_else(|| self.slots[i].expect_serial.clone());
+        let (tx, cfg) = (self.tx.clone(), self.cfg.connection.clone());
+        self.spawn_msg(async move {
+            let result = match ac_direct::Link::connect(sa, &creds, expect.as_deref()).await {
+                Ok(link) => {
+                    let hello = link.hello.clone();
+                    let (cmds, rx) = mpsc::unbounded_channel();
+                    let task = tokio::spawn(run_direct_link(link, slot, conn, cfg, tx, rx));
+                    Ok(DirectLink { conn, addr: sa, hello, cmds, task })
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            Msg::DirectLinked { slot, conn, result }
+        });
+    }
+
+    fn drop_direct(&mut self, i: usize) {
+        self.direct_pending[i] = 0;
+        if let Some(l) = self.direct[i].take() {
+            l.task.abort();
+        }
+    }
+
+    fn pair_direct(&mut self, slot: Option<SlotId>, addr: &str, code: &str) {
+        let Some(code) = parse_pair_code(code) else { return self.toast(None, "The pairing code is 6 digits") };
+        let Some(sa) = ac_direct::parse_addr(addr) else {
+            return self.toast(None, format!("“{}” is not an IP address", addr.trim()));
+        };
+        if let Err(m) = self.check_lan(&sa.to_string()) {
+            return self.toast(Some(ErrorCode::NotLan), m);
+        }
+        let Some(slot) = self.pick_slot(slot) else { return self.toast(None, self.slots_full()) };
+        let (pc_id, pc_name) = (self.keys.pc_id.clone(), ac_direct::pc_name());
+        self.spawn_msg(async move {
+            let result = ac_direct::pair(sa, &pc_id, &pc_name, &code).await.map_err(|e| e.to_string());
+            Msg::DirectPaired { slot, addr: sa, result }
+        });
+    }
+
+    fn on_direct_paired(&mut self, slot: SlotId, addr: SocketAddr, result: Result<ac_direct::Paired, String>) {
+        let p = match result {
+            Ok(p) => p,
+            Err(e) => return self.toast(Some(ErrorCode::PairFailed), format!("Pairing failed: {e}")),
+        };
+        self.keys.insert(&p);
+        if let Err(e) = self.keys.save() {
+            tracing::error!("saving direct-keys.toml: {e}");
+        }
+        tracing::info!(slot, "paired with {} ({}) without ADB", p.model, p.id);
+        self.toast(None, format!("Paired with {}", p.model));
+        self.suppressed.remove(&p.id);
+        // Already showing in a slot (paired again)? Reconnect it there.
+        let target = self
+            .slots
+            .iter()
+            .find(|s| s.device_id() == Some(p.id.as_str()))
+            .map(|s| s.id)
+            .or_else(|| self.pick_slot(Some(slot)))
+            .or_else(|| self.pick_slot(None));
+        let Some(target) = target else { return self.toast(None, self.slots_full()) };
+        if self.idx(target).is_some_and(|i| matches!(self.slots[i].phase, Phase::Online { .. })) {
+            return;
+        }
+        let ev = SlotEvent::Connect { addr: addr.to_string(), transport: TransportKind::Direct, expect_serial: Some(p.id), silent: false };
+        self.feed(target, ev);
+    }
+
+    fn on_direct_linked(&mut self, slot: SlotId, conn: u64, result: Result<DirectLink, String>) {
+        let Some(i) = self.idx(slot) else { return };
+        if conn != self.direct_pending[i] {
+            if let Ok(l) = result {
+                l.task.abort();
+            }
+            return;
+        }
+        match result {
+            Ok(l) => {
+                let addr = l.addr.to_string();
+                if !l.hello.input {
+                    self.toast(
+                        None,
+                        format!(
+                            "Touch control is off on {}: on the phone open Wireless Debugging Keeper and tap \"Turn on touch control\"",
+                            l.hello.model
+                        ),
+                    );
+                }
+                self.direct_pending[i] = 0;
+                self.direct[i] = Some(l);
+                self.feed(slot, SlotEvent::ConnectDone(Ok(())));
+                self.feed(slot, SlotEvent::AdbState { serial: addr, state: DeviceState::Device });
+            }
+            Err(e) => {
+                self.direct_pending[i] = 0;
+                self.feed(slot, SlotEvent::ConnectDone(Err(e)));
+            }
         }
     }
 
@@ -609,7 +840,7 @@ impl Manager {
             }
             let addr = match (&s.legacy_addr, s.transport, &s.addr) {
                 (Some(a), _, _) => a.clone(),
-                (None, TransportKind::Legacy, Some(a)) => a.clone(),
+                (None, TransportKind::Legacy | TransportKind::Direct, Some(a)) => a.clone(),
                 _ => continue,
             };
             if self.suppressed.contains(&addr) {
@@ -630,6 +861,9 @@ impl Manager {
     /// Grants the helper app its permission if the phone has it installed.
     fn setup_helper(&self, i: usize) {
         let s = &self.slots[i];
+        if s.transport == TransportKind::Direct {
+            return; // it is already running: that is how we got here
+        }
         let (Some(serial), Some(d)) = (s.adb_serial.clone(), s.device.as_ref()) else { return };
         if d.sdk != 0 && d.sdk < 23 {
             return; // the helper needs Android 6+
@@ -659,6 +893,13 @@ impl Manager {
     /// Reads (`set = None`) or changes the phone's "keep screen on" state.
     fn run_stay_awake(&mut self, i: usize, set: Option<bool>) {
         let s = &self.slots[i];
+        if s.transport == TransportKind::Direct {
+            let (Some(l), Some(d)) = (&self.direct[i], s.device.as_ref()) else { return };
+            if l.cmds.send(LinkCmd::StayAwake { set, device_id: d.id.clone() }).is_ok() {
+                self.stay_awake_busy[i] = true;
+            }
+            return;
+        }
         let (Some(serial), Some(d)) = (s.adb_serial.clone(), s.device.as_ref()) else { return };
         let (slot, device_id, shell_v2) = (s.id, d.id.clone(), d.shell_v2());
         let cmd = stay_awake_cmd(set);
@@ -804,6 +1045,7 @@ impl Manager {
                 }
                 self.feed(slot, SlotEvent::PairCode { addr, code, connect });
             }
+            UiCommand::PairDirect { slot, addr, code } => self.pair_direct(slot, &addr, &code),
             UiCommand::PairQr { slot } => {
                 let Some(slot) = self.pick_slot(slot) else { return self.toast(None, self.slots_full()) };
                 let secret = QrSecret::generate(&mut rand::rng());
@@ -983,7 +1225,17 @@ impl Manager {
                 if matches!(s.phase, Phase::Disconnected { .. }) && s.device_id().is_some() {
                     tracing::info!(slot, "{addr} answers again; reconnecting");
                     let expect = s.device_id().map(str::to_owned);
-                    self.feed(slot, SlotEvent::Connect { addr, transport: TransportKind::Legacy, expect_serial: expect, silent: true });
+                    let transport = if s.transport == TransportKind::Direct { TransportKind::Direct } else { TransportKind::Legacy };
+                    self.feed(slot, SlotEvent::Connect { addr, transport, expect_serial: expect, silent: true });
+                }
+            }
+            Msg::DirectPaired { slot, addr, result } => self.on_direct_paired(slot, addr, result),
+            Msg::DirectLinked { slot, conn, result } => self.on_direct_linked(slot, conn, result),
+            Msg::DirectGone { slot, conn } => {
+                let Some(i) = self.idx(slot) else { return };
+                if let Some(l) = self.direct[i].take_if(|l| l.conn == conn) {
+                    tracing::info!(slot, "helper connection to {} lost", l.addr);
+                    self.feed(slot, SlotEvent::AdbGone { serial: l.addr.to_string() });
                 }
             }
         }
@@ -1130,6 +1382,27 @@ impl Manager {
                 }
             }
             ServiceKind::Legacy => {}
+            ServiceKind::Direct => {
+                let Some(id) = dev.serial() else { return };
+                if !self.keys.is_paired(id) {
+                    return;
+                }
+                let auto = self.cfg.discovery.auto_connect_known && !self.suppressed.contains(id);
+                let addr = dev.addr.to_string();
+                let slot = self.slots.iter().find(|s| {
+                    s.device_id() == Some(id)
+                        && match s.phase {
+                            // A new address (DHCP): go there instead.
+                            Phase::Reconnecting { .. } | Phase::ConnectingAdb { connected: false, .. } => s.addr.as_deref() != Some(addr.as_str()),
+                            Phase::Disconnected { .. } => auto && self.devices.get(id).is_none_or(|r| r.auto_connect),
+                            _ => false,
+                        }
+                });
+                if let Some(s) = slot {
+                    let (slot, expect) = (s.id, Some(id.to_owned()));
+                    self.feed(slot, SlotEvent::Connect { addr, transport: TransportKind::Direct, expect_serial: expect, silent: true });
+                }
+            }
         }
     }
 }
@@ -1255,6 +1528,61 @@ async fn monitor(
     }
 }
 
+/// Heartbeat and telemetry over the helper link (no ADB), plus the slot's
+/// requests. Ends (reporting `DirectGone`) when the link breaks.
+async fn run_direct_link(
+    mut link: ac_direct::Link,
+    slot: SlotId,
+    conn: u64,
+    cfg: ac_config::Connection,
+    tx: mpsc::UnboundedSender<Msg>,
+    mut cmds: mpsc::UnboundedReceiver<LinkCmd>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_millis(cfg.heartbeat_interval_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline = Duration::from_millis(cfg.heartbeat_timeout_ms);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => match link.ping(deadline).await {
+                Ok((pong, rtt)) => {
+                    let rtt_ms = rtt.as_millis() as u32;
+                    let _ = tx.send(Msg::Slot(slot, SlotEvent::Heartbeat(Ok(rtt_ms))));
+                    let stats = DeviceStats {
+                        battery_pct: pong.battery,
+                        charging: pong.charging,
+                        wifi_rssi_dbm: pong.rssi,
+                        wifi_link_mbps: pong.link_mbps,
+                        rtt_ms: Some(rtt_ms),
+                    };
+                    if tx.send(Msg::Stats(slot, stats)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // A late answer would desynchronize the link: start over.
+                    tracing::info!(slot, "helper heartbeat failed: {e}");
+                    let _ = tx.send(Msg::Slot(slot, SlotEvent::Heartbeat(Err(e.to_string()))));
+                    let _ = tx.send(Msg::DirectGone { slot, conn });
+                    return;
+                }
+            },
+            cmd = cmds.recv() => match cmd {
+                Some(LinkCmd::StayAwake { set, device_id }) => {
+                    let on = match link.stay_awake(set, deadline * 2).await {
+                        Ok(on) => Some(on),
+                        Err(e) => {
+                            tracing::warn!(slot, "keep screen on: {e}");
+                            None
+                        }
+                    };
+                    let _ = tx.send(Msg::StayAwake { slot, device_id, on });
+                }
+                None => return,
+            },
+        }
+    }
+}
+
 /// Keeps a `host:track-devices-l` stream open, restarting the ADB server once
 /// if it is not running.
 async fn track_devices(adb: AdbClient, cfg: Config, tx: mpsc::UnboundedSender<Msg>) {
@@ -1306,7 +1634,11 @@ pub fn normalize_addr(input: &str, legacy_port: u16) -> Option<(String, Transpor
         Ok(sa) => sa,
         Err(_) => SocketAddr::new(s.trim_matches(['[', ']']).parse::<IpAddr>().ok()?, legacy_port),
     };
-    let transport = if sa.port() == legacy_port { TransportKind::Legacy } else { TransportKind::Tls };
+    let transport = match sa.port() {
+        p if p == legacy_port => TransportKind::Legacy,
+        ac_direct::PORT => TransportKind::Direct,
+        _ => TransportKind::Tls,
+    };
     Some((sa.to_string(), transport))
 }
 
@@ -1327,6 +1659,7 @@ mod tests {
         assert_eq!(normalize_addr(" 192.168.1.5:37115 ", 5555), Some(("192.168.1.5:37115".into(), TransportKind::Tls)));
         assert_eq!(normalize_addr("[fe80::1]:5555", 5555), Some(("[fe80::1]:5555".into(), TransportKind::Legacy)));
         assert_eq!(normalize_addr("phone.local", 5555), None);
+        assert_eq!(normalize_addr("192.168.1.5:27190", 5555), Some(("192.168.1.5:27190".into(), TransportKind::Direct)));
     }
 
     #[test]

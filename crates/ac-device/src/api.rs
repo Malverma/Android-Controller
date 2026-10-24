@@ -17,6 +17,10 @@ pub enum UiCommand {
     /// `pair_addr` is the `ip:port` from the phone's pairing-code screen;
     /// `connect` is the port (or `ip:port`) shown under Wireless debugging.
     PairAddr { slot: Option<SlotId>, pair_addr: String, code: String, connect: Option<String> },
+    /// Pair with the Android helper's "PC connection without ADB" (phones
+    /// without wireless debugging): `addr` is `ip[:port]` as the helper shows
+    /// it, `code` the 6 digits on its screen. Connects once paired.
+    PairDirect { slot: Option<SlotId>, addr: String, code: String },
     /// Start a QR pairing session; answered with `UiEvent::QrCode`.
     PairQr { slot: Option<SlotId> },
     CancelPairing { slot: SlotId },
@@ -94,6 +98,10 @@ pub struct NearbyView {
     pub known_name: Option<String>,
     /// Slot currently holding this device.
     pub in_slot: Option<SlotId>,
+    /// `Direct` only: the helper's "Pair with PC" is open.
+    pub pairing_open: bool,
+    /// `Direct` only: this PC holds a key for the phone.
+    pub paired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

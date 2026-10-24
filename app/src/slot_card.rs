@@ -414,6 +414,7 @@ impl SlotCard {
             detail.push(match v.transport {
                 TransportKind::Tls => "TLS".into(),
                 TransportKind::Legacy => "tcpip".into(),
+                TransportKind::Direct => "no ADB".into(),
             });
         }
         self.detail.set_label(&detail.join(" · "));

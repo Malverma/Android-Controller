@@ -699,6 +699,15 @@ fn install_actions(app: &Rc<App>, gapp: &adw::Application) {
     });
     app.window.add_action(&pair_code);
 
+    let pair_direct = gtk::gio::SimpleAction::new("pair-direct", None);
+    let weak = Rc::downgrade(app);
+    pair_direct.connect_activate(move |_, _| {
+        if let Some(app) = weak.upgrade() {
+            app.open_pairing(Page::Direct, None);
+        }
+    });
+    app.window.add_action(&pair_direct);
+
     let quit = gtk::gio::SimpleAction::new("quit", None);
     let window = app.window.clone();
     quit.connect_activate(move |_, _| window.close());
@@ -1425,14 +1434,20 @@ impl App {
                 ServiceKind::Pairing => (format!("Ready to pair · {}", n.addr), "Pair…"),
                 ServiceKind::Connect => (format!("Wireless debugging · {}", n.addr), "Connect"),
                 ServiceKind::Legacy => (format!("adb tcpip · {}", n.addr), "Connect"),
+                ServiceKind::Direct if n.paired => (format!("No ADB · {}", n.addr), "Connect"),
+                ServiceKind::Direct if n.pairing_open => (format!("Ready to pair without ADB · {}", n.addr), "Pair…"),
+                ServiceKind::Direct => (format!("Helper without ADB · {} · tap Pair with PC on the phone", n.addr), "Pair…"),
             };
             row.set_subtitle(&subtitle);
             let button = gtk::Button::builder().label(label).valign(gtk::Align::Center).build();
-            let (cmds, kind, addr) = (self.commands.clone(), n.kind, n.addr.to_string());
+            let (cmds, kind, addr, paired) = (self.commands.clone(), n.kind, n.addr.to_string(), n.paired);
             let window = self.window.clone();
             button.connect_clicked(move |_| match kind {
                 ServiceKind::Pairing => {
                     let _ = WidgetExt::activate_action(&window, "win.pair-code", None);
+                }
+                ServiceKind::Direct if !paired => {
+                    let _ = WidgetExt::activate_action(&window, "win.pair-direct", None);
                 }
                 _ => {
                     let _ = cmds.try_send(UiCommand::Connect { slot: None, addr: addr.clone() });

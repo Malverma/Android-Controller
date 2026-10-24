@@ -18,6 +18,9 @@ pub enum TransportKind {
     Tls,
     /// `adb tcpip 5555`.
     Legacy,
+    /// No ADB: the Android helper's own connection (screen capture and
+    /// accessibility input), for phones without wireless debugging.
+    Direct,
 }
 
 /// Error and warning codes from spec Appendix A.

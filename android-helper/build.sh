@@ -21,12 +21,13 @@ if [[ ! -f $KEYSTORE ]]; then
 fi
 
 rm -rf build && mkdir -p build/classes build/dex
-"$BT/aapt2" link -o build/unsigned.apk -I "$JAR" --manifest AndroidManifest.xml
+"$BT/aapt2" compile --dir res -o build/res.zip
+"$BT/aapt2" link -o build/unsigned.apk -I "$JAR" --manifest AndroidManifest.xml build/res.zip
 javac --release 11 -classpath "$JAR" -d build/classes $(find src -name '*.java')
-"$BT/d8" --min-api 30 --lib "$JAR" --output build/dex $(find build/classes -name '*.class')
+"$BT/d8" --min-api 23 --lib "$JAR" --output build/dex $(find build/classes -name '*.class')
 (cd build/dex && zip -q -j ../unsigned.apk classes.dex)
 "$BT/zipalign" -f -p 4 build/unsigned.apk build/aligned.apk
 "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
     --out build/wireless-debugging-keeper.apk build/aligned.apk
-rm -f build/unsigned.apk build/aligned.apk build/*.idsig
+rm -f build/unsigned.apk build/aligned.apk build/res.zip build/*.idsig
 echo "built $(pwd)/build/wireless-debugging-keeper.apk"
