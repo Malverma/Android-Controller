@@ -216,13 +216,19 @@ impl App {
     }
 
     fn open_pairing(self: &Rc<Self>, page: Page, slot: Option<SlotId>) {
-        if let Some(existing) = self.pairing.borrow().as_ref() {
+        if let Some(existing) = self.pairing_dialog() {
             existing.dialog.present(Some(&self.window));
             return;
         }
         let dlg = PairingDialog::new(self, page, slot);
         dlg.dialog.present(Some(&self.window));
         *self.pairing.borrow_mut() = Some(dlg);
+    }
+
+    /// Clones the dialog out so no `RefCell` borrow is held while calling into
+    /// it: closing it re-enters `pairing_closed`, which needs `borrow_mut`.
+    fn pairing_dialog(&self) -> Option<Rc<PairingDialog>> {
+        self.pairing.borrow().clone()
     }
 
     pub fn pairing_closed(&self) {
@@ -271,7 +277,7 @@ impl App {
                 let prev = self.slot_view(v.slot);
                 let was = prev.as_ref().map(|p| p.phase);
                 self.cards[v.slot as usize - 1].update(&v);
-                if let Some(dlg) = self.pairing.borrow().clone() {
+                if let Some(dlg) = self.pairing_dialog() {
                     if was == Some(PhaseView::Pairing) && v.phase != PhaseView::Pairing {
                         dlg.qr_slot_left_pairing(v.slot, v.error.as_deref());
                     }
@@ -291,19 +297,19 @@ impl App {
             UiEvent::Nearby(list) => {
                 self.state.borrow_mut().nearby = list.clone();
                 self.render_nearby();
-                if let Some(dlg) = self.pairing.borrow().clone() {
+                if let Some(dlg) = self.pairing_dialog() {
                     dlg.update_nearby(&list);
                 }
             }
             UiEvent::UsbDevices(list) => {
                 self.state.borrow_mut().usb = list.clone();
                 self.render_nearby();
-                if let Some(dlg) = self.pairing.borrow().clone() {
+                if let Some(dlg) = self.pairing_dialog() {
                     dlg.update_usb(&list);
                 }
             }
             UiEvent::QrCode { slot, payload, expires_in } => {
-                if let Some(dlg) = self.pairing.borrow().clone() {
+                if let Some(dlg) = self.pairing_dialog() {
                     dlg.show_qr(slot, &payload, expires_in);
                 } else {
                     // Dialog closed before the session started.

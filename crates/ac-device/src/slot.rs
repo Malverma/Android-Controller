@@ -20,7 +20,7 @@ use crate::qr::QrSecret;
 pub const MAX_CONNECT_ATTEMPTS: u32 = 6;
 pub const PAIR_CODE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PAIR_QR_TIMEOUT: Duration = Duration::from_secs(120);
-pub const AWAIT_CONNECT_SERVICE: Duration = Duration::from_secs(10);
+pub const AWAIT_CONNECT_SERVICE: Duration = Duration::from_secs(30);
 pub const AWAIT_ONLINE: Duration = Duration::from_secs(10);
 pub const AWAIT_AUTHORIZATION: Duration = Duration::from_secs(30);
 /// Legacy devices: start ARP re-resolution from this reconnect attempt on.
@@ -143,6 +143,8 @@ pub enum Effect {
     /// Look for an already-discovered connect service for `serial` (or on `ip`).
     FindConnectService { serial: Option<String>, ip: Option<IpAddr> },
     LookupLegacy { mac: String, port: u16 },
+    /// Ask the network again for `_adb-tls-connect._tcp` services.
+    RescanConnect,
     Persist,
     Forget { id: String },
     Toast { code: ErrorCode, message: String },
@@ -443,6 +445,10 @@ impl Slot {
                 let mut fx = Vec::new();
                 if let Some(addr) = self.addr.clone() {
                     fx.push(Effect::Reconnect { addr });
+                }
+                if self.transport == TransportKind::Tls {
+                    // The port may have changed; only a fresh mDNS answer tells us.
+                    fx.push(Effect::RescanConnect);
                 }
                 if self.transport == TransportKind::Legacy
                     && attempt >= LEGACY_LOOKUP_FROM_ATTEMPT

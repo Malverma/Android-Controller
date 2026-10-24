@@ -3,9 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use zbus::Connection;
 use zbus::zvariant::OwnedObjectPath;
@@ -16,6 +17,11 @@ const IF_UNSPEC: i32 = -1;
 /// `AVAHI_PROTO_INET`: browse and resolve over IPv4 only. Phones advertise on
 /// both families; IPv4 avoids duplicate entries and link-local v6 scope ids.
 const PROTO_INET: i32 = 0;
+/// How long a rescan browser lives. Avahi queries at 1, 2, 4, 8, 16 s after
+/// creating a browser, so this covers five fresh queries.
+const RESCAN_FOR: Duration = Duration::from_secs(30);
+/// Rescan requests closer together than this are merged.
+const RESCAN_MIN_GAP: Duration = Duration::from_secs(5);
 
 #[zbus::proxy(
     interface = "org.freedesktop.Avahi.Server2",
@@ -50,6 +56,7 @@ trait Server2 {
 #[zbus::proxy(interface = "org.freedesktop.Avahi.ServiceBrowser", default_service = "org.freedesktop.Avahi")]
 trait ServiceBrowser {
     fn start(&self) -> zbus::Result<()>;
+    fn free(&self) -> zbus::Result<()>;
 
     #[zbus(signal)]
     fn item_new(&self, interface: i32, protocol: i32, name: &str, service_type: &str, domain: &str, flags: u32)
@@ -72,34 +79,70 @@ trait ServiceBrowser {
 
 /// Starts browsing all ADB service types. Events are sent on `tx`; on
 /// failure a single `DiscoveryEvent::Unavailable` is sent and the task ends.
-pub fn spawn_avahi(tx: UnboundedSender<DiscoveryEvent>) -> JoinHandle<()> {
+///
+/// Each `ServiceKind` sent on `rescan` starts a short-lived extra browser,
+/// which makes Avahi query the network again right away. A long-running
+/// browser backs off to one query an hour, and phones whose Wi-Fi was asleep
+/// when it last asked are otherwise not seen until they re-announce.
+pub fn spawn_avahi(tx: UnboundedSender<DiscoveryEvent>, rescan: UnboundedReceiver<ServiceKind>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(tx.clone()).await {
+        if let Err(e) = run(tx.clone(), rescan).await {
             tracing::warn!("avahi discovery unavailable: {e}");
             let _ = tx.send(DiscoveryEvent::Unavailable(e.to_string()));
         }
     })
 }
 
-async fn run(tx: UnboundedSender<DiscoveryEvent>) -> zbus::Result<()> {
+async fn run(tx: UnboundedSender<DiscoveryEvent>, mut rescan: UnboundedReceiver<ServiceKind>) -> zbus::Result<()> {
     let conn = Connection::system().await?;
     let server = Server2Proxy::new(&conn).await?;
     tracing::info!("connected to {}", server.get_version_string().await?);
 
     let mut browsers = Vec::new();
     for kind in ServiceKind::ALL {
-        let path = server.service_browser_prepare(IF_UNSPEC, PROTO_INET, kind.service_type(), "", 0).await?;
-        let browser = ServiceBrowserProxy::builder(&conn).path(path)?.build().await?;
-        let new = browser.receive_item_new().await?;
-        let removed = browser.receive_item_remove().await?;
-        let failed = browser.receive_failure().await?;
-        browser.start().await?;
-        browsers.push(tokio::spawn(browse(server.clone(), kind, new, removed, failed, tx.clone())));
+        let (browser, task) = start_browser(&conn, &server, kind, &tx).await?;
+        browsers.push((browser, task));
     }
-    for b in browsers {
-        let _ = b.await;
+    let mut last: BTreeMap<ServiceKind, tokio::time::Instant> = BTreeMap::new();
+    while let Some(kind) = rescan.recv().await {
+        let now = tokio::time::Instant::now();
+        if last.get(&kind).is_some_and(|t| now.duration_since(*t) < RESCAN_MIN_GAP) {
+            continue;
+        }
+        last.insert(kind, now);
+        tracing::debug!("rescanning {}", kind.service_type());
+        match start_browser(&conn, &server, kind, &tx).await {
+            Ok((browser, task)) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(RESCAN_FOR).await;
+                    task.abort();
+                    let _ = browser.free().await;
+                });
+            }
+            Err(e) => tracing::warn!("rescan of {} failed: {e}", kind.service_type()),
+        }
+    }
+    // The manager is gone.
+    for (_, task) in browsers {
+        task.abort();
     }
     Ok(())
+}
+
+async fn start_browser(
+    conn: &Connection,
+    server: &Server2Proxy<'static>,
+    kind: ServiceKind,
+    tx: &UnboundedSender<DiscoveryEvent>,
+) -> zbus::Result<(ServiceBrowserProxy<'static>, JoinHandle<()>)> {
+    let path = server.service_browser_prepare(IF_UNSPEC, PROTO_INET, kind.service_type(), "", 0).await?;
+    let browser = ServiceBrowserProxy::builder(conn).path(path)?.build().await?;
+    let new = browser.receive_item_new().await?;
+    let removed = browser.receive_item_remove().await?;
+    let failed = browser.receive_failure().await?;
+    browser.start().await?;
+    let task = tokio::spawn(browse(server.clone(), kind, new, removed, failed, tx.clone()));
+    Ok((browser, task))
 }
 
 async fn browse(

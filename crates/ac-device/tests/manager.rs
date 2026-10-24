@@ -156,6 +156,39 @@ async fn pair_with_code_then_connect_via_mdns() {
 }
 
 #[tokio::test]
+async fn connect_service_announced_late_after_pairing() {
+    // The phone only answers mDNS some seconds after pairing (Wi-Fi power save).
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        s.pairable.insert("192.168.0.253:41000".into(), ("482913".into(), "adb-0811122210042336-tjt4sf".into()));
+        s.connectable.insert("192.168.0.253:41927".into(), phone("0811122210042336", "Schok Volt SV55"));
+    });
+    let h = start(&mock);
+    let svc = |kind, addr: &str| DiscoveredDevice {
+        instance: "adb-0811122210042336-tjt4sf".into(),
+        kind,
+        addr: addr.parse().unwrap(),
+        host: "Android-3.local".into(),
+        txt: BTreeMap::new(),
+    };
+    h.discovery_tx.send(DiscoveryEvent::Added(svc(ServiceKind::Pairing, "192.168.0.253:41000"))).unwrap();
+    wait_for(&h, "nearby", |e| matches!(e, UiEvent::Nearby(n) if !n.is_empty()).then_some(())).await;
+    h.commands
+        .send(UiCommand::PairCode { slot: None, instance: "adb-0811122210042336-tjt4sf".into(), code: "482913".into() })
+        .await
+        .unwrap();
+    wait_for(&h, "paired", |e| match e {
+        UiEvent::Slot(v) if v.detail.starts_with("Paired") => Some(()),
+        _ => None,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    h.discovery_tx.send(DiscoveryEvent::Added(svc(ServiceKind::Connect, "192.168.0.253:41927"))).unwrap();
+    let v = wait_phase(&h, 1, PhaseView::Online).await;
+    assert_eq!(v.title, "Schok Volt SV55");
+}
+
+#[tokio::test]
 async fn pair_by_typed_address_without_mdns() {
     // Wired PC, phone on Wi-Fi, router filters multicast: nothing is ever discovered.
     let mock = MockAdb::start().await;

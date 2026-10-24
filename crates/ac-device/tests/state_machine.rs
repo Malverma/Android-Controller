@@ -284,6 +284,16 @@ fn t19_tls_address_change_via_mdns() {
 }
 
 #[test]
+fn t19b_tls_backoff_asks_mdns_again() {
+    // A phone whose Wi-Fi slept may not re-announce its new port by itself.
+    let mut s = online("10.0.0.7:37115", "SER1");
+    let fx = ev(&mut s, SlotEvent::AdbGone { serial: "10.0.0.7:37115".into() });
+    let fx = fire(&mut s, &fx);
+    assert_eq!(fx[0], Effect::Reconnect { addr: "10.0.0.7:37115".into() });
+    assert!(fx.contains(&Effect::RescanConnect));
+}
+
+#[test]
 fn t20_backoff_reconnects_and_legacy_looks_up_mac() {
     let mut s = Slot::new(1);
     ev(&mut s, SlotEvent::Connect { addr: "10.0.0.7:5555".into(), transport: TransportKind::Legacy, expect_serial: None, silent: false });
@@ -295,6 +305,7 @@ fn t20_backoff_reconnects_and_legacy_looks_up_mac() {
     let fx = fire(&mut s, &fx); // attempt 1
     assert_eq!(fx[0], Effect::Reconnect { addr: "10.0.0.7:5555".into() });
     assert!(!fx.iter().any(|f| matches!(f, Effect::LookupLegacy { .. })));
+    assert!(!fx.contains(&Effect::RescanConnect), "legacy devices are not on mDNS");
     let fx = fire(&mut s, &fx); // attempt 2: ARP lookup starts
     assert!(fx.contains(&Effect::LookupLegacy { mac: "a6:3b:91:0c:4e:12".into(), port: 5555 }));
 

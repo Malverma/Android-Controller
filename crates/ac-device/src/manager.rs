@@ -99,6 +99,8 @@ struct Manager {
     /// Device ids / adb serials the user disconnected: never auto-adopt or
     /// auto-connect them until the user connects again.
     suppressed: HashSet<String>,
+    /// Asks the Avahi browser to query the network again.
+    rescan: Option<mpsc::UnboundedSender<ServiceKind>>,
     tx: mpsc::UnboundedSender<Msg>,
     rx: Option<mpsc::UnboundedReceiver<Msg>>,
     ui: async_channel::Sender<UiEvent>,
@@ -137,6 +139,7 @@ impl Manager {
             adb_snapshot: Vec::new(),
             last_usb: Vec::new(),
             suppressed: HashSet::new(),
+            rescan: None,
             tx,
             rx: Some(rx),
             ui,
@@ -152,7 +155,11 @@ impl Manager {
     ) {
         let mut rx = self.rx.take().expect("run called once");
         let _tracker = tokio::spawn(track_devices(self.adb.clone(), self.cfg.clone(), self.tx.clone()));
-        let _discovery = (self.discovery && self.cfg.discovery.avahi).then(|| ac_discovery::spawn_avahi(disc_tx));
+        let _discovery = (self.discovery && self.cfg.discovery.avahi).then(|| {
+            let (rescan, rescan_rx) = mpsc::unbounded_channel();
+            self.rescan = Some(rescan);
+            ac_discovery::spawn_avahi(disc_tx, rescan_rx)
+        });
         let _pruner = {
             let tx = self.tx.clone();
             tokio::spawn(async move {
@@ -369,14 +376,20 @@ impl Manager {
                 }));
             }
             Effect::FindConnectService { serial, ip } => {
-                let found = self.nearby.values().map(|n| &n.dev).find(|d| {
-                    d.kind == ServiceKind::Connect
-                        && (serial.is_some() && d.serial() == serial.as_deref() || serial.is_none() && Some(d.addr.ip()) == ip)
-                });
-                if let Some(d) = found {
-                    let _ = self.tx.send(Msg::Slot(slot, SlotEvent::ConnectSeen { addr: d.addr }));
+                // Prefer the serial; fall back to the phone's IP in case adb's
+                // pairing guid and the mDNS instance name disagree.
+                let connect = || self.nearby.values().map(|n| &n.dev).filter(|d| d.kind == ServiceKind::Connect);
+                let found = connect()
+                    .find(|d| serial.is_some() && d.serial() == serial.as_deref())
+                    .or_else(|| connect().find(|d| ip.is_some() && Some(d.addr.ip()) == ip));
+                match found {
+                    Some(d) => {
+                        let _ = self.tx.send(Msg::Slot(slot, SlotEvent::ConnectSeen { addr: d.addr }));
+                    }
+                    None => self.rescan(ServiceKind::Connect),
                 }
             }
+            Effect::RescanConnect => self.rescan(ServiceKind::Connect),
             Effect::LookupLegacy { mac, port } => {
                 let path = self.arp_table.clone();
                 self.spawn_msg(async move {
@@ -393,6 +406,12 @@ impl Manager {
                 self.save_devices();
             }
             Effect::Toast { code, message } => self.toast(Some(code), message),
+        }
+    }
+
+    fn rescan(&self, kind: ServiceKind) {
+        if let Some(r) = &self.rescan {
+            let _ = r.send(kind);
         }
     }
 
@@ -731,7 +750,8 @@ impl Manager {
                 let Some(serial) = dev.serial() else { return };
                 let auto = self.cfg.discovery.auto_connect_known && !self.suppressed.contains(serial);
                 let slot = self.slots.iter().find(|s| {
-                    let mine = s.device_id() == Some(serial) || s.expect_serial.as_deref() == Some(serial);
+                    let just_paired_here = matches!(s.phase, Phase::Pairing { paired: true, pair_ip: Some(ip), .. } if ip == dev.addr.ip());
+                    let mine = s.device_id() == Some(serial) || s.expect_serial.as_deref() == Some(serial) || just_paired_here;
                     mine && match s.phase {
                         Phase::Reconnecting { .. } | Phase::Pairing { paired: true, .. } | Phase::ConnectingAdb { connected: false, .. } => true,
                         Phase::Disconnected { .. } => {
