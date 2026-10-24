@@ -29,6 +29,18 @@ const STAY_AWAKE_FILE: &str = "/data/local/tmp/android-controller-screen-timeout
 /// `Integer.MAX_VALUE` ms: the screen never times out.
 const STAY_AWAKE_TIMEOUT: u32 = i32::MAX as u32;
 
+/// Finishes setting up the Wireless Debugging Keeper helper (android-helper/)
+/// on a phone that has it installed: the one permission it needs can only be
+/// granted over adb. Prints `@granted` when it did the setup now.
+const HELPER_SETUP_CMD: &str = "p=org.androidcontroller.keeper; \
+pm path $p >/dev/null 2>&1 || { echo @none; exit 0; }; \
+dumpsys package $p | grep -q 'WRITE_SECURE_SETTINGS: granted=true' && { echo @ready; exit 0; }; \
+pm grant $p android.permission.WRITE_SECURE_SETTINGS && echo @granted; \
+pm grant $p android.permission.POST_NOTIFICATIONS >/dev/null 2>&1; \
+dumpsys deviceidle whitelist +$p >/dev/null 2>&1; \
+cmd appops set $p RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1; \
+am broadcast -a $p.START -n $p/.BootReceiver >/dev/null 2>&1; true";
+
 /// How often a given-up `adb tcpip` phone is checked for being back (it
 /// does not announce itself over mDNS, so nothing else would notice).
 const LEGACY_PROBE_EVERY: Duration = Duration::from_secs(30);
@@ -173,6 +185,8 @@ struct Manager {
     stay_awake: Vec<Option<bool>>,
     stay_awake_busy: Vec<bool>,
     last_legacy_probe: Instant,
+    /// Per slot: the helper check ran for the phone currently online.
+    helper_checked: Vec<bool>,
 }
 
 impl Manager {
@@ -236,6 +250,7 @@ impl Manager {
             stay_awake: vec![None; n as usize],
             stay_awake_busy: vec![false; n as usize],
             last_legacy_probe: Instant::now(),
+            helper_checked: vec![false; n as usize],
         }
     }
 
@@ -357,8 +372,15 @@ impl Manager {
         for i in 0..self.slots.len() {
             if !matches!(self.slots[i].phase, Phase::Online { .. }) {
                 self.stay_awake[i] = None;
-            } else if self.stay_awake[i].is_none() && !self.stay_awake_busy[i] {
+                self.helper_checked[i] = false;
+                continue;
+            }
+            if self.stay_awake[i].is_none() && !self.stay_awake_busy[i] {
                 self.run_stay_awake(i, None);
+            }
+            if !self.helper_checked[i] {
+                self.helper_checked[i] = true;
+                self.setup_helper(i);
             }
         }
         for (i, s) in self.slots.iter().enumerate() {
@@ -603,6 +625,35 @@ impl Manager {
                 }
             });
         }
+    }
+
+    /// Grants the helper app its permission if the phone has it installed.
+    fn setup_helper(&self, i: usize) {
+        let s = &self.slots[i];
+        let (Some(serial), Some(d)) = (s.adb_serial.clone(), s.device.as_ref()) else { return };
+        if d.sdk != 0 && d.sdk < 30 {
+            return; // wireless debugging (and the helper) need Android 11+
+        }
+        let shell_v2 = d.shell_v2();
+        let title = if s.alias.is_empty() && !d.model.is_empty() { d.model.clone() } else { s.display_name() };
+        let adb = self.adb.clone();
+        self.spawn_msg(async move {
+            match adb.shell(&serial, HELPER_SETUP_CMD, shell_v2).await {
+                Ok(out) if out.stdout.lines().any(|l| l.trim() == "@granted") => {
+                    tracing::info!("set up Wireless Debugging Keeper on {title}");
+                    Msg::Toast(None, format!("Wireless Debugging Keeper is set up on {title}: wireless debugging now stays on"))
+                }
+                Ok(out) if out.stdout.contains("@none") || out.stdout.contains("@ready") => Msg::Prune,
+                Ok(out) => {
+                    tracing::warn!("helper setup on {title}: {}{}", out.stdout, out.stderr);
+                    Msg::Prune
+                }
+                Err(e) => {
+                    tracing::warn!("helper setup on {title}: {e}");
+                    Msg::Prune
+                }
+            }
+        });
     }
 
     /// Reads (`set = None`) or changes the phone's "keep screen on" state.

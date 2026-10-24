@@ -14,7 +14,19 @@ on, so Android Controller can reconnect by itself:
   It never touches Wi-Fi you switched off yourself.
 - A silent notification shows what it is doing, with a **Pause** button.
 
-## Install
+## Install on a new phone (download link)
+
+1. On the phone, open this link and install the app (allow your browser to
+   "install unknown apps" when Android asks):
+   **https://github.com/Malverma/Android-Controller/raw/main/android-helper/dist/wireless-debugging-keeper.apk**
+   One APK works on 32-bit and 64-bit phones (it has no native code).
+2. Turn on **Developer options › Wireless debugging** and pair the phone in
+   Android Controller (**Add Device**). Tick **Always allow on this network**.
+3. That's it: when the phone connects, Android Controller grants the
+   helper its permission and starts it, and shows a toast. Until then the
+   helper's notification says it needs setup from the PC.
+
+## Install from the PC
 
 With each phone reachable by adb (USB, or wireless debugging already on):
 
