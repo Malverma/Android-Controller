@@ -390,7 +390,7 @@ impl App {
         if rows == 0 {
             let row = adw::ActionRow::builder()
                 .title("No phones found yet")
-                .subtitle("On the phone: Settings › Developer options › Wireless debugging (same Wi-Fi network)")
+                .subtitle("On the phone: Settings › Developer options › Wireless debugging (phone on the same network as this PC)")
                 .build();
             let spinner = gtk::Spinner::builder().spinning(true).build();
             row.add_prefix(&spinner);

@@ -156,6 +156,32 @@ async fn pair_with_code_then_connect_via_mdns() {
 }
 
 #[tokio::test]
+async fn pair_by_typed_address_without_mdns() {
+    // Wired PC, phone on Wi-Fi, router filters multicast: nothing is ever discovered.
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        s.pairable.insert("192.168.0.84:41000".into(), ("482913".into(), "adb-SER7-OpVSoG".into()));
+        s.connectable.insert("192.168.0.84:37999".into(), phone("SER7", "Galaxy S23"));
+    });
+    let h = start(&mock);
+    h.commands
+        .send(UiCommand::PairAddr {
+            slot: None,
+            pair_addr: "192.168.0.84:41000".into(),
+            code: "482913".into(),
+            connect: Some("37999".into()),
+        })
+        .await
+        .unwrap();
+    let v = wait_phase(&h, 1, PhaseView::Online).await;
+    assert_eq!(v.title, "Galaxy S23");
+    assert_eq!(v.device_id.as_deref(), Some("SER7"));
+    let reqs = mock.requests();
+    assert!(reqs.contains(&"host:pair:482913:192.168.0.84:41000".to_owned()));
+    assert!(reqs.contains(&"host:connect:192.168.0.84:37999".to_owned()), "{reqs:?}");
+}
+
+#[tokio::test]
 async fn wrong_pairing_code_reports_failure() {
     let mock = MockAdb::start().await;
     mock.with_state(|s| {

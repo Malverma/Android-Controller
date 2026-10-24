@@ -65,7 +65,7 @@ fn page_box() -> gtk::Box {
 
 impl PairingDialog {
     pub fn new(app: &Rc<App>, page: Page, slot: Option<SlotId>) -> Rc<Self> {
-        let dialog = adw::Dialog::builder().title("Add Device").content_width(460).content_height(600).build();
+        let dialog = adw::Dialog::builder().title("Add Device").content_width(460).content_height(680).build();
         let stack = adw::ViewStack::new();
         let switcher = adw::ViewSwitcher::builder().stack(&stack).policy(adw::ViewSwitcherPolicy::Wide).build();
         let header = adw::HeaderBar::builder().title_widget(&switcher).build();
@@ -105,6 +105,24 @@ It appears below; type the 6-digit code it shows.",
         code_list.add_css_class("boxed-list");
         code_list.set_selection_mode(gtk::SelectionMode::None);
         code_page.append(&code_list);
+        let typed_group = adw::PreferencesGroup::builder()
+            .title("Phone not listed?")
+            .description(
+                "Some routers don't pass discovery between Wi-Fi and wired PCs. Type what the phone shows instead: \
+the pairing dialog's IP address &amp; port and code, and the port from the top of the Wireless debugging screen.",
+            )
+            .build();
+        let pair_addr_row = adw::EntryRow::builder().title("Pairing IP:port, e.g. 192.168.0.84:41567").build();
+        let pair_code_row = adw::EntryRow::builder().title("Wi-Fi pairing code").input_purpose(gtk::InputPurpose::Digits).build();
+        let connect_row = adw::EntryRow::builder().title("Wireless debugging port, e.g. 37115").build();
+        let typed_pair = gtk::Button::builder().label("Pair").halign(gtk::Align::End).margin_top(6).margin_bottom(6).build();
+        typed_pair.add_css_class("suggested-action");
+        typed_pair.add_css_class("pill");
+        for r in [&pair_addr_row, &pair_code_row, &connect_row] {
+            typed_group.add(r);
+        }
+        code_page.append(&typed_group);
+        code_page.append(&typed_pair);
 
         // --- Manual page ---
         let manual_page = page_box();
@@ -165,6 +183,20 @@ It appears below; type the 6-digit code it shows.",
                     this.send(UiCommand::Connect { slot: this.chosen_slot(), addr: row.text().to_string() });
                 }
             });
+        }
+        {
+            let weak = Rc::downgrade(&this);
+            let submit = move || {
+                let Some(this) = weak.upgrade() else { return };
+                let connect = connect_row.text().to_string();
+                this.send(UiCommand::PairAddr {
+                    slot: this.chosen_slot(),
+                    pair_addr: pair_addr_row.text().to_string(),
+                    code: pair_code_row.text().to_string(),
+                    connect: (!connect.trim().is_empty()).then_some(connect),
+                });
+            };
+            typed_pair.connect_clicked(move |_| submit());
         }
         {
             let weak = Rc::downgrade(&this);

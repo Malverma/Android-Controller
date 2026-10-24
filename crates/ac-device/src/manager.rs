@@ -485,16 +485,34 @@ impl Manager {
                 self.feed(slot, SlotEvent::Connect { addr, transport, expect_serial: None, silent: false });
             }
             UiCommand::PairCode { slot, instance, code } => {
-                let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-                if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-                    return self.toast(None, "The pairing code is 6 digits");
-                }
+                let Some(code) = parse_pair_code(&code) else { return self.toast(None, "The pairing code is 6 digits") };
                 let Some(n) = self.nearby.get(&(ServiceKind::Pairing, instance.clone())) else {
                     return self.toast(Some(ErrorCode::PairFailed), "That pairing request is no longer advertised; reopen it on the phone");
                 };
                 let addr = n.dev.addr;
                 let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
-                self.feed(slot, SlotEvent::PairCode { addr, code });
+                self.feed(slot, SlotEvent::PairCode { addr, code, connect: None });
+            }
+            UiCommand::PairAddr { slot, pair_addr, code, connect } => {
+                let Some(code) = parse_pair_code(&code) else { return self.toast(None, "The pairing code is 6 digits") };
+                let Ok(addr) = pair_addr.trim().parse::<SocketAddr>() else {
+                    return self.toast(None, format!("“{}” is not an IP:port address", pair_addr.trim()));
+                };
+                if let Err(m) = self.check_lan(&addr.to_string()) {
+                    return self.toast(Some(ErrorCode::NotLan), m);
+                }
+                let connect = match connect.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                    None => None,
+                    Some(c) => match connect_addr_for(addr, c) {
+                        Some(c) if self.check_lan(&c).is_ok() => Some(c),
+                        _ => return self.toast(None, format!("“{c}” is not a port or IP:port")),
+                    },
+                };
+                let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
+                if let Some(c) = &connect {
+                    self.suppressed.remove(c);
+                }
+                self.feed(slot, SlotEvent::PairCode { addr, code, connect });
             }
             UiCommand::PairQr { slot } => {
                 let Some(slot) = self.pick_slot(slot) else { return self.toast(None, "All 5 slots are in use") };
@@ -742,6 +760,21 @@ async fn connect(adb: &AdbClient, addr: &str) -> Result<(), String> {
     }
 }
 
+/// Digits only, spaces allowed (`482 913`).
+fn parse_pair_code(code: &str) -> Option<String> {
+    let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    (code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())).then_some(code)
+}
+
+/// The connect address typed next to a manual pairing: a bare port on the
+/// pairing IP, or a full `ip:port`.
+fn connect_addr_for(pair: SocketAddr, typed: &str) -> Option<String> {
+    if let Ok(port) = typed.parse::<u16>() {
+        return (port != 0).then(|| SocketAddr::new(pair.ip(), port).to_string());
+    }
+    typed.parse::<SocketAddr>().ok().map(|a| a.to_string())
+}
+
 async fn identify(adb: &AdbClient, serial: &str, low_latency_wifi: bool) -> SlotEvent {
     let features = match adb.features(serial).await {
         Ok(f) => f,
@@ -876,6 +909,18 @@ mod tests {
         assert_eq!(normalize_addr(" 192.168.1.5:37115 ", 5555), Some(("192.168.1.5:37115".into(), TransportKind::Tls)));
         assert_eq!(normalize_addr("[fe80::1]:5555", 5555), Some(("[fe80::1]:5555".into(), TransportKind::Legacy)));
         assert_eq!(normalize_addr("phone.local", 5555), None);
+    }
+
+    #[test]
+    fn manual_pairing_inputs() {
+        assert_eq!(parse_pair_code(" 482 913 ").as_deref(), Some("482913"));
+        assert_eq!(parse_pair_code("48291"), None);
+        assert_eq!(parse_pair_code("48291a"), None);
+        let pair: SocketAddr = "192.168.0.84:41000".parse().unwrap();
+        assert_eq!(connect_addr_for(pair, "37115").as_deref(), Some("192.168.0.84:37115"));
+        assert_eq!(connect_addr_for(pair, "192.168.0.85:37115").as_deref(), Some("192.168.0.85:37115"));
+        assert_eq!(connect_addr_for(pair, "0"), None);
+        assert_eq!(connect_addr_for(pair, "phone"), None);
     }
 
     #[test]

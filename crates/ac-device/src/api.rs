@@ -12,6 +12,11 @@ pub enum UiCommand {
     Connect { slot: Option<SlotId>, addr: String },
     /// Pair with the 6-digit code shown for a discovered pairing service.
     PairCode { slot: Option<SlotId>, instance: String, code: String },
+    /// Pair by typed address, for networks where mDNS does not reach this PC
+    /// (e.g. a wired PC and a router that filters multicast to Wi-Fi).
+    /// `pair_addr` is the `ip:port` from the phone's pairing-code screen;
+    /// `connect` is the port (or `ip:port`) shown under Wireless debugging.
+    PairAddr { slot: Option<SlotId>, pair_addr: String, code: String, connect: Option<String> },
     /// Start a QR pairing session; answered with `UiEvent::QrCode`.
     PairQr { slot: Option<SlotId> },
     CancelPairing { slot: SlotId },

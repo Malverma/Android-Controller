@@ -108,7 +108,9 @@ pub enum SlotEvent {
     /// A network transport adb already has (adb's own mDNS auto-connect, or a
     /// CLI `adb connect`) is taken over by this slot.
     Adopt { adb_serial: String, transport: TransportKind },
-    PairCode { addr: SocketAddr, code: String },
+    /// `connect` is the phone's `ip:port` from Wireless debugging, when the
+    /// user typed it: connect there after pairing instead of waiting for mDNS.
+    PairCode { addr: SocketAddr, code: String, connect: Option<String> },
     PairQr { secret: QrSecret },
     QrServiceSeen { addr: SocketAddr },
     /// `Ok(guid)` where guid is `adb-<serial>-<suffix>` when adb reports it.
@@ -163,6 +165,8 @@ pub struct Slot {
     /// Device serial we expect from mDNS (pairing guid, or devices.toml).
     pub expect_serial: Option<String>,
     pub wifi_mac: Option<String>,
+    /// Address to connect to once pairing succeeds (manual pairing).
+    pair_connect: Option<String>,
     identify_inflight: bool,
     generation: u64,
 }
@@ -180,6 +184,7 @@ impl Slot {
             adb_serial: None,
             expect_serial: None,
             wifi_mac: None,
+            pair_connect: None,
             identify_inflight: false,
             generation: 0,
         }
@@ -315,13 +320,15 @@ impl Slot {
             }
 
             // ---- pairing --------------------------------------------------------
-            (P::Empty | P::Disconnected { .. }, E::PairCode { addr, code }) => {
+            (P::Empty | P::Disconnected { .. }, E::PairCode { addr, code, connect }) => {
                 self.transport = TransportKind::Tls;
+                self.pair_connect = connect;
                 self.set_phase(P::Pairing { qr: None, pair_ip: Some(addr.ip()), paired: false });
                 vec![Effect::Pair { code, addr }, self.timer(TimerKind::PairDeadline, PAIR_CODE_TIMEOUT)]
             }
             (P::Empty | P::Disconnected { .. }, E::PairQr { secret }) => {
                 self.transport = TransportKind::Tls;
+                self.pair_connect = None;
                 self.set_phase(P::Pairing { qr: Some(secret), pair_ip: None, paired: false });
                 vec![self.timer(TimerKind::PairDeadline, PAIR_QR_TIMEOUT)]
             }
@@ -332,6 +339,9 @@ impl Slot {
             (P::Pairing { pair_ip, paired: false, .. }, E::PairDone(Ok(guid))) => {
                 let serial = guid.as_deref().and_then(serial_from_instance).map(str::to_owned);
                 self.expect_serial = serial.clone();
+                if let Some(addr) = self.pair_connect.take() {
+                    return self.start_connect(addr, TransportKind::Tls, serial, false);
+                }
                 self.phase = P::Pairing { qr: None, pair_ip, paired: true };
                 vec![
                     Effect::FindConnectService { serial, ip: pair_ip },

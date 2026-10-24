@@ -77,7 +77,7 @@ fn t03_disconnected_user_connect() {
 #[test]
 fn t04_t06_pair_code_then_connect_service_seen() {
     let mut s = Slot::new(2);
-    let fx = ev(&mut s, SlotEvent::PairCode { addr: sa("192.168.1.42:41000"), code: "123456".into() });
+    let fx = ev(&mut s, SlotEvent::PairCode { addr: sa("192.168.1.42:41000"), code: "123456".into(), connect: None });
     assert_eq!(fx[0], Effect::Pair { code: "123456".into(), addr: sa("192.168.1.42:41000") });
     assert_eq!(current_timer(&fx).1, PAIR_CODE_TIMEOUT);
 
@@ -88,6 +88,17 @@ fn t04_t06_pair_code_then_connect_service_seen() {
     let fx = ev(&mut s, SlotEvent::ConnectSeen { addr: sa("192.168.1.42:37115") });
     assert_eq!(fx, vec![Effect::Connect { addr: "192.168.1.42:37115".into() }]);
     assert!(matches!(s.phase, Phase::ConnectingAdb { .. }));
+}
+
+#[test]
+fn t04b_manual_pair_connects_to_typed_address() {
+    // Wired PC whose router drops mDNS between Wi-Fi and Ethernet.
+    let mut s = Slot::new(1);
+    ev(&mut s, SlotEvent::PairCode { addr: sa("192.168.0.84:41000"), code: "123456".into(), connect: Some("192.168.0.84:37115".into()) });
+    let fx = ev(&mut s, SlotEvent::PairDone(Ok(Some("adb-SER1-OpVSoG".into()))));
+    assert_eq!(fx, vec![Effect::Connect { addr: "192.168.0.84:37115".into() }]);
+    assert!(matches!(s.phase, Phase::ConnectingAdb { attempt: 0, connected: false, silent: false, .. }));
+    assert_eq!(s.expect_serial.as_deref(), Some("SER1"));
 }
 
 #[test]
@@ -105,7 +116,7 @@ fn t05_qr_session_pairs_when_phone_advertises() {
 #[test]
 fn t06b_adb_auto_connects_after_pairing() {
     let mut s = Slot::new(1);
-    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into() });
+    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into(), connect: None });
     ev(&mut s, SlotEvent::PairDone(Ok(Some("adb-SER9-xYz123".into()))));
     let serial = "adb-SER9-xYz123._adb-tls-connect._tcp";
     assert!(s.wants_adb_serial(serial));
@@ -118,7 +129,7 @@ fn t06b_adb_auto_connects_after_pairing() {
 #[test]
 fn t07_pair_failure_and_timeouts() {
     let mut s = Slot::new(1);
-    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "000000".into() });
+    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "000000".into(), connect: None });
     let fx = ev(&mut s, SlotEvent::PairDone(Err("Wrong password".into())));
     assert!(has_toast(&fx, ErrorCode::PairFailed));
     assert!(matches!(&s.phase, Phase::Disconnected { error: Some(e) } if e.contains("Wrong password")));
@@ -129,7 +140,7 @@ fn t07_pair_failure_and_timeouts() {
     assert!(has_toast(&fx, ErrorCode::PairTimeout));
 
     let mut s = Slot::new(1);
-    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into() });
+    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into(), connect: None });
     let fx = ev(&mut s, SlotEvent::PairDone(Ok(None)));
     assert_eq!(current_timer(&fx).0, TimerKind::AwaitConnectService);
     let fx = fire(&mut s, &fx);
@@ -139,7 +150,7 @@ fn t07_pair_failure_and_timeouts() {
 #[test]
 fn t08_pair_deadline_is_stale_after_pairing_succeeds() {
     let mut s = Slot::new(1);
-    let first = ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into() });
+    let first = ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into(), connect: None });
     ev(&mut s, SlotEvent::PairDone(Ok(None)));
     // The original 30 s pairing deadline fires late: it must be ignored.
     assert!(fire(&mut s, &first).is_empty());
