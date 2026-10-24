@@ -1,7 +1,7 @@
 # Local build from this repository: cd packaging/arch && makepkg -si
 # Builds the last *committed* state (git+file:// source).
 pkgname=android-controller
-pkgver=0.1.0.r2.gf9fb8fa
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Mirror and control up to four Android phones over Wi-Fi (GTK4)"
 url='https://github.com/Malverma/Android-Controller'
@@ -17,7 +17,12 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd "$pkgname"
-  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  # v0.2.0 → 0.2.0.r0.g1234567; commits after a tag bump the r count.
+  if git describe --long --tags --abbrev=7 >/dev/null 2>&1; then
+    git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  else
+    printf '0.2.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  fi
 }
 
 prepare() {

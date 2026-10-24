@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ac-adb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adb-mock",
  "thiserror",
@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "ac-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ac-core",
  "chrono",
@@ -26,14 +26,14 @@ dependencies = [
 
 [[package]]
 name = "ac-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ac-device"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ac-adb",
  "ac-config",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "ac-discovery"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "tokio",
@@ -61,11 +61,11 @@ dependencies = [
 
 [[package]]
 name = "ac-input"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ac-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ac-scrcpy",
  "ffmpeg-sys-next",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "ac-scrcpy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ac-adb",
  "thiserror",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "adb-mock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
 ]
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "android-controller"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ac-config",
  "ac-core",
