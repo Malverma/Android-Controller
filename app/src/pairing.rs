@@ -83,7 +83,8 @@ impl PairingDialog {
         let qr_page = page_box();
         qr_page.append(&instructions(
             "On the phone open <b>Settings › Developer options › Wireless debugging</b>, \
-tap <b>Pair device with QR code</b> and scan this code.",
+tap <b>Pair device with QR code</b> and scan this code with that scanner.\n\
+<b>Don't use the camera app</b> — it reads this as a Wi-Fi network.",
         ));
         let qr_picture = gtk::Picture::builder().width_request(240).height_request(240).halign(gtk::Align::Center).build();
         qr_picture.add_css_class("qr");
