@@ -29,6 +29,8 @@ use crate::stream::{
     spawn_session,
 };
 use ac_media::MediaContext;
+use serde_json::Value;
+use tokio::sync::oneshot;
 use ac_scrcpy::VideoCodec;
 
 /// Phone-side copy of the user's screen timeout while "keep screen on" is
@@ -82,11 +84,14 @@ pub struct ManagerOptions {
     pub streaming: bool,
     /// Decoding setup; created (with a VA-API probe) when `None`.
     pub media: Option<Arc<MediaContext>>,
+    /// Serve the automation socket here (when `config.automation.enabled`);
+    /// the app uses `control::socket_path()`, tests none.
+    pub control_socket: Option<PathBuf>,
 }
 
 impl ManagerOptions {
     pub fn new(config: Config, paths: Option<Paths>) -> Self {
-        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None }
+        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None, control_socket: None }
     }
 }
 
@@ -106,6 +111,9 @@ impl ManagerHandle {
         self.task.abort();
     }
 }
+
+mod automation;
+mod games;
 
 enum Msg {
     Ui(UiCommand),
@@ -141,6 +149,12 @@ enum Msg {
     Emit(UiEvent),
     /// The helper's version code on the phone `device_id` (over ADB).
     HelperVersion { slot: SlotId, device_id: String, version: u32 },
+    /// The helper's screen size (no ADB) changed.
+    DirectScreen { slot: SlotId, conn: u64, size: (u32, u32) },
+    /// The game add-on on an ADB phone (connection `serial`).
+    Game { slot: SlotId, serial: String, ev: crate::game::GameEvent },
+    /// The game add-on through the helper's relay (no ADB).
+    GameNews { slot: SlotId, conn: u64, news: Value },
 }
 
 /// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
@@ -155,8 +169,11 @@ struct DirectLink {
 
 enum LinkCmd {
     StayAwake { set: Option<bool>, device_id: String },
-    App { action: AppAction },
-    Packages,
+    /// `reply`: an automation request (else the UI hears the result).
+    App { action: AppAction, reply: Option<oneshot::Sender<Result<String, String>>> },
+    Packages { reply: Option<oneshot::Sender<Result<Vec<String>, String>>> },
+    /// Helper 0.7+: an automation op.
+    Dev { req: Value, reply: oneshot::Sender<Result<Value, String>> },
 }
 
 /// A slot's running logcat stream and what it was started for.
@@ -275,6 +292,10 @@ struct Manager {
     helper_apk: Option<(PathBuf, u32)>,
     /// Per slot: the phone's older helper version, while an update is offered.
     helper_old: Vec<Option<u32>>,
+    /// The control socket's state (Claude, scripts).
+    auto: automation::Automation,
+    control_socket: Option<PathBuf>,
+    games: games::Games,
 }
 
 impl Manager {
@@ -367,6 +388,9 @@ impl Manager {
             run: None,
             helper_apk: None,
             helper_old: vec![None; n as usize],
+            auto: automation::Automation::new(n as usize),
+            control_socket: opts.control_socket,
+            games: games::Games::new(n as usize),
         }
     }
 
@@ -417,11 +441,19 @@ impl Manager {
             })
         };
 
+        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
+        let _control = self
+            .control_socket
+            .clone()
+            .filter(|_| self.cfg.automation.enabled)
+            .map(|path| tokio::spawn(crate::control::serve(path, ctl_tx, self.auto.clients.clone())));
+
         self.emit_all();
         self.auto_connect_restored();
 
         loop {
             tokio::select! {
+                Some(req) = ctl_rx.recv() => self.on_control(req),
                 cmd = commands.recv() => match cmd {
                     Ok(cmd) => self.on_ui(cmd),
                     Err(_) => return, // UI gone
@@ -880,10 +912,11 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
         self.direct_pending[i] = conn;
         let creds = self.keys.credentials();
         let expect = self.slots[i].device_id().map(str::to_owned).or_else(|| self.slots[i].expect_serial.clone());
-        let (tx, cfg) = (self.tx.clone(), self.cfg.connection.clone());
+        let (tx, cfg, game_port) = (self.tx.clone(), self.cfg.connection.clone(), self.cfg.automation.game_port);
         self.spawn_msg(async move {
             let result = match ac_direct::Link::connect(sa, &creds, expect.as_deref()).await {
-                Ok(link) => {
+                Ok(mut link) => {
+                    link.game_port = game_port;
                     let hello = link.hello.clone();
                     let (cmds, rx) = mpsc::unbounded_channel();
                     let task = tokio::spawn(run_direct_link(link, slot, conn, cfg, tx, rx));
@@ -1270,7 +1303,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             }
             // Perf sampler (ADB; the helper reports in its heartbeat).
-            let want_perf = target.filter(|_| self.perf_on || self.run.is_some());
+            let want_perf = target.filter(|_| self.perf_wanted());
             let keep = matches!((&self.perf[i], &want_perf), (Some((t, s)), Some((serial, ..))) if !t.is_finished() && s == serial);
             if !keep {
                 if let Some((t, _)) = self.perf[i].take() {
@@ -1284,12 +1317,19 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             }
         }
+        self.reconcile_games();
+    }
+
+    /// The graphs, a test run or automation want performance samples.
+    fn perf_wanted(&self) -> bool {
+        self.perf_on || self.run.is_some() || self.control_perf()
     }
 
     fn on_log(&mut self, ev: LogEvent) {
         let LogEvent::Crash(slot, crash) = ev else { return }; // an ended stream is restarted by reconcile
         let Some(i) = self.idx(slot) else { return };
         tracing::info!(slot, "{} in {}: {}", crash.kind.label(), crash.package, crash.summary);
+        self.note_crash(slot, &crash);
         if let Some(p) = self.run.as_mut().and_then(|r| r.phones[i].as_mut()) {
             p.crashes.push(crash.clone());
             append(&p.dir.join("crashes.txt"), &crash_entry(&crash));
@@ -1302,9 +1342,10 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
 
     fn on_perf(&mut self, slot: SlotId, sample: PerfSample) {
         let Some(i) = self.idx(slot) else { return };
-        if !matches!(self.slots[i].phase, Phase::Online { .. }) || !(self.perf_on || self.run.is_some()) {
+        if !matches!(self.slots[i].phase, Phase::Online { .. }) || !self.perf_wanted() {
             return;
         }
+        self.note_perf(i, &sample);
         if let Some(p) = self.run.as_ref().and_then(|r| r.phones[i].as_ref()) {
             let path = p.dir.join("stats.csv");
             if !path.exists() {
@@ -1382,7 +1423,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
             match self.adb_target(i) {
                 Some((serial, ..)) => jobs.push((self.title(i), serial, path)),
                 // No ADB: the window saves the mirror's frame.
-                None => self.send(UiEvent::SaveFrame { slot, path }),
+                None => self.send(UiEvent::SaveFrame { slot, path, request: None }),
             }
         }
         let Some(mut folder) = folder else { return self.toast(None, "No connected phone to take a screenshot of") };
@@ -1489,7 +1530,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 self.send(reply(false, "Update Wireless Debugging Keeper on this phone (0.6 or newer) for app actions".into()))
             }
             Some(l) => {
-                let _ = l.cmds.send(LinkCmd::App { action });
+                let _ = l.cmds.send(LinkCmd::App { action, reply: None });
             }
             None => self.send(reply(false, "Not connected".into())),
         }
@@ -1505,7 +1546,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             });
         } else if let Some(l) = self.direct[i].as_ref().filter(|l| l.hello.version >= ac_direct::HELPER_V6) {
-            let _ = l.cmds.send(LinkCmd::Packages);
+            let _ = l.cmds.send(LinkCmd::Packages { reply: None });
         }
     }
 
@@ -1747,6 +1788,8 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
             UiCommand::Record { slots, on } => self.record(slots, on),
             UiCommand::SetPerf { on } => self.perf_on = on,
             UiCommand::UpdateHelper { slot } => self.update_helper(slot),
+            UiCommand::Confirm { id, ok } => self.on_confirm(id, ok),
+            UiCommand::FrameSaved { request, error } => self.on_frame_saved(request, error),
             UiCommand::SetTileSize { slot, px } => {
                 let Some(i) = self.idx(slot) else { return };
                 self.tile_px[i] = Some(px);
@@ -1844,6 +1887,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             }
             Msg::Prune => {
+                self.check_clients();
                 let now = Instant::now();
                 self.nearby.retain(|_, n| n.stale_since.is_none_or(|t| now.duration_since(t) < NEARBY_GRACE));
                 if now.duration_since(self.last_legacy_probe) >= LEGACY_PROBE_EVERY {
@@ -1874,6 +1918,15 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             }
             Msg::Codecs { slot, device_id, codecs } => self.on_codecs(slot, &device_id, codecs),
+            Msg::Game { slot, serial, ev } => self.on_game(slot, &serial, ev),
+            Msg::GameNews { slot, conn, news } => self.on_game_news(slot, conn, news),
+            Msg::DirectScreen { slot, conn, size } => {
+                if let Some(i) = self.idx(slot)
+                    && self.direct[i].as_ref().is_some_and(|l| l.conn == conn)
+                {
+                    self.auto.screen[i] = Some(size);
+                }
+            }
             Msg::DirectPaired { slot, addr, result } => self.on_direct_paired(slot, addr, result),
             Msg::DirectLinked { slot, conn, result } => self.on_direct_linked(slot, conn, result),
             Msg::DirectInput { slot, conn, on } => {
@@ -2241,6 +2294,7 @@ async fn run_direct_link(
     let deadline = Duration::from_millis(cfg.heartbeat_timeout_ms);
     let mut input = link.hello.input;
     let mut clip_seq = u64::MAX;
+    let mut screen = None;
     loop {
         tokio::select! {
             _ = tick.tick() => match link.ping(deadline).await {
@@ -2248,6 +2302,13 @@ async fn run_direct_link(
                     if pong.input != input {
                         input = pong.input;
                         let _ = tx.send(Msg::DirectInput { slot, conn, on: input });
+                    }
+                    if let Some(news) = pong.game.clone() {
+                        let _ = tx.send(Msg::GameNews { slot, conn, news });
+                    }
+                    if pong.screen.is_some() && pong.screen != screen {
+                        screen = pong.screen;
+                        let _ = tx.send(Msg::DirectScreen { slot, conn, size: pong.screen.unwrap_or_default() });
                     }
                     let rtt_ms = rtt.as_millis() as u32;
                     let _ = tx.send(Msg::Slot(slot, SlotEvent::Heartbeat(Ok(rtt_ms))));
@@ -2302,7 +2363,7 @@ async fn run_direct_link(
                     };
                     let _ = tx.send(Msg::StayAwake { slot, device_id, on });
                 }
-                Some(LinkCmd::App { action }) => {
+                Some(LinkCmd::App { action, reply }) => {
                     let name = match &action {
                         AppAction::Launch(_) => "launch",
                         AppAction::Stop(_) => "stop",
@@ -2316,23 +2377,44 @@ async fn run_direct_link(
                         Ok(Err(m)) => (false, m),
                         Err(e) => {
                             // A timed-out request leaves an answer in flight.
-                            let _ = tx.send(Msg::Emit(UiEvent::AppResult { slot, kind: action.kind(), ok: false, message: e.to_string() }));
+                            match reply {
+                                Some(r) => drop(r.send(Err(e.to_string()))),
+                                None => drop(tx.send(Msg::Emit(UiEvent::AppResult { slot, kind: action.kind(), ok: false, message: e.to_string() }))),
+                            }
                             let _ = tx.send(Msg::DirectGone { slot, conn });
                             return;
                         }
                     };
-                    let _ = tx.send(Msg::Emit(UiEvent::AppResult { slot, kind: action.kind(), ok, message }));
-                }
-                Some(LinkCmd::Packages) => match link.packages(deadline * 4).await {
-                    Ok(packages) => {
-                        let _ = tx.send(Msg::Emit(UiEvent::Packages { slot, packages }));
+                    match reply {
+                        Some(r) => drop(r.send(if ok { Ok(message) } else { Err(message) })),
+                        None => drop(tx.send(Msg::Emit(UiEvent::AppResult { slot, kind: action.kind(), ok, message }))),
                     }
+                }
+                Some(LinkCmd::Packages { reply }) => match link.packages(deadline * 4).await {
+                    Ok(packages) => match reply {
+                        Some(r) => drop(r.send(Ok(packages))),
+                        None => drop(tx.send(Msg::Emit(UiEvent::Packages { slot, packages }))),
+                    },
                     Err(e) => {
                         tracing::warn!(slot, "listing apps: {e}");
+                        if let Some(r) = reply {
+                            let _ = r.send(Err(e.to_string()));
+                        }
                         let _ = tx.send(Msg::DirectGone { slot, conn });
                         return;
                     }
                 },
+                Some(LinkCmd::Dev { req, reply }) => {
+                    // Waiting on screen changes happens on the PC; each op is quick.
+                    match link.dev(req, Duration::from_secs(15)).await {
+                        Ok(v) => drop(reply.send(Ok(v))),
+                        Err(e) => {
+                            let _ = reply.send(Err(e.to_string()));
+                            let _ = tx.send(Msg::DirectGone { slot, conn });
+                            return;
+                        }
+                    }
+                }
                 None => return,
             },
         }

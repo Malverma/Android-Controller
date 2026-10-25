@@ -55,7 +55,9 @@ fn main() -> glib::ExitCode {
     state.normalize(slots);
     let manager = {
         let _guard = runtime.enter();
-        ac_device::spawn(ac_device::ManagerOptions::new(config.clone(), paths))
+        let mut opts = ac_device::ManagerOptions::new(config.clone(), paths);
+        opts.control_socket = Some(ac_device::control::socket_path());
+        ac_device::spawn(opts)
     };
 
     let app = adw::Application::builder().application_id(APP_ID).build();

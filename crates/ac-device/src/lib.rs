@@ -3,6 +3,8 @@
 
 pub mod adaptive;
 mod api;
+pub mod control;
+pub mod game;
 pub mod logcat;
 mod manager;
 pub mod perf;
@@ -12,6 +14,7 @@ pub mod slot;
 pub mod stream;
 pub mod testing;
 pub mod transfer;
+pub mod uitree;
 
 pub use api::*;
 pub use manager::{ManagerHandle, ManagerOptions, normalize_addr, parse_inet, spawn};

@@ -23,6 +23,7 @@ pub struct Config {
     pub transfer: Transfer,
     pub audio: Audio,
     pub testing: Testing,
+    pub automation: Automation,
     pub ui: Ui,
     #[serde(deserialize_with = "merge_keybindings")]
     pub keybindings: BTreeMap<String, String>,
@@ -49,6 +50,7 @@ impl Default for Config {
             transfer: Transfer::default(),
             audio: Audio::default(),
             testing: Testing::default(),
+            automation: Automation::default(),
             ui: Ui::default(),
             keybindings: default_keybindings(),
         }
@@ -346,6 +348,24 @@ pub struct Testing {
 impl Default for Testing {
     fn default() -> Self {
         Self { output_dir: String::new(), watch_crashes: true, perf_interval_ms: 2000 }
+    }
+}
+
+/// The automation socket for Claude (`android-controller-mcp`) and scripts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Automation {
+    /// Listen on `$XDG_RUNTIME_DIR/android-controller/control.sock` (this user only).
+    pub enabled: bool,
+    /// Ask in the window before an automated "clear data" or "uninstall".
+    pub confirm_destructive: bool,
+    /// TCP port the game add-on listens on, on the phone's localhost.
+    pub game_port: u16,
+}
+
+impl Default for Automation {
+    fn default() -> Self {
+        Self { enabled: true, confirm_destructive: true, game_port: 27191 }
     }
 }
 

@@ -5,7 +5,7 @@
 # and push.
 pkgname=android-controller-git
 _pkgname=android-controller
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Mirror, control and test apps on up to five Android phones over Wi-Fi (GTK4)"
 url='https://github.com/Malverma/Android-Controller'
@@ -44,7 +44,7 @@ prepare() {
 build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-  cargo build --frozen --release --package android-controller
+  cargo build --frozen --release --package android-controller --package ac-mcp
 }
 
 check() {
@@ -57,6 +57,7 @@ package() {
   cd "$_pkgname"
   local appid=org.androidcontroller.AndroidController
   install -Dm755 target/release/android-controller "$pkgdir/usr/bin/android-controller"
+  install -Dm755 target/release/android-controller-mcp "$pkgdir/usr/bin/android-controller-mcp"
   install -Dm644 "data/$appid.desktop" "$pkgdir/usr/share/applications/$appid.desktop"
   # The phone helper, for installing by hand (the app also offers it).
   install -Dm644 android-helper/dist/wireless-debugging-keeper.apk \

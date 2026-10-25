@@ -392,6 +392,11 @@ pub struct Hello {
 /// The helper version that knows app actions, multi-touch, the phone's
 /// clipboard and performance stats.
 pub const HELPER_V6: u32 = 6;
+/// The helper version with the automation ops (UI tree, tap by text,
+/// popups, test settings, the game add-on relay): see [`Link::dev`].
+pub const HELPER_V7: u32 = 7;
+/// The game debug add-on's default port on the phone (ACaddon.md).
+pub const GAME_PORT: u16 = 27191;
 
 /// Telemetry in a heartbeat answer.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -411,6 +416,11 @@ pub struct Pong {
     /// counts changes so the same text copied twice still arrives).
     pub clip: Option<String>,
     pub clip_seq: u64,
+    /// Helper 0.7+: the screen's size in pixels, as it is turned now.
+    pub screen: Option<(u32, u32)>,
+    /// Helper 0.7+: the game add-on's news since the last ping, if a game
+    /// with it runs (`{"hello": ..., "logs": [...], "events": [...]}`).
+    pub game: Option<Value>,
 }
 
 /// The long-lived connection: heartbeat, telemetry, "keep screen on".
@@ -418,6 +428,8 @@ pub struct Pong {
 pub struct Link {
     stream: TcpStream,
     pub hello: Hello,
+    /// Where helper 0.7+ looks for a game's debug add-on (sent with each ping).
+    pub game_port: u16,
 }
 
 impl Link {
@@ -439,7 +451,7 @@ impl Link {
                 None => vec!["h264".to_owned()],
             },
         };
-        Ok(Link { stream, hello })
+        Ok(Link { stream, hello, game_port: GAME_PORT })
     }
 
     async fn request(&mut self, v: Value, limit: Duration) -> Result<Value, Error> {
@@ -454,7 +466,7 @@ impl Link {
     /// Heartbeat; returns the phone's telemetry and the round trip.
     pub async fn ping(&mut self, limit: Duration) -> Result<(Pong, Duration), Error> {
         let start = Instant::now();
-        let v = self.request(json!({ "op": "ping" }), limit).await?;
+        let v = self.request(json!({ "op": "ping", "game_port": self.game_port }), limit).await?;
         let rtt = start.elapsed();
         Ok((
             Pong {
@@ -470,6 +482,10 @@ impl Link {
                 battery_temp_c: v.get("battery_temp").and_then(Value::as_f64).map(|t| t as f32),
                 clip: v.get("clip").and_then(Value::as_str).map(str::to_owned),
                 clip_seq: v.get("clip_seq").and_then(Value::as_u64).unwrap_or(0),
+                screen: v.get("screen").and_then(Value::as_array).and_then(|a| {
+                    Some((a.first()?.as_u64()? as u32, a.get(1)?.as_u64()? as u32))
+                }),
+                game: v.get("game").filter(|g| g.is_object()).cloned(),
             },
             rtt,
         ))
@@ -488,6 +504,13 @@ impl Link {
         let v = self.request(json!({ "op": "app", "action": action, "package": package }), limit).await?;
         let msg = v.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
         Ok(if v.get("ok").and_then(Value::as_bool).unwrap_or(false) { Ok(msg) } else { Err(msg) })
+    }
+
+    /// Helper 0.7+: an automation op (`{"op": "tree"}`, `{"op": "tap", ...}`;
+    /// the same ops as the helper's ADB socket). The phone's answer, or
+    /// `Ok({"error": ...})` when it could not do it.
+    pub async fn dev(&mut self, req: Value, limit: Duration) -> Result<Value, Error> {
+        self.request(req, limit).await
     }
 
     /// Helper 0.6+: the apps the user installed (package names).

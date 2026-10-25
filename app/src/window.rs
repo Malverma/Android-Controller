@@ -147,6 +147,8 @@ pub struct App {
     // ---- app testing (Milestone 5) ----
     test_bar: RefCell<Option<Rc<TestBar>>>,
     recording: RefCell<Vec<bool>>,
+    /// Automation clients (Claude through the MCP server, scripts) connected.
+    automation_clients: Cell<usize>,
     graphs_on: Cell<bool>,
     /// The test run's folder whose crashes the tiles show.
     run_dir: RefCell<Option<PathBuf>>,
@@ -444,6 +446,7 @@ pub fn build(
             apk_answer: Cell::new(None),
             test_bar: RefCell::new(None),
             recording: RefCell::new(vec![false; slots as usize]),
+            automation_clients: Cell::new(0),
             graphs_on: Cell::new(false),
             run_dir: RefCell::new(None),
         }
@@ -1112,7 +1115,12 @@ impl App {
                     card.set_perf(&sample);
                 }
             }
-            UiEvent::SaveFrame { slot, path } => self.save_frame(slot, &path),
+            UiEvent::SaveFrame { slot, path, request } => self.save_frame(slot, &path, request),
+            UiEvent::Confirm { id, title, body } => self.confirm_automation(id, &title, &body),
+            UiEvent::Automation { clients } => {
+                self.automation_clients.set(clients);
+                self.render_status();
+            }
             UiEvent::Recording { slot, file } => {
                 let i = slot as usize - 1;
                 let Some(card) = self.cards.get(i) else { return };
@@ -1208,19 +1216,38 @@ impl App {
     }
 
     /// A phone without ADB: its mirror's current frame is the screenshot.
-    fn save_frame(self: &Rc<Self>, slot: SlotId, path: &std::path::Path) {
+    /// `request`: an automation client waits for it (no toast).
+    fn save_frame(self: &Rc<Self>, slot: SlotId, path: &std::path::Path, request: Option<u64>) {
         let i = slot as usize - 1;
         let paintable = self.cards.get(i).and_then(|c| c.picture.paintable()).or_else(|| self.focus_pictures.get(i)?.paintable());
-        let Some(texture) = paintable.and_downcast::<gdk::Texture>() else {
-            return self.toast("No picture from that phone yet to save");
+        let result = match paintable.and_downcast::<gdk::Texture>() {
+            None => Err("No picture from that phone yet (is it mirroring?)".to_owned()),
+            Some(texture) => texture.save_to_png(path).map_err(|e| format!("Could not save the screenshot: {e}")),
         };
-        match texture.save_to_png(path) {
-            Ok(()) => {
+        match (request, result) {
+            (Some(request), r) => self.send(UiCommand::FrameSaved { request, error: r.err() }),
+            (None, Ok(())) => {
                 let folder = path.parent().map(PathBuf::from).unwrap_or_default();
                 self.saved_toast("Screenshot saved", folder);
             }
-            Err(e) => self.toast(&format!("Could not save the screenshot: {e}")),
+            (None, Err(e)) => self.toast(&e),
         }
+    }
+
+    /// An automation client wants to clear an app's data or uninstall it.
+    fn confirm_automation(self: &Rc<Self>, id: u64, title: &str, body: &str) {
+        let alert = adw::AlertDialog::new(Some(title), Some(body));
+        alert.add_response("no", "Don't allow");
+        alert.add_response("yes", "Allow");
+        alert.set_response_appearance("yes", adw::ResponseAppearance::Destructive);
+        alert.set_default_response(Some("no"));
+        alert.set_close_response("no");
+        let tx = self.commands.clone();
+        alert.connect_response(None, move |_, resp| {
+            let _ = tx.try_send(UiCommand::Confirm { id, ok: resp == "yes" });
+        });
+        alert.present(Some(&self.window));
+        self.window.present();
     }
 
     /// "Saved" with a button that opens the folder.
@@ -1777,6 +1804,11 @@ impl App {
         let sending = self.transfers.borrow().iter().flatten().count();
         if sending > 0 {
             line.push_str(&format!("  ·  ⇅ sending to {sending} phone{}", if sending == 1 { "" } else { "s" }));
+        }
+        match self.automation_clients.get() {
+            0 => {}
+            1 => line.push_str("  ·  automation client connected"),
+            n => line.push_str(&format!("  ·  {n} automation clients connected")),
         }
         let kbps = self.total_kbps.get();
         if kbps > 0 {

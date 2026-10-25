@@ -3,7 +3,7 @@
 Native Arch Linux (GTK4 + libadwaita) app for viewing and controlling up to
 four Android phones over Wi-Fi (five with `max_slots = 5`). The full design is in [`spec.md`](spec.md).
 
-## Status: v1.0 — Milestones 1–6 built (awaiting feedback before release)
+## Status: v1.1 — Milestones 1–7 built
 
 Working (Milestones 1–2):
 
@@ -119,6 +119,38 @@ New in Milestone 6:
   one gets an *Update* button on its tile.
 - **AUR package**: [`packaging/aur/android-controller-git`](packaging/aur/android-controller-git/PKGBUILD).
 
+New in 1.1 — **automation for Claude** (spec §9, Milestone 7):
+
+- **Control socket**: the app listens on
+  `$XDG_RUNTIME_DIR/android-controller/control.sock` (your user only) for
+  JSON-line requests: list phones, screenshot, tap/swipe/type/keys, read the
+  screen's elements, install/launch/stop apps, crashes, logs, performance,
+  test runs, recording and test settings. Preferences › Testing ›
+  Automation turns it off. Clearing app data or uninstalling waits for you
+  to allow it in the window, and the status bar shows when a client is
+  connected.
+- **MCP server** `android-controller-mcp` (`crates/ac-mcp`): gives Claude in
+  Cursor (or Claude Code) these as tools. Add it to `~/.cursor/mcp.json`:
+
+  ```json
+  {"mcpServers": {"android-controller": {"command": "android-controller-mcp"}}}
+  ```
+
+  Then ask Claude to test your app on the phones. The app must be running.
+- **Helper 0.7** (Wireless Debugging Keeper):
+  - the screen's elements in ~0.2 s, instead of 1–3 s with `uiautomator`;
+  - tap by text or id, and wait for an element;
+  - popup, dialog and toast events;
+  - auto-allow for permission prompts;
+  - animations on or off.
+
+  Over ADB the app switches its touch control on by itself.
+- **Game debug add-on** ([`ACaddon.md`](ACaddon.md), [`game-addon/`](game-addon)):
+  a debug-only server inside a game (Unity, Godot and native Android
+  versions) that lets Claude read the game's state, run its debug commands
+  (load a level, give coins), and read its logs. Its exceptions show as
+  crash badges.
+
 Not run yet: the 2-hour, 5-phone soak test from spec §9.
 
 ## Run
@@ -143,6 +175,9 @@ cargo run -p ac-device --example audio_probe -- <serial>   # check a phone's aud
 cargo run -p ac-scrcpy --example encoders -- <serial>      # a phone's video encoders
 cargo run -p ac-device --example testing_probe -- <serial> [pkg]  # perf, screenshot, crash parser
 cargo run -p ac-device --example testing_e2e -- <out-dir>  # a test run on every phone, headless
+cargo run -p ac-device --example automation_host -- $XDG_RUNTIME_DIR/ac-test/control.sock  # headless control socket
+ANDROID_CONTROLLER_SOCKET=$XDG_RUNTIME_DIR/ac-test/control.sock android-controller-mcp  # MCP against it
+python3 game-addon/tools/fake_game.py   # a fake game add-on (with: adb reverse tcp:27191 tcp:27191)
 ```
 
 ## Layout
@@ -157,6 +192,7 @@ cargo run -p ac-device --example testing_e2e -- <out-dir>  # a test run on every
 | `crates/ac-transfer` | Transfer planning: segments, conflict names, APK check, rate limit |
 | `crates/ac-direct` | PC side of the helper's no-ADB connection (pairing, stream, files)  |
 | `crates/ac-audio`  | Focus-view audio: raw PCM from scrcpy-server played via PipeWire    |
+| `crates/ac-mcp`    | `android-controller-mcp`: MCP server for Claude over the control socket |
 | `crates/adb-mock`  | Fake ADB server for integration tests                                |
 | `app`              | GTK4/libadwaita UI                                                   |
 
@@ -173,4 +209,5 @@ cd packaging/aur/android-controller-git && makepkg -si   # or: yay -S android-co
 ```
 
 Both install the phone helper to
-`/usr/share/android-controller/wireless-debugging-keeper.apk` as well.
+`/usr/share/android-controller/wireless-debugging-keeper.apk`, and
+`android-controller-mcp`, as well.

@@ -78,6 +78,7 @@ public final class InputService extends AccessibilityService {
     protected void onServiceConnected() {
         instance = this;
         Log.i(Direct.TAG, "touch control on");
+        Dev.serve(this);
         // Turned on while the PC already wants the screen kept on.
         if (Screen.keptOn()) keepScreenOn(true);
     }
@@ -85,6 +86,7 @@ public final class InputService extends AccessibilityService {
     @Override
     public void onDestroy() {
         if (instance == this) instance = null;
+        Dev.stop();
         removeKeepOn();
         super.onDestroy();
     }
@@ -92,6 +94,7 @@ public final class InputService extends AccessibilityService {
     @Override
     public boolean onUnbind(android.content.Intent intent) {
         if (instance == this) instance = null;
+        Dev.stop();
         main.post(this::removeKeepOn);
         return super.onUnbind(intent);
     }
@@ -134,7 +137,9 @@ public final class InputService extends AccessibilityService {
     }
 
     @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) {}
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        Dev.onEvent(this, event);
+    }
 
     @Override
     public void onInterrupt() {}
@@ -501,6 +506,11 @@ public final class InputService extends AccessibilityService {
                 if (n != null) n.performAction(AccessibilityNodeInfo.ACTION_PASTE);
             }
         });
+    }
+
+    /** A text field has input focus (typing would land somewhere). */
+    boolean hasFocusedField() {
+        return focused() != null;
     }
 
     private AccessibilityNodeInfo focused() {

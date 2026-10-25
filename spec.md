@@ -1858,6 +1858,92 @@ replace the empty-slot tiles and the Nearby list under the grid). Record-and-rep
   4. A phone with helper 0.5 shows *Update*; after updating, the tile no longer offers it.
   5. `makepkg -si` from `packaging/aur/android-controller-git` builds and installs v1.0.0.
 
+### Milestone 7 — Automation for Claude, Helper 0.7 and the Game Add-on
+
+**Scope:**
+- **Control socket** (`ac-device::control`, `manager/automation.rs`):
+  - Location: `$XDG_RUNTIME_DIR/android-controller/control.sock`. The folder is 0700 and the
+    socket 0600. If `XDG_RUNTIME_DIR` is unset: `/tmp/android-controller-<uid>/`.
+  - A second instance does not take over a socket that answers.
+  - Wire format: JSON lines `{"id", "method", "params"}` → `{"id", "result"}` | `{"id", "error"}`.
+    Requests may overlap.
+  - Config `[automation]`:
+    - `enabled = true` (restart to apply);
+    - `confirm_destructive = true`;
+    - `game_port = 27191`.
+  - `params.phone` is a slot, a name (or part of one), or `"all"`. It may be left out when one
+    phone is connected. Multi-phone answers are `[{phone, slot, result|error}]`. Coordinates are
+    the phone's screen pixels.
+  - Methods:
+    - `phones`, `screenshot` (full-size PNG path, size, phone size; no ADB: the window saves the
+      mirror frame, `UiEvent::SaveFrame { request }` → `UiCommand::FrameSaved`);
+    - `tap` (x,y or text/id/desc + index; long), `swipe`, `type`, `key`;
+    - `ui_tree`, `find`, `wait_for` (PC-side polling every 250 ms);
+    - `events`, `auto_allow`;
+    - `install` (through the transfer queue; `Transfers::install_results`), `app`
+      (launch/stop/restart/clear_data/uninstall), `packages`;
+    - `crashes` (the last 200, with `seq`), `perf` (keeps sampling 2 minutes after the last ask);
+    - `logcat` (`-d -t N`, `--pid` for a package, grep; last 30 KB), `shell` (ADB);
+    - `run_start`, `run_stop`, `record`;
+    - `settings` (animation scales, `cmd uimode night`, `font_scale`);
+    - `game_info`, `game_state`, `game_command`, `game_logs`.
+  - With `confirm_destructive`, clear data and uninstall wait up to 2 minutes for
+    `UiEvent::Confirm` → `UiCommand::Confirm`. No answer counts as no.
+  - The status bar counts connected clients (`UiEvent::Automation`).
+- **MCP server** `android-controller-mcp` (`crates/ac-mcp`):
+  - stdio JSON-RPC: `initialize` (with usage instructions), `tools/list`, `tools/call`, `ping`;
+  - one tool per method;
+  - screenshots scaled to fit 1024 px and sent as JPEG image content, with the factor from image
+    pixels to phone pixels;
+  - `ANDROID_CONTROLLER_SOCKET` overrides the socket path.
+- **Screen elements**: one node shape for both sources: `{text, desc, id, cls, pkg, b:[l,t,r,b],
+  click, long, scroll, edit, check, sel, on}`.
+  - Sources: helper 0.7, else `uiautomator dump` (ADB, parsed in `uitree.rs`).
+  - Rendered one element per line with its tap centre.
+  - `find` ranks exact over contained text, then the closest length, then clickable, then top
+    to bottom. A text query also matches descriptions.
+- **Wireless Debugging Keeper 0.7** (`Dev.java`, `GameRelay.java`):
+  - Ops, on the no-ADB link and on a local socket `android-controller-dev` that only uid 2000 or
+    0 may use (`adb … localabstract:`): `tree` (every window, top first), `tap`, `swipe`,
+    `text`, `key`, `events`, `auto_allow`, `settings` (animations, through
+    `WRITE_SECURE_SETTINGS`), `screen`.
+  - Accessibility events: window state and notification state (toasts).
+  - Flags: view ids, interactive windows, not-important views.
+  - The pong carries `screen` and the game relay's news.
+  - Over ADB the manager switches the helper's accessibility service on (`settings put secure
+    enabled_accessibility_services`) the first time it needs it, if helper 0.7+ is installed.
+- **Game add-on protocol v1** (`ac-device::game`, `manager/games.rs`, [`ACaddon.md`](ACaddon.md)):
+  - The game listens on `127.0.0.1:<game_port>` in debug builds, newline JSON. Messages:
+    `hello`, `log`, `event`, `result`; requests `state`, `command`, `ping`.
+  - ADB phones: the manager opens `tcp:<port>` every 3 s while automation is on.
+  - No ADB: the helper connects on each heartbeat (the ping carries `game_port`) and relays.
+    Requests go as `{"op": "game", "msg", "timeout_ms" ≤ 10 000}`.
+  - 2000 lines are kept per phone. During a run they go to `game.txt`.
+  - `exception` logs become `CrashKind::Exception` crashes (the same message within 10 s counts
+    once).
+  - Reference implementations in `game-addon/`: Unity C#, Godot 4, native Android Java, and a
+    Python fake game.
+
+**Verification:**
+- Unit:
+  - the control socket (ids, 0600, client count);
+  - the uiautomator parser, rendering and `find` ranking;
+  - the MCP server (initialize, tools list, calls through a fake socket, screenshot scaling);
+  - the game book (logs, events, exceptions badged once, level filter, results).
+- Live (2026-10-25, Moto g play 2023 Android 13 and Schok Volt SV55 Android 11, over ADB, through
+  `automation_host` and `android-controller-mcp`):
+  - every read-only tool;
+  - a tap, and a refused clear-data confirmation;
+  - installing helper 0.7 on both phones through `install_apk`;
+  - helper trees: `wait_for` answers in 191 ms against 2849 ms with `uiautomator`;
+  - the game tools against `fake_game.py` over `adb reverse`, including an exception reaching
+    `crashes`, and reconnecting after the game restarts.
+- Unity reference: compiled for debug and release with `dotnet` against UnityEngine stubs, and
+  run against a protocol client. Android reference: `javac -Xlint:all` against android-35.
+- Not yet run:
+  - the no-ADB link path for the dev ops and the game relay (needs a phone paired without ADB);
+  - the Godot reference inside Godot.
+
 ---
 
 ## Appendix A — Error Codes

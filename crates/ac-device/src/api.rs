@@ -66,6 +66,10 @@ pub enum UiCommand {
     SetPerf { on: bool },
     /// Install the Wireless Debugging Keeper this app ships over an older one.
     UpdateHelper { slot: SlotId },
+    /// The user's answer to `UiEvent::Confirm`.
+    Confirm { id: u64, ok: bool },
+    /// The window saved the frame asked for by `UiEvent::SaveFrame { request: Some(_) }`.
+    FrameSaved { request: u64, error: Option<String> },
 }
 
 /// Something to do with an installed app, by package name.
@@ -111,6 +115,8 @@ pub enum CrashKind {
     Anr,
     /// A native (C/C++) crash, e.g. in a game engine.
     Native,
+    /// An exception the game's debug add-on reported (the game kept running).
+    Exception,
 }
 
 impl CrashKind {
@@ -119,6 +125,7 @@ impl CrashKind {
             Self::Crash => "Crash",
             Self::Anr => "ANR",
             Self::Native => "Native crash",
+            Self::Exception => "Exception",
         }
     }
 }
@@ -252,11 +259,18 @@ pub enum UiEvent {
     Perf { slot: SlotId, sample: PerfSample },
     /// A phone without ADB has no screenshot command: save its mirror's
     /// current frame to `path` instead.
-    SaveFrame { slot: SlotId, path: std::path::PathBuf },
+    /// `request`: an automation request waiting for `UiCommand::FrameSaved`
+    /// (no toast then).
+    SaveFrame { slot: SlotId, path: std::path::PathBuf, request: Option<u64> },
     /// Recording started (`Some(file)`) or stopped on a phone.
     Recording { slot: SlotId, file: Option<std::path::PathBuf> },
     /// Files were saved: a toast with an "Open folder" button.
     Saved { message: String, folder: std::path::PathBuf },
+    /// An automation client (e.g. Claude through the MCP server) wants to do
+    /// something that loses data: answer with `UiCommand::Confirm`.
+    Confirm { id: u64, title: String, body: String },
+    /// How many automation clients are connected.
+    Automation { clients: usize },
 }
 
 /// Aggregate progress of one slot's queued transfers (spec §5.7).

@@ -322,7 +322,7 @@ public final class DirectService extends Service {
                 }
                 String op = m.optString("op");
                 if (op.equals("ping")) {
-                    Proto.write(out, pong());
+                    Proto.write(out, pong(m));
                 } else if (op.equals("stay_awake")) {
                     if (m.has("on") && !m.isNull("on")) {
                         boolean on = m.optBoolean("on");
@@ -340,6 +340,12 @@ public final class DirectService extends Service {
                     Proto.write(out, r);
                 } else if (op.equals("packages")) {
                     Proto.write(out, Apps.packages(this));
+                } else if (Dev.handles(op)) {
+                    Proto.write(out, Dev.handle(this, m));
+                } else if (op.equals("game")) {
+                    JSONObject msg = m.optJSONObject("msg");
+                    Proto.write(out, msg == null ? Proto.obj("op", op, "error", "no msg")
+                            : GameRelay.request(msg, m.optInt("timeout_ms", 10_000)));
                 } else {
                     Proto.write(out, Proto.obj("op", op, "error", "unknown request"));
                 }
@@ -355,7 +361,7 @@ public final class DirectService extends Service {
         }
     }
 
-    private JSONObject pong() {
+    private JSONObject pong(JSONObject ping) {
         JSONObject o = Proto.obj("op", "pong", "input", InputService.get() != null, "capture", Projection.get() != null);
         Intent bat = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         try {
@@ -366,6 +372,10 @@ public final class DirectService extends Service {
                 o.put("charging", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
             }
             Apps.perf(this, o, bat);
+            int[] screen = Dev.screenSize(this);
+            if (screen != null) o.put("screen", new org.json.JSONArray().put(screen[0]).put(screen[1]));
+            JSONObject game = GameRelay.poll(ping.optInt("game_port", 0));
+            if (game != null) o.put("game", game);
             String clip = Clip.text();
             if (clip != null) {
                 o.put("clip", clip);

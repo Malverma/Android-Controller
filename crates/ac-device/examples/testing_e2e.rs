@@ -67,7 +67,7 @@ async fn main() {
             UiEvent::Run(r) => println!("run: {r:?}"),
             UiEvent::Recording { slot, file } => println!("recording {slot}: {file:?}"),
             UiEvent::Saved { message, folder } => println!("saved: {message} in {}", folder.display()),
-            UiEvent::SaveFrame { slot, path } => println!("save frame {slot}: {}", path.display()),
+            UiEvent::SaveFrame { slot, path, .. } => println!("save frame {slot}: {}", path.display()),
             UiEvent::Crash { slot, crash } => println!("crash {slot}: {crash:?}"),
             _ => {}
         }

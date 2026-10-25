@@ -1,0 +1,17 @@
+[package]
+name = "ac-mcp"
+description = "MCP server: lets Claude (Cursor, Claude Code) drive the phones in a running Android Controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "android-controller-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

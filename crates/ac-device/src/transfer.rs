@@ -263,6 +263,8 @@ struct Ctx {
     next_id: AtomicU64,
     ui: async_channel::Sender<UiEvent>,
     journal: Mutex<Journal>,
+    /// Every APK install's result `(slot, ok, message)`, for automation.
+    installs: tokio::sync::broadcast::Sender<(SlotId, bool, String)>,
 }
 
 pub struct Transfers {
@@ -298,6 +300,7 @@ impl Transfers {
             adb: AdbClient::new(adb_server).with_timeout(Duration::from_secs(120)),
             io,
             slots,
+            installs: tokio::sync::broadcast::channel(64).0,
             reserved: Mutex::default(),
             next_id: AtomicU64::new(rand::random::<u32>() as u64),
             ui,
@@ -394,6 +397,11 @@ impl Transfers {
 
     /// Queues `paths` (files and folders) for the phone `device_id` in `slot`.
     /// APKs are installed when `install_apks`, otherwise pushed like any file.
+    /// Install results from now on.
+    pub fn install_results(&self) -> tokio::sync::broadcast::Receiver<(SlotId, bool, String)> {
+        self.ctx.installs.subscribe()
+    }
+
     pub fn submit(&self, slot: SlotId, device_id: String, title: String, paths: Vec<PathBuf>, install_apks: bool) {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
@@ -537,6 +545,7 @@ impl Ctx {
                         Outcome::Failed(why) => (false, why.clone()),
                         _ => (true, format!("{name}: nothing to do")),
                     };
+                    let _ = ctx.installs.send((slot, ok, message.clone()));
                     let _ = ctx.ui.try_send(UiEvent::AppResult { slot, kind: AppKind::Install, ok, message });
                 }
                 ctx.finish(slot, id, size, outcome);

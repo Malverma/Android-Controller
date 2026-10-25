@@ -162,6 +162,7 @@ impl Pending {
                     self.summary = format!("{} — {}", self.summary, msg.trim_matches('\''));
                 }
             }
+            CrashKind::Exception => {}
         }
     }
 
@@ -170,7 +171,7 @@ impl Pending {
         match self.kind {
             CrashKind::Native => self.signal_seen && self.detail.len() >= 12,
             CrashKind::Anr => !self.summary.is_empty() && self.detail.len() >= 4,
-            CrashKind::Crash => false,
+            CrashKind::Crash | CrashKind::Exception => false,
         }
     }
 }

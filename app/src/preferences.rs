@@ -255,6 +255,10 @@ fn testing(ctx: &Ctx, cfg: &Config) -> adw::PreferencesPage {
     let g = ctx.group(&p, "Watching", "");
     ctx.switch(&g, "Show crashes and freezes", "A red badge on the tile when an app crashes or stops responding. Needs a wireless-debugging (ADB) connection", cfg.testing.watch_crashes, |c, v| c.testing.watch_crashes = v);
     ctx.spin(&g, "Graph sample interval (ms)", "How often frame rate, CPU, memory and temperature are measured. ", (500, 60_000, 500), cfg.testing.perf_interval_ms as u32, |c, v| c.testing.perf_interval_ms = v as u64);
+
+    let g = ctx.group(&p, "Automation", "Lets tools on this PC drive the phones: Claude through android-controller-mcp, or your own scripts. Only your user account can connect");
+    ctx.switch(&g, "Allow automation", "Takes effect after a restart", cfg.automation.enabled, |c, v| c.automation.enabled = v);
+    ctx.switch(&g, "Ask before deleting app data", "Clearing an app's data or uninstalling it waits for you to allow it here", cfg.automation.confirm_destructive, |c, v| c.automation.confirm_destructive = v);
     p
 }
 
