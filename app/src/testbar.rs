@@ -19,7 +19,7 @@ use crate::window::App;
 type MakeAction = fn(String) -> AppAction;
 
 pub struct TestBar {
-    pub root: gtk::FlowBox,
+    pub root: gtk::Box,
     run_name: gtk::Entry,
     run_button: gtk::Button,
     run_status: gtk::Label,
@@ -57,8 +57,9 @@ fn section(title: &str) -> gtk::Box {
 }
 
 impl TestBar {
-    /// `phones`: the Add Device and Nearby buttons, shown first.
-    pub fn new(app: &Rc<App>, phones: &[&gtk::Widget]) -> Rc<Self> {
+    /// `phones`: the Add Device and Nearby buttons, shown first;
+    /// `input`: Mirror clicks and Broadcast, beside the captures.
+    pub fn new(app: &Rc<App>, phones: &[&gtk::Widget], input: &[&gtk::Widget]) -> Rc<Self> {
         let weak = Rc::downgrade(app);
 
         let phones_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -134,17 +135,29 @@ impl TestBar {
         cap_box.append(&shot);
         cap_box.append(&record);
         cap_box.append(&graphs);
-
-        let row = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .column_spacing(18)
-            .row_spacing(6)
-            .max_children_per_line(4)
-            .homogeneous(false)
-            .build();
-        for b in [&phones_box, &cap_box, &run_box, &app_box] {
-            row.append(b);
+        let input_box = section("Input");
+        for w in input {
+            input_box.append(*w);
         }
+
+        // Two rows: phones and the run; then the app, captures and input
+        // (each row wraps only when the window is too narrow for it).
+        let flow = |parts: &[&gtk::Box]| {
+            let f = gtk::FlowBox::builder()
+                .selection_mode(gtk::SelectionMode::None)
+                .column_spacing(18)
+                .row_spacing(6)
+                .max_children_per_line(parts.len() as u32)
+                .homogeneous(false)
+                .build();
+            for p in parts {
+                f.append(*p);
+            }
+            f
+        };
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        row.append(&flow(&[&phones_box, &run_box]));
+        row.append(&flow(&[&app_box, &cap_box, &input_box]));
         row.add_css_class("test-bar");
 
         let bar = Rc::new(Self {

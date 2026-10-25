@@ -216,12 +216,12 @@ pub fn build(
         .build();
     header.pack_start(&grid_button);
     let broadcast_toggle = gtk::ToggleButton::builder()
-        .icon_name("network-transmit-symbolic")
+        .child(&adw::ButtonContent::builder().icon_name("network-transmit-symbolic").label("Broadcast").build())
         .tooltip_text("Broadcast input to the selected phones (Alt+Shift+B)")
         .build();
     broadcast_toggle.update_property(&[gtk::accessible::Property::Label("Broadcast input")]);
     let mirror_toggle = gtk::ToggleButton::builder()
-        .label("Mirror clicks")
+        .child(&adw::ButtonContent::builder().icon_name("edit-copy-symbolic").label("Mirror clicks").build())
         .tooltip_text("Repeat taps, swipes and typing on every mirroring phone, e.g. to test an app on all of them at once (Alt+Shift+M)")
         .build();
     let broadcast_badge = gtk::Label::builder().label("BROADCAST ●").visible(false).build();
@@ -233,8 +233,6 @@ pub fn build(
     let menu_button = gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).tooltip_text("Main menu").build();
     menu_button.set_primary(true);
     header.pack_end(&menu_button);
-    header.pack_end(&broadcast_toggle);
-    header.pack_end(&mirror_toggle);
     header.pack_end(&broadcast_badge);
 
     // Slots, laid out by the grid scorer (spec §6.1).
@@ -456,7 +454,11 @@ pub fn build(
         app_rc.install_drop(slot, &app_rc.focus_widgets[i], false);
     }
 
-    let test_bar = TestBar::new(&app_rc, &[add_button.upcast_ref(), nearby_button.upcast_ref()]);
+    let test_bar = TestBar::new(
+        &app_rc,
+        &[add_button.upcast_ref(), nearby_button.upcast_ref()],
+        &[mirror_toggle.upcast_ref(), broadcast_toggle.upcast_ref()],
+    );
     toolbar.add_top_bar(&test_bar.root);
     *app_rc.test_bar.borrow_mut() = Some(test_bar);
 
