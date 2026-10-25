@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "app"]
 
 [workspace.package]
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -20,6 +20,7 @@ ac-input = { path = "crates/ac-input" }
 ac-media = { path = "crates/ac-media" }
 ac-transfer = { path = "crates/ac-transfer" }
 ac-direct = { path = "crates/ac-direct" }
+ac-audio = { path = "crates/ac-audio" }
 adb-mock = { path = "crates/adb-mock" }
 
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }

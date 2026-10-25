@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ac_config::{AppState, BroadcastState, WindowState};
 use ac_core::SlotId;
 use ac_device::{
-    ManagerHandle, NearbyView, PhaseView, SlotIo, SlotView, StreamProfile, StreamView, TransferView, UiCommand, UiEvent,
+    AppAction, ManagerHandle, NearbyView, PhaseView, SlotIo, SlotView, StreamProfile, StreamView, TransferView, UiCommand, UiEvent,
     UsbDeviceView,
 };
 use ac_discovery::ServiceKind;
@@ -31,6 +31,7 @@ use crate::grid_layout::{Grid, TileInfo};
 use crate::mirror::{DeviceAction, InputPrefs, SlotInput, new_mirror};
 use crate::pairing::{Page, PairingDialog};
 use crate::slot_card::{CardAction, SlotCard};
+use crate::testbar::TestBar;
 use crate::texture;
 
 const CSS: &str = r#"
@@ -58,6 +59,13 @@ const CSS: &str = r#"
 .drop-hint { background: alpha(@window_bg_color, 0.92); color: @window_fg_color; border-radius: 12px; padding: 10px 14px; margin: 12px; font-weight: bold; }
 togglebutton.stay-awake:checked { color: @accent_color; background: alpha(@accent_color, 0.15); }
 .transfer-row progressbar trough, .transfer-row progressbar progress { min-height: 4px; }
+.test-bar { padding: 6px 12px; border-bottom: 1px solid alpha(currentColor, 0.1); }
+.rec-badge { color: @error_color; font-weight: 800; font-size: smaller; }
+.crash-badge { color: @error_color; font-weight: 800; padding: 0 6px; min-height: 0; }
+.result-chip.success { color: @success_color; }
+.result-chip.error { color: @error_color; }
+.perf-graph { border-radius: 4px; }
+togglebutton.record-toggle:checked { color: @error_color; background: alpha(@error_color, 0.15); }
 "#;
 
 /// A restored focus view waits this long for its phone to start streaming.
@@ -95,8 +103,8 @@ pub struct App {
     pointer_in_mirror: Rc<Cell<bool>>,
     broadcast: Rc<Broadcast>,
     broadcast_toggle: gtk::ToggleButton,
+    mirror_toggle: gtk::ToggleButton,
     broadcast_badge: gtk::Label,
-    hide_empty: bool,
     /// Bytes per second over all streams, for the status bar.
     total_kbps: Cell<u32>,
     app_state: RefCell<AppState>,
@@ -111,10 +119,13 @@ pub struct App {
     /// The slot keyboard shortcuts act on: the last one clicked or focused.
     active: Cell<Option<SlotId>>,
     video: RefCell<Vec<VideoBook>>,
-    clipboard_autosync: bool,
+    clipboard_autosync: Cell<bool>,
     /// Last text the phone put on the clipboard, to avoid echoing it back.
     last_from_device: RefCell<Option<String>>,
     nearby_list: gtk::ListBox,
+    nearby_button: gtk::MenuButton,
+    /// The grid, or the welcome page while no slot has a phone.
+    home: gtk::Stack,
     status: gtk::Label,
     commands: async_channel::Sender<UiCommand>,
     state: RefCell<State>,
@@ -122,10 +133,23 @@ pub struct App {
     /// The focus view's "keep screen on" toggle, and its echo guard.
     rail_stay_awake: gtk::ToggleButton,
     rail_syncing: Cell<bool>,
-    transfer_cfg: ac_config::Transfer,
+    transfer_cfg: RefCell<ac_config::Transfer>,
+    /// Shared with every slot's input handler.
+    prefs: Rc<RefCell<InputPrefs>>,
+    /// The settings in effect, as Preferences edits them.
+    config: RefCell<ac_config::Config>,
+    config_path: Option<PathBuf>,
+    /// Why config.toml could not be loaded; Preferences won't overwrite it.
+    config_locked: Option<String>,
     transfers: RefCell<Vec<Option<TransferView>>>,
     /// "Remember for this session" answer of the APK question: install?
     apk_answer: Cell<Option<bool>>,
+    // ---- app testing (Milestone 5) ----
+    test_bar: RefCell<Option<Rc<TestBar>>>,
+    recording: RefCell<Vec<bool>>,
+    graphs_on: Cell<bool>,
+    /// The test run's folder whose crashes the tiles show.
+    run_dir: RefCell<Option<PathBuf>>,
 }
 
 /// Per-slot presentation bookkeeping.
@@ -148,6 +172,8 @@ struct VideoBook {
 pub struct Restore {
     pub state: AppState,
     pub path: Option<PathBuf>,
+    /// Where Preferences saves `config.toml`.
+    pub config_path: Option<PathBuf>,
 }
 
 pub fn build(
@@ -158,6 +184,7 @@ pub fn build(
     config_error: Option<String>,
     restore: Restore,
 ) {
+    crate::preferences::apply_color_scheme(&cfg.ui.color_scheme);
     let provider = gtk::CssProvider::new();
     provider.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(
@@ -181,10 +208,6 @@ pub fn build(
     let header = adw::HeaderBar::new();
     let window_title = adw::WindowTitle::new("Android Controller", "");
     header.set_title_widget(Some(&window_title));
-    let add = gtk::Button::builder().label("Add Device").tooltip_text("Pair or connect a phone (Ctrl+N)").build();
-    add.add_css_class("suggested-action");
-    add.set_action_name(Some("win.pair"));
-    header.pack_start(&add);
     let grid_button = gtk::Button::builder()
         .icon_name("view-grid-symbolic")
         .label("All phones")
@@ -197,9 +220,21 @@ pub fn build(
         .tooltip_text("Broadcast input to the selected phones (Alt+Shift+B)")
         .build();
     broadcast_toggle.update_property(&[gtk::accessible::Property::Label("Broadcast input")]);
+    let mirror_toggle = gtk::ToggleButton::builder()
+        .label("Mirror clicks")
+        .tooltip_text("Repeat taps, swipes and typing on every mirroring phone, e.g. to test an app on all of them at once (Alt+Shift+M)")
+        .build();
     let broadcast_badge = gtk::Label::builder().label("BROADCAST ●").visible(false).build();
     broadcast_badge.add_css_class("broadcast-badge");
+    let menu = gtk::gio::Menu::new();
+    menu.append(Some("Preferences"), Some("win.preferences"));
+    menu.append(Some("Add Device"), Some("win.pair"));
+    menu.append(Some("Quit"), Some("win.quit"));
+    let menu_button = gtk::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).tooltip_text("Main menu").build();
+    menu_button.set_primary(true);
+    header.pack_end(&menu_button);
     header.pack_end(&broadcast_toggle);
+    header.pack_end(&mirror_toggle);
     header.pack_end(&broadcast_badge);
 
     // Slots, laid out by the grid scorer (spec §6.1).
@@ -209,14 +244,14 @@ pub fn build(
     grid.set_margin_end(12);
     grid.set_vexpand(true);
 
-    // Nearby.
+    // Nearby phones: a toolbar button's popover.
     let nearby_group = adw::PreferencesGroup::builder()
         .title("Nearby")
         .description("Phones advertising wireless debugging on this network")
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(12)
-        .margin_bottom(12)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(6)
+        .margin_bottom(6)
         .build();
     let nearby_list = gtk::ListBox::new();
     nearby_list.add_css_class("boxed-list");
@@ -226,8 +261,19 @@ pub fn build(
         .child(&nearby_group)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
-        .max_content_height(260)
+        .max_content_height(480)
+        .min_content_width(460)
         .build();
+    let nearby_button = gtk::MenuButton::builder()
+        .popover(&gtk::Popover::builder().child(&nearby_scroll).build())
+        .tooltip_text("Phones on this network or USB that can be added")
+        .build();
+    let add_button = gtk::Button::builder()
+        .child(&adw::ButtonContent::builder().icon_name("list-add-symbolic").label("Add Device").build())
+        .tooltip_text("Pair or connect a phone")
+        .build();
+    add_button.add_css_class("suggested-action");
+    add_button.set_action_name(Some("win.pair"));
 
     let status = gtk::Label::builder().xalign(0.0).build();
     status.add_css_class("caption");
@@ -243,9 +289,21 @@ pub fn build(
         .vexpand(true)
         .build();
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&grid_scroll);
-    content.append(&nearby_scroll);
+    // No phone at all: a welcome page instead of an empty grid.
+    let welcome_add = gtk::Button::builder().label("Add Device").halign(gtk::Align::Center).build();
+    welcome_add.add_css_class("suggested-action");
+    welcome_add.add_css_class("pill");
+    welcome_add.set_action_name(Some("win.pair"));
+    let welcome = adw::StatusPage::builder()
+        .icon_name("phone-symbolic")
+        .title("No phones yet")
+        .description("Add a phone with Add Device, or pick one under Nearby in the toolbar")
+        .child(&welcome_add)
+        .vexpand(true)
+        .build();
+    let content = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
+    content.add_named(&grid_scroll, Some("grid"));
+    content.add_named(&welcome, Some("welcome"));
 
     // Focus view: live thumbnails of the other phones, one phone large, and
     // the hardware buttons (spec §6.2).
@@ -301,7 +359,7 @@ pub fn build(
                 }
             })
         };
-        let prefs = Rc::new(InputPrefs::new(&cfg.input));
+        let prefs = Rc::new(RefCell::new(InputPrefs::new(&cfg.input)));
         let broadcast = Broadcast::new(manager.io.clone(), &cfg.input);
         let inputs: Vec<Rc<SlotInput>> = (1..=slots)
             .map(|s| SlotInput::new(s, manager.io[s as usize - 1].clone(), prefs.clone(), broadcast.clone(), on_activate.clone()))
@@ -349,8 +407,8 @@ pub fn build(
             pointer_in_mirror,
             broadcast,
             broadcast_toggle: broadcast_toggle.clone(),
+            mirror_toggle: mirror_toggle.clone(),
             broadcast_badge,
-            hide_empty: cfg.ui.hide_empty_slots,
             total_kbps: Cell::new(0),
             app_state: RefCell::new(restore.state),
             state_path: restore.path,
@@ -364,9 +422,11 @@ pub fn build(
             focused: Cell::new(None),
             active: Cell::new(None),
             video: RefCell::new(vec![VideoBook::default(); slots as usize]),
-            clipboard_autosync: cfg.input.clipboard_autosync,
+            clipboard_autosync: Cell::new(cfg.input.clipboard_autosync),
             last_from_device: RefCell::new(None),
             nearby_list,
+            nearby_button: nearby_button.clone(),
+            home: content.clone(),
             status,
             commands: manager.commands.clone(),
             state: RefCell::new(State { slots: vec![None; slots as usize], ..Default::default() }),
@@ -377,9 +437,17 @@ pub fn build(
                 .focusable(false)
                 .build(),
             rail_syncing: Cell::new(false),
-            transfer_cfg: cfg.transfer.clone(),
+            transfer_cfg: RefCell::new(cfg.transfer.clone()),
+            prefs,
+            config: RefCell::new(cfg.clone()),
+            config_path: restore.config_path.clone(),
+            config_locked: config_error.clone(),
             transfers: RefCell::new(vec![None; slots as usize]),
             apk_answer: Cell::new(None),
+            test_bar: RefCell::new(None),
+            recording: RefCell::new(vec![false; slots as usize]),
+            graphs_on: Cell::new(false),
+            run_dir: RefCell::new(None),
         }
     });
     for i in 0..app_rc.cards.len() {
@@ -387,6 +455,10 @@ pub fn build(
         app_rc.install_drop(slot, app_rc.cards[i].root.upcast_ref(), true);
         app_rc.install_drop(slot, &app_rc.focus_widgets[i], false);
     }
+
+    let test_bar = TestBar::new(&app_rc, &[add_button.upcast_ref(), nearby_button.upcast_ref()]);
+    toolbar.add_top_bar(&test_bar.root);
+    *app_rc.test_bar.borrow_mut() = Some(test_bar);
 
     install_actions(&app_rc, app);
     install_shortcuts(&app_rc, cfg);
@@ -404,6 +476,14 @@ pub fn build(
         broadcast_toggle.connect_toggled(move |b| {
             if let Some(app) = weak.upgrade() {
                 app.set_broadcast(b.is_active());
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&app_rc);
+        mirror_toggle.connect_toggled(move |b| {
+            if let Some(app) = weak.upgrade() {
+                app.set_mirror(b.is_active());
             }
         });
     }
@@ -462,7 +542,7 @@ pub fn build(
         let weak = Rc::downgrade(&app_rc);
         window.clipboard().connect_changed(move |clip| {
             if let Some(app) = weak.upgrade()
-                && app.clipboard_autosync
+                && app.clipboard_autosync.get()
                 && !clip.is_local()
             {
                 app.with_clipboard_text(|app, slot, text| {
@@ -623,6 +703,20 @@ impl App {
                 self.broadcast_toggle.set_active(!self.broadcast_toggle.is_active());
                 return true;
             }
+            "mirror_clicks_toggle" => {
+                self.mirror_toggle.set_active(!self.mirror_toggle.is_active());
+                return true;
+            }
+            "screenshot_all" => {
+                self.screenshot_all();
+                return true;
+            }
+            "record_all" => {
+                if let Some(bar) = self.bar() {
+                    bar.record.set_active(!bar.record.is_active());
+                }
+                return true;
+            }
             "grid_view" if self.focused.get().is_some() => {
                 self.leave_focus();
                 return true;
@@ -708,6 +802,16 @@ fn install_actions(app: &Rc<App>, gapp: &adw::Application) {
     });
     app.window.add_action(&pair_direct);
 
+    let prefs = gtk::gio::SimpleAction::new("preferences", None);
+    let weak = Rc::downgrade(app);
+    prefs.connect_activate(move |_, _| {
+        if let Some(app) = weak.upgrade() {
+            crate::preferences::show(&app);
+        }
+    });
+    app.window.add_action(&prefs);
+    gapp.set_accels_for_action("win.preferences", &["<Ctrl>comma"]);
+
     let quit = gtk::gio::SimpleAction::new("quit", None);
     let window = app.window.clone();
     quit.connect_activate(move |_, _| window.close());
@@ -727,6 +831,43 @@ impl App {
         }
     }
 
+    pub fn window(&self) -> &adw::ApplicationWindow {
+        &self.window
+    }
+
+    pub fn config(&self) -> ac_config::Config {
+        self.config.borrow().clone()
+    }
+
+    pub fn config_locked(&self) -> Option<String> {
+        self.config_locked.clone()
+    }
+
+    /// Validates, saves and applies settings from Preferences. Input, file
+    /// and look settings apply now; the manager takes the rest for new
+    /// streams and connections.
+    pub fn apply_config(&self, cfg: ac_config::Config) -> Result<(), String> {
+        if self.config_locked.is_some() {
+            return Err("config.toml has an error; fix it first".into());
+        }
+        let errors = ac_config::validate(&cfg);
+        if !errors.is_empty() {
+            return Err(errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "));
+        }
+        if let Some(path) = &self.config_path {
+            ac_config::save_config(path, &cfg).map_err(|e| e.to_string())?;
+        }
+        *self.prefs.borrow_mut() = InputPrefs::new(&cfg.input);
+        self.broadcast.configure(&cfg.input);
+        self.clipboard_autosync.set(cfg.input.clipboard_autosync);
+        *self.transfer_cfg.borrow_mut() = cfg.transfer.clone();
+        crate::preferences::apply_color_scheme(&cfg.ui.color_scheme);
+        self.send(UiCommand::UpdateConfig(Box::new(cfg.clone())));
+        *self.config.borrow_mut() = cfg;
+        self.refresh_broadcast();
+        Ok(())
+    }
+
     pub fn nearby(&self) -> Vec<NearbyView> {
         self.state.borrow().nearby.clone()
     }
@@ -735,7 +876,7 @@ impl App {
         self.state.borrow().usb.clone()
     }
 
-    fn toast(&self, msg: &str) {
+    pub fn toast(&self, msg: &str) {
         let t = adw::Toast::new(msg);
         t.set_timeout(5);
         self.toasts.add_toast(t);
@@ -784,6 +925,7 @@ impl App {
             CardAction::SendFolder => self.pick_files(slot, true),
             CardAction::CancelTransfers => self.send(UiCommand::CancelTransfers { slot }),
             CardAction::Rename => self.ask_rename(slot),
+            CardAction::UpdateHelper => self.send(UiCommand::UpdateHelper { slot }),
             CardAction::Forget => {
                 let name = self.slot_view(slot).map(|v| v.title).unwrap_or_default();
                 let alert = adw::AlertDialog::new(
@@ -925,6 +1067,64 @@ impl App {
                 *self.last_from_device.borrow_mut() = Some(text.clone());
                 self.window.clipboard().set_text(&text);
             }
+            UiEvent::AppResult { slot, kind, ok, message } => {
+                if let Some(card) = self.cards.get(slot as usize - 1) {
+                    card.set_app_result(kind, ok, &message);
+                }
+            }
+            UiEvent::Packages { packages, .. } => {
+                if let Some(bar) = self.bar() {
+                    bar.add_packages(&packages);
+                }
+            }
+            UiEvent::Crash { slot, crash } => {
+                let Some(card) = self.cards.get(slot as usize - 1) else { return };
+                card.add_crash(&crash);
+                let name = self.slot_view(slot).map(|v| v.title).unwrap_or_default();
+                self.toast(&format!("{name}: {} in {}", crash.kind.label(), crash.package));
+            }
+            UiEvent::Run(v) => {
+                if v.active && self.run_dir.borrow().as_ref() != Some(&v.dir) {
+                    // A new run starts with clean tiles.
+                    for c in &self.cards {
+                        c.clear_crashes();
+                        c.clear_app_result();
+                    }
+                    *self.run_dir.borrow_mut() = Some(v.dir.clone());
+                }
+                if !v.active {
+                    self.run_dir.borrow_mut().take();
+                    if !self.graphs_on.get() {
+                        self.cards.iter().for_each(SlotCard::hide_perf);
+                    }
+                }
+                if let Some(bar) = self.bar() {
+                    bar.set_run(v);
+                }
+            }
+            UiEvent::Perf { slot, sample } => {
+                let run = self.bar().is_some_and(|b| b.run_active());
+                if (self.graphs_on.get() || run)
+                    && let Some(card) = self.cards.get(slot as usize - 1)
+                {
+                    card.set_perf(&sample);
+                }
+            }
+            UiEvent::SaveFrame { slot, path } => self.save_frame(slot, &path),
+            UiEvent::Recording { slot, file } => {
+                let i = slot as usize - 1;
+                let Some(card) = self.cards.get(i) else { return };
+                card.set_recording(file.is_some());
+                let any = {
+                    let mut r = self.recording.borrow_mut();
+                    r[i] = file.is_some();
+                    r.iter().any(|&x| x)
+                };
+                if let Some(bar) = self.bar() {
+                    bar.set_recording(any);
+                }
+            }
+            UiEvent::Saved { message, folder } => self.saved_toast(&message, folder),
             UiEvent::Transfer(v) => {
                 let i = v.slot as usize - 1;
                 let Some(card) = self.cards.get(i) else { return };
@@ -936,6 +1136,110 @@ impl App {
                 }
             }
         }
+    }
+
+    // ---- app testing (Milestone 5) ---------------------------------------------
+
+    fn bar(&self) -> Option<Rc<TestBar>> {
+        self.test_bar.borrow().clone()
+    }
+
+    /// Every phone that is connected, in slot order.
+    pub fn online_slots(&self) -> Vec<SlotId> {
+        self.state.borrow().slots.iter().flatten().filter(|v| v.phase == PhaseView::Online).map(|v| v.slot).collect()
+    }
+
+    pub fn start_run(&self, name: &str) {
+        self.send(UiCommand::StartRun { name: name.to_owned() });
+    }
+
+    pub fn clear_results(&self) {
+        self.cards.iter().for_each(SlotCard::clear_app_result);
+    }
+
+    /// Runs an app action on every connected phone; the destructive ones ask first.
+    pub fn app_action(self: &Rc<Self>, action: AppAction) {
+        let slots = self.online_slots();
+        if slots.is_empty() {
+            return self.toast("No phone is connected");
+        }
+        let ask = match &action {
+            AppAction::ClearData(p) => Some((format!("Clear {p}'s data?"), "Its settings, saves and accounts are deleted on every connected phone.", "Clear data")),
+            AppAction::Uninstall(p) => Some((format!("Uninstall {p}?"), "It is removed from every connected phone. Phones without ADB ask on their screen.", "Uninstall")),
+            _ => None,
+        };
+        let Some((title, body, verb)) = ask else {
+            self.clear_results();
+            return self.send(UiCommand::AppAction { slots, action });
+        };
+        let alert = adw::AlertDialog::new(Some(&title), Some(body));
+        alert.add_response("cancel", "Cancel");
+        alert.add_response("go", verb);
+        alert.set_response_appearance("go", adw::ResponseAppearance::Destructive);
+        alert.set_default_response(Some("cancel"));
+        let weak = Rc::downgrade(self);
+        alert.connect_response(None, move |_, resp| {
+            if resp == "go"
+                && let Some(app) = weak.upgrade()
+            {
+                app.clear_results();
+                app.send(UiCommand::AppAction { slots: slots.clone(), action: action.clone() });
+            }
+        });
+        alert.present(Some(&self.window));
+    }
+
+    pub fn screenshot_all(&self) {
+        let slots = self.online_slots();
+        if slots.is_empty() {
+            return self.toast("No phone is connected");
+        }
+        self.send(UiCommand::Screenshot { slots });
+    }
+
+    pub fn set_graphs(&self, on: bool) {
+        self.graphs_on.set(on);
+        self.send(UiCommand::SetPerf { on });
+        if !on && !self.bar().is_some_and(|b| b.run_active()) {
+            self.cards.iter().for_each(SlotCard::hide_perf);
+        }
+    }
+
+    /// A phone without ADB: its mirror's current frame is the screenshot.
+    fn save_frame(self: &Rc<Self>, slot: SlotId, path: &std::path::Path) {
+        let i = slot as usize - 1;
+        let paintable = self.cards.get(i).and_then(|c| c.picture.paintable()).or_else(|| self.focus_pictures.get(i)?.paintable());
+        let Some(texture) = paintable.and_downcast::<gdk::Texture>() else {
+            return self.toast("No picture from that phone yet to save");
+        };
+        match texture.save_to_png(path) {
+            Ok(()) => {
+                let folder = path.parent().map(PathBuf::from).unwrap_or_default();
+                self.saved_toast("Screenshot saved", folder);
+            }
+            Err(e) => self.toast(&format!("Could not save the screenshot: {e}")),
+        }
+    }
+
+    /// "Saved" with a button that opens the folder.
+    fn saved_toast(self: &Rc<Self>, message: &str, folder: PathBuf) {
+        let t = adw::Toast::builder().title(message).timeout(8).button_label("Open folder").build();
+        let weak = Rc::downgrade(self);
+        t.connect_button_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.open_folder(&folder);
+            }
+        });
+        self.toasts.add_toast(t);
+    }
+
+    pub fn open_folder(&self, folder: &std::path::Path) {
+        let uri = gtk::gio::File::for_path(folder).uri();
+        gtk::UriLauncher::new(&uri).launch(Some(&self.window), gtk::gio::Cancellable::NONE, |r| {
+            if let Err(e) = r {
+                tracing::warn!("opening the folder: {e}");
+            }
+        });
     }
 
     fn set_stay_awake(&self, slot: SlotId, on: bool) {
@@ -963,7 +1267,10 @@ impl App {
     /// broadcasting from it, otherwise just that one.
     fn transfer_targets(&self, slot: SlotId) -> Vec<SlotId> {
         let online = |s: SlotId| self.slot_view(s).is_some_and(|v| v.phase == PhaseView::Online);
-        if self.broadcast.active_for(slot) {
+        if self.broadcast.mirror() && online(slot) {
+            // Mirror clicks: an APK dropped on one phone goes to all of them.
+            (1..=self.cards.len() as SlotId).filter(|&s| online(s)).collect()
+        } else if self.broadcast.active_for(slot) {
             self.broadcast.targets().into_iter().filter(|&s| online(s)).collect()
         } else if online(slot) {
             vec![slot]
@@ -1001,7 +1308,7 @@ impl App {
                 if phones == 0 {
                     return Some("Connect this phone to send files to it".into());
                 }
-                let cfg = &app.transfer_cfg;
+                let cfg = app.transfer_cfg.borrow();
                 let choice = dnd::apk_choice(&cfg.apk_drop_action, false);
                 Some(match t.value().map(|v| dnd::paths_from_value(&v)) {
                     Some(Ok(paths)) => dnd::hint(&paths, &cfg.default_target_dir, choice, &cfg.apk_alternate_modifier, phones),
@@ -1053,7 +1360,7 @@ impl App {
                 };
                 // Alternate modifier (spec §5.2): keyboard state at drop
                 // time, or a Shift-drag negotiated as MOVE.
-                let m = dnd::modifier(&app.transfer_cfg.apk_alternate_modifier);
+                let m = dnd::modifier(&app.transfer_cfg.borrow().apk_alternate_modifier);
                 let alternate = t.current_drop().is_some_and(|d| {
                     let dev = d.device();
                     let held = dev.modifier_state().contains(m)
@@ -1074,7 +1381,7 @@ impl App {
             return;
         }
         let has_apk = paths.iter().any(|p| ac_transfer::apk::has_apk_ext(p));
-        let choice = dnd::apk_choice(&self.transfer_cfg.apk_drop_action, alternate);
+        let choice = dnd::apk_choice(&self.transfer_cfg.borrow().apk_drop_action, alternate);
         match (has_apk, choice, self.apk_answer.get()) {
             (false, ..) => self.send(UiCommand::SendFiles { slots, paths, install_apks: false }),
             (true, ApkChoice::Ask, Some(install)) => self.send(UiCommand::SendFiles { slots, paths, install_apks: install }),
@@ -1270,8 +1577,8 @@ impl App {
 
     // ---- grid, thumbnails, broadcast --------------------------------------
 
-    /// Tells the grid layout about each card: empty slots go to the narrow
-    /// column (or are hidden with `ui.hide_empty_slots`), phones are scored
+    /// Tells the grid layout about each card: empty slots are hidden (the
+    /// welcome page shows while there is no phone at all), phones are scored
     /// by their frame shape.
     fn refresh_layout(&self) {
         let st = self.state.borrow();
@@ -1280,13 +1587,15 @@ impl App {
             .map(|i| st.slots[i].as_ref().is_none_or(|v| v.phase == PhaseView::Empty))
             .collect();
         let any_phone = empty.iter().any(|e| !e);
+        // Empty slots get no tile: Add Device is in the toolbar.
+        self.home.set_visible_child_name(if any_phone { "grid" } else { "welcome" });
         let tiles = empty
             .iter()
             .enumerate()
             .map(|(i, &compact)| {
-                self.cards[i].set_compact(compact && any_phone);
-                self.cards[i].root.set_visible(!(compact && any_phone && self.hide_empty));
-                TileInfo { frame: books[i].frame, compact }
+                self.cards[i].set_compact(false);
+                self.cards[i].root.set_visible(!compact);
+                TileInfo { frame: books[i].frame, compact: false }
             })
             .collect();
         self.grid.grid_layout().set_tiles(tiles);
@@ -1312,6 +1621,9 @@ impl App {
         if self.broadcast.enabled() == on {
             return;
         }
+        if on && self.broadcast.mirror() {
+            self.mirror_toggle.set_active(false);
+        }
         if on && self.broadcast.targets().is_empty() {
             // Nothing chosen yet: start with every phone that is mirroring.
             let all: Vec<SlotId> = (1..=self.cards.len() as SlotId).filter(|&s| self.streaming(s)).collect();
@@ -1326,24 +1638,51 @@ impl App {
         }
     }
 
+    /// Mirror clicks on/off; it and broadcast exclude each other.
+    fn set_mirror(&self, on: bool) {
+        if self.broadcast.mirror() == on {
+            return;
+        }
+        if on && self.broadcast.enabled() {
+            self.broadcast_toggle.set_active(false);
+        }
+        self.broadcast.set_mirror(on);
+        self.refresh_broadcast();
+        if on {
+            let n = self.broadcast.fan_out().len();
+            self.toast(&match n {
+                0 => "Mirror clicks on: it starts once phones are mirroring".to_owned(),
+                1 => "Mirror clicks on: connect more phones to repeat input on them".to_owned(),
+                n => format!("Mirror clicks on: input on any phone repeats on all {n}"),
+            });
+        } else {
+            self.toast("Mirror clicks off");
+        }
+    }
+
     /// Checkboxes, ⚠ badges, red borders and the header badge (spec §4.10).
     fn refresh_broadcast(&self) {
-        let on = self.broadcast.enabled();
+        let mirror = self.broadcast.mirror();
+        let on = self.broadcast.enabled() || mirror;
+        self.broadcast_badge.set_label(if mirror { "MIRROR CLICKS ●" } else { "BROADCAST ●" });
         self.broadcast_badge.set_visible(on);
-        if self.broadcast_toggle.is_active() != on {
-            self.broadcast_toggle.set_active(on);
+        if self.broadcast_toggle.is_active() != self.broadcast.enabled() {
+            self.broadcast_toggle.set_active(self.broadcast.enabled());
+        }
+        if self.mirror_toggle.is_active() != mirror {
+            self.mirror_toggle.set_active(mirror);
         }
         // Orientation warnings are relative to the phone being driven.
         let reference = self
             .focused
             .get()
             .or(self.active.get())
-            .filter(|&s| self.broadcast.is_target(s) && self.streaming(s))
-            .or_else(|| self.broadcast.targets().into_iter().find(|&s| self.streaming(s)));
+            .filter(|&s| self.broadcast.receives(s))
+            .or_else(|| self.broadcast.fan_out().into_iter().find(|&s| self.streaming(s)));
         let ref_frame = reference.and_then(|s| self.io[s as usize - 1].mailbox.size());
         for (i, card) in self.cards.iter().enumerate() {
             let slot = i as SlotId + 1;
-            let target = self.broadcast.is_target(slot);
+            let target = if mirror { self.broadcast.receives(slot) } else { self.broadcast.is_target(slot) };
             let frame = self.io[i].mailbox.size();
             let warning = if !self.streaming(slot) {
                 Some("Not mirroring: broadcast skips this phone".to_owned())
@@ -1359,7 +1698,7 @@ impl App {
             } else {
                 None
             };
-            card.set_broadcast(on, target, warning.as_deref());
+            card.set_broadcast(on, !mirror, target, warning.as_deref());
             let w = &self.focus_widgets[i];
             if on && target {
                 w.add_css_class("broadcast-target");
@@ -1448,6 +1787,9 @@ impl App {
         self.nearby_list.remove_all();
         let st = self.state.borrow();
         let mut rows = 0;
+        let found = st.nearby.iter().filter(|n| n.in_slot.is_none() && !n.instance.starts_with("studio-")).count() + st.usb.len();
+        let label = if found == 0 { "Nearby".to_owned() } else { format!("Nearby ({found})") };
+        self.nearby_button.set_child(Some(&adw::ButtonContent::builder().icon_name("network-wireless-symbolic").label(&label).build()));
         for n in st.nearby.iter().filter(|n| n.in_slot.is_none() && !n.instance.starts_with("studio-")) {
             let title = n.known_name.clone().or_else(|| n.serial.clone()).unwrap_or_else(|| n.instance.clone());
             let row = adw::ActionRow::builder().title(&title).build();
@@ -1524,6 +1866,10 @@ fn status_strip(fps: u64, kbps: u32, (w, h): (u32, u32), codec: Option<VideoCode
         parts.push(codec_name(c).to_owned());
     }
     parts.push(format!("{:.1} Mbit/s", kbps as f64 / 1000.0));
+    if io.reduced() {
+        // Adaptive bitrate stepped down for a laggy link (spec §3.6).
+        parts.push("reduced for Wi-Fi".to_owned());
+    }
     parts.push(format!("{w}×{h}"));
     parts.push(backend.to_owned());
     let lag = io.mailbox.stats.lag_ms.load(Ordering::Relaxed);

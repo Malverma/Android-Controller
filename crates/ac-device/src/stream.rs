@@ -25,6 +25,8 @@ pub struct SlotIo {
     control: Mutex<Option<mpsc::UnboundedSender<ControlMsg>>>,
     backend: Mutex<Option<Backend>>,
     info: Mutex<Option<StreamInfo>>,
+    /// The adaptive bitrate controller lowered this stream (spec §3.6).
+    reduced: std::sync::atomic::AtomicBool,
 }
 
 /// What the running session asked the phone for (shown in the status strip).
@@ -46,6 +48,15 @@ impl SlotIo {
         self.control.lock().unwrap().is_some()
     }
 
+    /// Attaches a control channel as a running stream would (for tests of
+    /// input routing); the receiver gets what is sent.
+    #[doc(hidden)]
+    pub fn attach_control_for_test(&self) -> mpsc::UnboundedReceiver<ControlMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.control.lock().unwrap() = Some(tx);
+        rx
+    }
+
     /// Backend decoding this slot's stream, while it runs.
     pub fn backend(&self) -> Option<Backend> {
         *self.backend.lock().unwrap()
@@ -55,12 +66,23 @@ impl SlotIo {
     pub fn info(&self) -> Option<StreamInfo> {
         *self.info.lock().unwrap()
     }
+
+    /// The stream runs below its profile because the Wi-Fi lagged.
+    pub fn reduced(&self) -> bool {
+        self.reduced.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_reduced(&self, on: bool) {
+        self.reduced.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// What a session reports back to the manager.
 pub enum SessionMsg {
     Slot(SlotId, SlotEvent),
     DeviceClipboard(SlotId, String),
+    /// Something to tell the user that does not end the session.
+    Notice(SlotId, String),
 }
 
 /// Everything a session needs; cheap to clone per launch.
@@ -103,14 +125,27 @@ pub fn max_size_for(p: &Profile, tile_px: Option<u32>) -> u32 {
     }
 }
 
+/// The codec for a profile's `codec` setting: `*-if-supported` only when the
+/// phone has a hardware encoder for it (devices.toml `supported_codecs`) and
+/// this PC's VA-API decodes it (spec §4.3); H.264 otherwise.
+pub fn pick_codec(want: &str, device: &[String], host: &ac_media::ProbeResult) -> VideoCodec {
+    let has = |c: &str| device.iter().any(|d| d == c);
+    match want {
+        "h265" => VideoCodec::H265,
+        "av1" => VideoCodec::Av1,
+        "h265-if-supported" if has("h265") && host.hevc => VideoCodec::H265,
+        "av1-if-supported" if has("av1") && host.av1 => VideoCodec::Av1,
+        _ => VideoCodec::H264,
+    }
+}
+
 /// Launch parameters for a resolved profile (spec §4.3).
 pub fn server_params(cfg: &Config, p: &Profile, tile_px: Option<u32>, bitrate_kbps: Option<u32>) -> ServerParams {
     let max_size = max_size_for(p, tile_px);
     let codec = match p.codec.as_str() {
         "h265" => VideoCodec::H265,
         "av1" => VideoCodec::Av1,
-        // "h265-if-supported" needs the device's encoder list, which is
-        // not probed yet: H.264 works everywhere.
+        // "*-if-supported" depends on the phone and this PC: see `pick_codec`.
         _ => VideoCodec::H264,
     };
     ServerParams {
@@ -125,6 +160,7 @@ pub fn server_params(cfg: &Config, p: &Profile, tile_px: Option<u32>, bitrate_kb
         stay_awake: cfg.connection.stay_awake,
         show_touches: cfg.connection.show_touches,
         power_on: true,
+        audio: p.audio,
     }
 }
 
@@ -169,6 +205,7 @@ pub fn spawn_session(
     serial: String,
     shell_v2: bool,
     params: ServerParams,
+    audio: ac_audio::Options,
     slot: SlotId,
     id: u64,
     io: Arc<SlotIo>,
@@ -176,7 +213,7 @@ pub fn spawn_session(
 ) -> SessionHandle {
     let (stop_tx, stop_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let error = run_session(&env, &serial, shell_v2, &params, slot, id, &io, &tx, stop_rx).await;
+        let error = run_session(&env, &serial, shell_v2, &params, audio, slot, id, &io, &tx, stop_rx).await;
         let _ = tx.send(SessionMsg::Slot(slot, SlotEvent::StreamEnded { id, error }));
     });
     SessionHandle { stop: Some(stop_tx) }
@@ -189,6 +226,7 @@ async fn run_session(
     serial: &str,
     shell_v2: bool,
     params: &ServerParams,
+    audio_opts: ac_audio::Options,
     slot: SlotId,
     id: u64,
     io: &Arc<SlotIo>,
@@ -231,6 +269,28 @@ async fn run_session(
         return Some(format!("decode thread: {e}"));
     }
 
+    // Audio (focus view): played on its own thread; a failure there is
+    // reported but leaves the mirror running.
+    let audio_shutdown = launched.audio.take().and_then(|a| {
+        let a = a.into_std().and_then(|s| s.set_nonblocking(false).map(|()| s)).ok()?;
+        let shutdown = a.try_clone().ok()?;
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new().name(format!("audio-{slot}")).spawn(move || {
+            let player = audio_opts.command();
+            match ac_audio::run(a, &audio_opts, player) {
+                Ok(ac_audio::Ended::Closed) => {}
+                Ok(ac_audio::Ended::Unsupported) => {
+                    let _ = tx.send(SessionMsg::Notice(slot, format!("{}: this phone can't share its audio (needs Android 11 or newer)", audio_opts.description)));
+                }
+                Err(e) => {
+                    tracing::warn!(slot, "audio: {e}");
+                    let _ = tx.send(SessionMsg::Notice(slot, format!("{}: no audio — {e}", audio_opts.description)));
+                }
+            }
+        });
+        spawned.ok().map(|_| shutdown)
+    });
+
     // Control: writer task fed by `SlotIo::send`, reader task for clipboard.
     let (read_half, write_half) = launched.control.into_split();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
@@ -262,6 +322,9 @@ async fn run_session(
     *io.info.lock().unwrap() = None;
     if let Some(v) = video_shutdown {
         let _ = v.shutdown(Shutdown::Both);
+    }
+    if let Some(a) = audio_shutdown {
+        let _ = a.shutdown(Shutdown::Both);
     }
     writer.abort();
     reader.abort();
@@ -316,6 +379,7 @@ async fn run_direct_session(
         bit_rate: params.bit_rate,
         max_fps: params.max_fps,
         power_on: params.power_on,
+        codec: if params.codec == VideoCodec::H265 { "h265" } else { "h264" },
     };
     let opened = tokio::select! {
         r = ac_direct::open_stream(env.addr, &env.creds, &env.device_id, p) => r,
@@ -356,7 +420,7 @@ async fn run_direct_session(
     }
     *io.control.lock().unwrap() = Some(ctl_tx);
     *io.info.lock().unwrap() = Some(StreamInfo {
-        codec: VideoCodec::H264,
+        codec: params.codec,
         max_size: params.max_size,
         bit_rate: params.bit_rate,
         max_fps: params.max_fps,
@@ -541,6 +605,19 @@ mod tests {
         assert_eq!((f.max_size, f.bit_rate, f.max_fps), (1920, 12_000_000, 60));
         assert_eq!(f.codec, VideoCodec::H264);
         assert_eq!(server_params(&cfg, &grid, None, Some(1800)).bit_rate, 1_800_000);
+    }
+
+    #[test]
+    fn codec_choice_needs_both_ends() {
+        let host = |hevc, av1| ac_media::ProbeResult { vaapi: Ok(()), dmabuf_export: true, hevc, av1 };
+        let phone: Vec<String> = vec!["h264".into(), "h265".into()];
+        assert_eq!(pick_codec("h265-if-supported", &phone, &host(true, false)), VideoCodec::H265);
+        assert_eq!(pick_codec("h265-if-supported", &phone, &host(false, false)), VideoCodec::H264, "PC can't decode it");
+        assert_eq!(pick_codec("h265-if-supported", &["h264".into()], &host(true, true)), VideoCodec::H264, "phone can't encode it");
+        assert_eq!(pick_codec("h265-if-supported", &[], &host(true, true)), VideoCodec::H264, "not probed yet");
+        assert_eq!(pick_codec("av1-if-supported", &phone, &host(true, true)), VideoCodec::H264);
+        assert_eq!(pick_codec("h265", &[], &host(false, false)), VideoCodec::H265, "explicit");
+        assert_eq!(pick_codec("h264", &phone, &host(true, true)), VideoCodec::H264);
     }
 
     #[test]

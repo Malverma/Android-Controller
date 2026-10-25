@@ -42,12 +42,16 @@ final class Streamer {
     private final int maxSize;
     private final int bitRate;
     private final int maxFps;
+    /** {@code video/avc} or, when the PC asked and the phone can, {@code video/hevc}. */
+    private String mime;
     private volatile boolean stopped;
     private volatile boolean keyFrameWanted;
     /** Current capture (frame) size and the real screen size it maps to. */
     private volatile int frameW, frameH, realW, realH;
 
-    Streamer(Context ctx, Socket socket, DataInputStream in, int maxSize, int bitRate, int maxFps) {
+    Streamer(Context ctx, Socket socket, DataInputStream in, int maxSize, int bitRate, int maxFps, String codec) {
+        this.mime = codec.equals("h265") && Apps.hardwareEncoder(MediaFormat.MIMETYPE_VIDEO_HEVC) != null
+                ? MediaFormat.MIMETYPE_VIDEO_HEVC : MediaFormat.MIMETYPE_VIDEO_AVC;
         this.ctx = ctx;
         this.socket = socket;
         this.in = in;
@@ -66,8 +70,7 @@ final class Streamer {
         display.getRealMetrics(metrics);
         VirtualDisplay vd = null;
         try {
-            out.write("h264".getBytes(StandardCharsets.US_ASCII));
-            out.flush();
+            boolean announced = false;
             long ptsOrigin = -1;
             while (!stopped) {
                 Point real = new Point();
@@ -75,22 +78,35 @@ final class Streamer {
                 MediaCodec codec = null;
                 Surface surface = null;
                 int[] size = null;
-                for (int limit : new int[] {maxSize, 1280, 1024, 800}) {
-                    if (limit > maxSize && maxSize > 0) continue;
-                    size = scaled(real.x, real.y, limit);
-                    try {
-                        codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-                        codec.configure(format(size[0], size[1]), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                        surface = codec.createInputSurface();
-                        codec.start();
+                for (int attempt = 0; attempt < 2 && codec == null; attempt++) {
+                    for (int limit : new int[] {maxSize, 1280, 1024, 800}) {
+                        if (limit > maxSize && maxSize > 0) continue;
+                        size = scaled(real.x, real.y, limit);
+                        try {
+                            codec = MediaCodec.createEncoderByType(mime);
+                            codec.configure(format(size[0], size[1]), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                            surface = codec.createInputSurface();
+                            codec.start();
+                            break;
+                        } catch (IOException | RuntimeException e) {
+                            Log.w(Direct.TAG, mime + " encoder at " + size[0] + "x" + size[1] + " failed", e);
+                            if (codec != null) codec.release();
+                            codec = null;
+                        }
+                    }
+                    // H.265 refused before the PC heard which format: fall back to H.264.
+                    if (codec == null && !announced && !mime.equals(MediaFormat.MIMETYPE_VIDEO_AVC)) {
+                        mime = MediaFormat.MIMETYPE_VIDEO_AVC;
+                    } else {
                         break;
-                    } catch (IOException | RuntimeException e) {
-                        Log.w(Direct.TAG, "encoder at " + size[0] + "x" + size[1] + " failed", e);
-                        if (codec != null) codec.release();
-                        codec = null;
                     }
                 }
                 if (codec == null) throw new IOException("the phone's video encoder did not start");
+                if (!announced) {
+                    // scrcpy's codec id: what the PC's demuxer reads first.
+                    out.write((mime.equals(MediaFormat.MIMETYPE_VIDEO_HEVC) ? "h265" : "h264").getBytes(StandardCharsets.US_ASCII));
+                    announced = true;
+                }
                 frameW = size[0];
                 frameH = size[1];
                 realW = real.x;
@@ -179,7 +195,7 @@ final class Streamer {
     }
 
     private MediaFormat format(int w, int h) {
-        MediaFormat f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
+        MediaFormat f = MediaFormat.createVideoFormat(mime, w, h);
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         f.setInteger(MediaFormat.KEY_BIT_RATE, bitRate > 0 ? bitRate : 4_000_000);
         f.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
@@ -240,14 +256,14 @@ final class Streamer {
             }
             case 2: { // INJECT_TOUCH_EVENT
                 int action = in.readUnsignedByte();
-                in.readLong(); // pointer id
+                long pointer = in.readLong();
                 int x = in.readInt(), y = in.readInt();
                 int sw = in.readUnsignedShort(), sh = in.readUnsignedShort();
                 in.readUnsignedShort(); // pressure
                 in.readInt(); // action button
                 in.readInt(); // buttons
                 if (input != null && sw == frameW && sh == frameH && action <= 3) {
-                    input.touch(action, (float) x * realW / sw, (float) y * realH / sh);
+                    input.touch(action, pointer, (float) x * realW / sw, (float) y * realH / sh);
                 }
                 break;
             }

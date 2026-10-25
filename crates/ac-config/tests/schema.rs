@@ -23,6 +23,43 @@ fn defaults_round_trip_through_toml() {
     assert_eq!(parse_config(&text, p()).unwrap(), Config::default());
 }
 
+/// What the Preferences dialog writes: the whole config, edited.
+#[test]
+fn edited_config_saves_and_loads_back() {
+    let dir = std::env::temp_dir().join(format!("ac-config-save-{}", std::process::id()));
+    let path = dir.join("config.toml");
+    let mut cfg = Config::default();
+    cfg.profiles.get_mut("focus").unwrap().max_size = MaxSize::Px(0);
+    cfg.profiles.get_mut("focus").unwrap().audio = false;
+    cfg.audio.volume = 0.35;
+    cfg.transfer.default_target_dir = "/sdcard/Games".into();
+    cfg.ui.color_scheme = "dark".into();
+    assert!(validate(&cfg).is_empty());
+    save_config(&path, &cfg).unwrap();
+    assert_eq!(load_config(&path).unwrap(), cfg);
+    assert!(!dir.join("config.toml.tmp").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn audio_settings_are_validated() {
+    let mut cfg = Config::default();
+    cfg.audio.volume = 1.5;
+    cfg.audio.pipewire_latency_frames = 10;
+    let keys: Vec<String> = validate(&cfg).into_iter().map(|e| e.key).collect();
+    assert_eq!(keys, ["audio.volume", "audio.pipewire_latency_frames"]);
+}
+
+#[test]
+fn testing_settings() {
+    let cfg = parse_config("[testing]\noutput_dir = \"~/Tests\"\nwatch_crashes = false\n", p()).unwrap();
+    assert_eq!((cfg.testing.output_dir.as_str(), cfg.testing.watch_crashes, cfg.testing.perf_interval_ms), ("~/Tests", false, 2000));
+    let mut cfg = Config::default();
+    cfg.testing.perf_interval_ms = 100;
+    let keys: Vec<String> = validate(&cfg).into_iter().map(|e| e.key).collect();
+    assert_eq!(keys, ["testing.perf_interval_ms"]);
+}
+
 #[test]
 fn partial_file_keeps_other_defaults() {
     let cfg = parse_config(

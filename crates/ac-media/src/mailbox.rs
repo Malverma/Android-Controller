@@ -1,9 +1,11 @@
 //! Latest-wins hand-off from a decode thread to the GTK main thread.
 
-use std::sync::Mutex;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, mpsc};
 
 use crate::frame::Frame;
+use crate::recorder::{self, OnDone, RecMsg};
 
 #[derive(Default)]
 pub struct VideoStats {
@@ -26,6 +28,10 @@ pub struct Mailbox {
     /// Current capture size `(w << 32) | h`, 0 when not streaming.
     size: AtomicU64,
     pub stats: VideoStats,
+    /// The slot's recording, fed by whichever stream runs (it outlives
+    /// stream restarts); the generation tells a decode thread it is new.
+    recorder: Mutex<Option<mpsc::Sender<RecMsg>>>,
+    rec_gen: AtomicU64,
 }
 
 impl Mailbox {
@@ -55,6 +61,37 @@ impl Mailbox {
     pub fn size(&self) -> Option<(u32, u32)> {
         let v = self.size.load(Ordering::Acquire);
         (v != 0).then_some(((v >> 32) as u32, v as u32))
+    }
+
+    /// Starts recording this slot's video to `stem.mp4` (see [`recorder`]).
+    pub fn start_recording(&self, stem: PathBuf, on_done: OnDone) -> std::io::Result<()> {
+        let tx = recorder::spawn(stem, on_done)?;
+        if let Some(old) = self.recorder.lock().unwrap().replace(tx) {
+            let _ = old.send(RecMsg::Stop);
+        }
+        self.rec_gen.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Finishes the recording; false when there was none.
+    pub fn stop_recording(&self) -> bool {
+        match self.recorder.lock().unwrap().take() {
+            Some(tx) => {
+                let _ = tx.send(RecMsg::Stop);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recorder.lock().unwrap().is_some()
+    }
+
+    /// The recording to feed, and its generation.
+    pub(crate) fn recorder(&self) -> Option<(u64, mpsc::Sender<RecMsg>)> {
+        let r = self.recorder.lock().unwrap().clone()?;
+        Some((self.rec_gen.load(Ordering::Acquire), r))
     }
 
     /// Ends a stream: forget the size and any undisplayed frame.

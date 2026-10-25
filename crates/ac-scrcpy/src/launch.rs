@@ -11,7 +11,11 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::demux::VideoCodec;
 use crate::server::{DEVICE_JAR, ServerParams};
+
+/// Where [`list_encoders`] pushes its own copy of the server.
+const PROBE_JAR: &str = "/data/local/tmp/android-controller-probe.jar";
 
 /// Mode for the pushed jar: regular file, 0644.
 const JAR_MODE: u32 = 0o100644;
@@ -104,6 +108,8 @@ impl Drop for ServerProcess {
 pub struct Launched {
     /// Positioned after the dummy byte and the 64-byte device name.
     pub video: TcpStream,
+    /// Present when `ServerParams::audio`; starts with the codec id.
+    pub audio: Option<TcpStream>,
     pub control: TcpStream,
     pub server: ServerProcess,
     pub device_name: String,
@@ -119,7 +125,7 @@ pub async fn launch(
     params: &ServerParams,
     shell_v2: bool,
 ) -> Result<Launched, LaunchError> {
-    push(adb, serial, server_jar).await?;
+    push(adb, serial, server_jar, DEVICE_JAR).await?;
 
     let port = adb
         .forward(serial, "tcp:0", &format!("localabstract:{}", params.socket_name()))
@@ -129,7 +135,9 @@ pub async fn launch(
     let forward_local = format!("tcp:{port}");
 
     match start(adb, serial, version, params, shell_v2, port).await {
-        Ok((video, control, server, device_name)) => Ok(Launched { video, control, server, device_name, forward_local }),
+        Ok((video, audio, control, server, device_name)) => {
+            Ok(Launched { video, audio, control, server, device_name, forward_local })
+        }
         Err(e) => {
             let _ = adb.kill_forward(serial, &forward_local).await;
             Err(e)
@@ -137,7 +145,7 @@ pub async fn launch(
     }
 }
 
-async fn push(adb: &AdbClient, serial: &str, server_jar: &Path) -> Result<(), LaunchError> {
+async fn push(adb: &AdbClient, serial: &str, server_jar: &Path, dest: &str) -> Result<(), LaunchError> {
     let err = |e: &dyn std::fmt::Display| LaunchError::new(Stage::Pushing, e);
     let file = tokio::fs::File::open(server_jar).await.map_err(|e| err(&format!("{}: {e}", server_jar.display())))?;
     let mtime = file
@@ -148,12 +156,80 @@ async fn push(adb: &AdbClient, serial: &str, server_jar: &Path) -> Result<(), La
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs() as u32);
     let mut sync = adb.sync(serial).await.map_err(|e| err(&e))?;
-    tokio::time::timeout(Duration::from_secs(15), sync.send(DEVICE_JAR, JAR_MODE, mtime, file, |_| {}))
+    tokio::time::timeout(Duration::from_secs(15), sync.send(dest, JAR_MODE, mtime, file, |_| {}))
         .await
         .map_err(|_| err(&"timed out"))?
         .map_err(|e| err(&e))?;
     let _ = sync.quit().await;
     Ok(())
+}
+
+/// One of the phone's video encoders, from `list_encoders=true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Encoder {
+    pub codec: VideoCodec,
+    pub name: String,
+    /// A hardware encoder (software HEVC/AV1 is far too slow to mirror with).
+    pub hw: bool,
+}
+
+/// Lists the phone's video encoders (spec §4.3 codec capability discovery).
+/// Uses its own copy of the server, so it can run beside a live session.
+pub async fn list_encoders(
+    adb: &AdbClient,
+    serial: &str,
+    server_jar: &Path,
+    version: &str,
+    shell_v2: bool,
+) -> Result<Vec<Encoder>, LaunchError> {
+    push(adb, serial, server_jar, PROBE_JAR).await?;
+    let cmd = format!(
+        "CLASSPATH={PROBE_JAR} app_process / com.genymobile.scrcpy.Server '{version}' log_level=info list_encoders=true; rm -f {PROBE_JAR}"
+    );
+    let out = tokio::time::timeout(Duration::from_secs(20), adb.shell(serial, &cmd, shell_v2))
+        .await
+        .map_err(|_| LaunchError::new(Stage::Launching, "listing encoders timed out"))?
+        .map_err(|e| LaunchError::new(Stage::Launching, e))?;
+    let encoders = parse_encoders(&format!("{}\n{}", out.stdout, out.stderr));
+    if encoders.is_empty() {
+        let mut e = LaunchError::new(Stage::Launching, "the phone listed no video encoders");
+        e.server_output = out.stdout.lines().rev().take(OUTPUT_TAIL_LINES).collect::<Vec<_>>().join("\n");
+        return Err(e);
+    }
+    Ok(encoders)
+}
+
+/// Lines like `--video-codec=h264 --video-encoder=c2.mtk.avc.encoder (hw) [vendor]`.
+/// Android 9 and older print no `(hw)`/`(sw)`; Google's software codecs are
+/// then recognized by name.
+pub fn parse_encoders(out: &str) -> Vec<Encoder> {
+    out.lines()
+        .filter_map(|line| {
+            let mut codec = None;
+            let mut name = None;
+            for w in line.split_whitespace() {
+                if let Some(c) = w.strip_prefix("--video-codec=") {
+                    codec = match c {
+                        "h264" => Some(VideoCodec::H264),
+                        "h265" => Some(VideoCodec::H265),
+                        "av1" => Some(VideoCodec::Av1),
+                        _ => None,
+                    };
+                } else if let Some(n) = w.strip_prefix("--video-encoder=") {
+                    name = Some(n.trim_matches('\'').to_owned());
+                }
+            }
+            let (codec, name) = (codec?, name?);
+            let hw = if line.contains("(sw)") {
+                false
+            } else if line.contains("(hw)") || line.contains("(hybrid)") {
+                true
+            } else {
+                !(name.starts_with("OMX.google.") || name.starts_with("c2.android."))
+            };
+            Some(Encoder { codec, name, hw })
+        })
+        .collect()
 }
 
 async fn start(
@@ -163,7 +239,7 @@ async fn start(
     params: &ServerParams,
     shell_v2: bool,
     port: u16,
-) -> Result<(TcpStream, TcpStream, ServerProcess, String), LaunchError> {
+) -> Result<(TcpStream, Option<TcpStream>, TcpStream, ServerProcess, String), LaunchError> {
     let cmd = params.command(version);
     let service = if shell_v2 { format!("shell,v2,raw:{cmd}") } else { format!("shell:{cmd}") };
     let shell = adb
@@ -203,6 +279,15 @@ async fn start(
 
     // The server sends the device name only once every socket is connected
     // (video, then audio if enabled, then control).
+    let audio = if params.audio {
+        let a = TcpStream::connect(addr)
+            .await
+            .map_err(|e| failed(Stage::Handshaking, &format!("audio socket: {e}"), &server))?;
+        let _ = a.set_nodelay(true);
+        Some(a)
+    } else {
+        None
+    };
     let control = TcpStream::connect(addr)
         .await
         .map_err(|e| failed(Stage::Handshaking, &format!("control socket: {e}"), &server))?;
@@ -217,7 +302,7 @@ async fn start(
     let device_name = String::from_utf8_lossy(&name[..end]).into_owned();
     let _ = video.set_nodelay(true);
     let _ = control.set_nodelay(true);
-    Ok((video, control, server, device_name))
+    Ok((video, audio, control, server, device_name))
 }
 
 /// Feeds server output to `on_text` until the stream ends.
@@ -239,5 +324,34 @@ async fn read_output<S: AsyncRead + Unpin>(shell: &mut S, shell_v2: bool, on_tex
                 Ok(n) => on_text(&String::from_utf8_lossy(&buf[..n])),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_encoder_lists() {
+        // Moto g play 2023 (Android 13), as scrcpy 4.1 prints it.
+        let moto = "[server] INFO: List of video encoders:
+    --video-codec=h264 --video-encoder=c2.mtk.avc.encoder             (hw) [vendor]
+    --video-codec=h264 --video-encoder=c2.android.avc.encoder         (sw)
+    --video-codec=h265 --video-encoder=c2.android.hevc.encoder        (sw)
+    --video-codec=vp8 --video-encoder=c2.android.vp8.encoder          (sw)
+[server] INFO: List of audio encoders:
+    --audio-codec=opus --audio-encoder=c2.android.opus.encoder        (sw)";
+        let e = parse_encoders(moto);
+        assert_eq!(e.len(), 3, "vp8 and audio are not listed: {e:?}");
+        assert_eq!(e[0], Encoder { codec: VideoCodec::H264, name: "c2.mtk.avc.encoder".into(), hw: true });
+        assert!(!e[2].hw && e[2].codec == VideoCodec::H265);
+
+        // Android 9 and older: no (hw)/(sw); quoted names.
+        let old = "    --video-codec=h265 --video-encoder='OMX.qcom.video.encoder.hevc'
+    --video-codec=h265 --video-encoder='OMX.google.hevc.encoder'";
+        let e = parse_encoders(old);
+        assert_eq!(e[0], Encoder { codec: VideoCodec::H265, name: "OMX.qcom.video.encoder.hevc".into(), hw: true });
+        assert!(!e[1].hw);
+        assert!(parse_encoders("ERROR: something").is_empty());
     }
 }

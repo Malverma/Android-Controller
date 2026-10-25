@@ -1,5 +1,5 @@
 //! Manual check against a phone: `probe <ip> pair <code>` then `probe <ip> link`
-//! / `probe <ip> stream`. Keys go to ./direct-keys-probe.toml.
+//! / `probe <ip> stream` / `probe <ip> awake <seconds>`. Keys go to ./direct-keys-probe.toml.
 use std::time::Duration;
 
 use ac_direct::*;
@@ -27,10 +27,22 @@ async fn main() {
             }
             println!("stay awake now {}", l.stay_awake(None, Duration::from_secs(3)).await.unwrap());
         }
+        "awake" => {
+            // `probe <ip> awake <seconds>`: keep the screen on while linked.
+            let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30);
+            let mut l = Link::connect(addr, &ks.credentials(), None).await.expect("link");
+            println!("keep screen on: {}", l.stay_awake(Some(true), Duration::from_secs(3)).await.unwrap());
+            for _ in 0..secs / 2 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                l.ping(Duration::from_secs(3)).await.expect("ping");
+            }
+            println!("releasing");
+            println!("keep screen on: {}", l.stay_awake(Some(false), Duration::from_secs(3)).await.unwrap());
+        }
         "stream" => {
             let creds = ks.credentials();
             let id = creds.keys.keys().next().unwrap().clone();
-            let p = StreamParams { max_size: 1024, bit_rate: 4_000_000, max_fps: 30, power_on: true };
+            let p = StreamParams { max_size: 1024, bit_rate: 4_000_000, max_fps: 30, power_on: true, codec: "h264" };
             let (mut s, input) = open_stream(addr, &creds, &id, p).await.expect("stream");
             println!("stream open, input {input}");
             let mut codec = [0u8; 4];

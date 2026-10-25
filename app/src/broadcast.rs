@@ -1,6 +1,10 @@
 //! Broadcast input (spec §4.10): input on a selected tile goes to every
 //! selected phone that is mirroring, with pointer positions mapped to each
 //! phone's own frame (spec §4.5 normalization).
+//!
+//! Mirror clicks is the same fan-out with no picking: input on any phone
+//! that is mirroring repeats on every other phone that is mirroring, e.g. to
+//! play the same game build on several phones at once.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -15,11 +19,13 @@ use ac_scrcpy::{ControlMsg, KeyAction, Position};
 
 pub struct Broadcast {
     enabled: Cell<bool>,
+    /// Mirror clicks: every streaming phone is a target.
+    mirror: Cell<bool>,
     /// Bit `slot - 1` set for each target.
     targets: Cell<u8>,
     ios: Vec<Arc<SlotIo>>,
-    include_power: bool,
-    skip_mismatched: bool,
+    include_power: Cell<bool>,
+    skip_mismatched: Cell<bool>,
     /// Called when a broadcast Power press is withheld.
     pub on_power_blocked: RefCell<Option<Box<dyn Fn()>>>,
 }
@@ -28,16 +34,23 @@ impl Broadcast {
     pub fn new(ios: Vec<Arc<SlotIo>>, cfg: &Input) -> Rc<Self> {
         Rc::new(Self {
             enabled: Cell::new(false),
+            mirror: Cell::new(false),
             targets: Cell::new(0),
             ios,
-            include_power: cfg.broadcast_includes_power,
-            skip_mismatched: cfg.broadcast_skip_mismatched_orientation,
+            include_power: Cell::new(cfg.broadcast_includes_power),
+            skip_mismatched: Cell::new(cfg.broadcast_skip_mismatched_orientation),
             on_power_blocked: RefCell::default(),
         })
     }
 
     pub fn skips_mismatched(&self) -> bool {
-        self.skip_mismatched
+        self.skip_mismatched.get()
+    }
+
+    /// Takes new `input.broadcast_*` settings from Preferences.
+    pub fn configure(&self, cfg: &Input) {
+        self.include_power.set(cfg.broadcast_includes_power);
+        self.skip_mismatched.set(cfg.broadcast_skip_mismatched_orientation);
     }
 
     pub fn enabled(&self) -> bool {
@@ -46,6 +59,32 @@ impl Broadcast {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.set(on);
+    }
+
+    pub fn mirror(&self) -> bool {
+        self.mirror.get()
+    }
+
+    pub fn set_mirror(&self, on: bool) {
+        self.mirror.set(on);
+    }
+
+    fn streaming(&self, slot: SlotId) -> bool {
+        self.io(slot).is_some_and(|io| io.is_streaming())
+    }
+
+    /// Phones input on a fanned-out tile goes to.
+    pub fn fan_out(&self) -> Vec<SlotId> {
+        if self.mirror.get() {
+            (1..=self.ios.len() as SlotId).filter(|&s| self.streaming(s)).collect()
+        } else {
+            self.targets()
+        }
+    }
+
+    /// Whether `slot` gets fanned-out input (a red border on its tile).
+    pub fn receives(&self, slot: SlotId) -> bool {
+        if self.mirror.get() { self.streaming(slot) } else { self.enabled.get() && self.is_target(slot) }
     }
 
     pub fn is_target(&self, slot: SlotId) -> bool {
@@ -74,7 +113,7 @@ impl Broadcast {
 
     /// Whether input on `slot` is fanned out.
     pub fn active_for(&self, slot: SlotId) -> bool {
-        self.enabled.get() && self.is_target(slot)
+        if self.mirror.get() { self.streaming(slot) } else { self.enabled.get() && self.is_target(slot) }
     }
 
     fn io(&self, slot: SlotId) -> Option<&Arc<SlotIo>> {
@@ -91,7 +130,7 @@ impl Broadcast {
         }
         if let ControlMsg::InjectKeycode { action, keycode, .. } = &msg
             && *keycode == android::POWER
-            && !self.include_power
+            && !self.include_power.get()
         {
             if *action == KeyAction::Down
                 && let Some(f) = self.on_power_blocked.borrow().as_ref()
@@ -103,14 +142,14 @@ impl Broadcast {
         let src = frame_of(&msg).or_else(|| self.io(source).and_then(|io| io.mailbox.size()));
         // Every target in the same loop iteration: host-side skew stays well
         // under a millisecond.
-        for t in self.targets() {
+        for t in self.fan_out() {
             let Some(io) = self.io(t) else { continue };
             if !io.is_streaming() {
                 continue;
             }
             let dst = io.mailbox.size();
             if t != source
-                && self.skip_mismatched
+                && self.skip_mismatched.get()
                 && let (Some(s), Some(d)) = (src, dst)
                 && orientation_differs(s, d)
             {
@@ -198,6 +237,26 @@ mod tests {
         b.set_target(3, false);
         b.set_target(2, true);
         assert_eq!(b.targets(), vec![1, 2]);
+    }
+
+    #[test]
+    fn mirror_targets_every_streaming_phone() {
+        let ios: Vec<_> = (0..3).map(|_| Arc::new(SlotIo::default())).collect();
+        let b = Broadcast::new(ios.clone(), &Input::default());
+        b.set_targets(&[1]);
+        b.set_mirror(true);
+        assert!(b.fan_out().is_empty() && !b.active_for(1), "nothing mirroring yet");
+        let mut one = ios[0].attach_control_for_test();
+        let mut three = ios[2].attach_control_for_test();
+        assert_eq!(b.fan_out(), vec![1, 3], "ticks do not matter");
+        assert!(b.active_for(3) && !b.active_for(2) && b.receives(1));
+        // A tap on phone 3's 1000×2000 frame lands at the same relative spot on phone 1.
+        ios[0].mailbox.set_size(500, 1000);
+        b.send(3, touch(250, 500, 1000, 2000));
+        assert_eq!(three.try_recv().unwrap(), touch(250, 500, 1000, 2000));
+        assert_eq!(one.try_recv().unwrap(), touch(125, 250, 500, 1000));
+        b.set_mirror(false);
+        assert!(!b.active_for(3), "broadcast is still off");
     }
 
     #[test]

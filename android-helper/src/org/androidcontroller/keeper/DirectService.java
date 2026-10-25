@@ -118,6 +118,7 @@ public final class DirectService extends Service {
             cpuLock.setReferenceCounted(false);
         }
         nsd = getSystemService(NsdManager.class);
+        Clip.listen(this);
         acceptor = new Thread(this::serve, "direct-accept");
         acceptor.start();
         main.post(tick);
@@ -136,6 +137,7 @@ public final class DirectService extends Service {
     public void onDestroy() {
         stopping = true;
         running = null;
+        Clip.stop(this);
         main.removeCallbacks(tick);
         unannounce();
         try {
@@ -306,7 +308,8 @@ public final class DirectService extends Service {
             s.setSoTimeout(LINK_TIMEOUT_MS);
             JSONObject hello = Proto.obj("ok", true, "id", Direct.deviceId(this), "model", Direct.model(),
                     "manufacturer", Build.MANUFACTURER, "sdk", Build.VERSION.SDK_INT, "release", Build.VERSION.RELEASE,
-                    "input", InputService.get() != null, "capture", Projection.get() != null);
+                    "input", InputService.get() != null, "capture", Projection.get() != null,
+                    "version", Apps.versionCode(this), "codecs", Apps.codecs());
             Proto.write(out, hello);
             setStatus("Connected to the PC");
             if (Direct.stayAwake(this)) Screen.keepOn(this, true);
@@ -327,6 +330,18 @@ public final class DirectService extends Service {
                         Screen.keepOn(this, on);
                     }
                     Proto.write(out, Proto.obj("op", "stay_awake", "on", Screen.keptOn()));
+                } else if (op.equals("app")) {
+                    JSONObject r;
+                    try {
+                        r = Apps.act(this, m.optString("action"), m.optString("package"));
+                    } catch (RuntimeException e) {
+                        r = Proto.obj("op", "app", "ok", false, "message", String.valueOf(e.getMessage()));
+                    }
+                    Proto.write(out, r);
+                } else if (op.equals("packages")) {
+                    Proto.write(out, Apps.packages(this));
+                } else {
+                    Proto.write(out, Proto.obj("op", op, "error", "unknown request"));
                 }
             }
         } finally {
@@ -349,6 +364,12 @@ public final class DirectService extends Service {
                 if (level >= 0 && scale > 0) o.put("battery", level * 100 / scale);
                 int st = bat.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
                 o.put("charging", st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL);
+            }
+            Apps.perf(this, o, bat);
+            String clip = Clip.text();
+            if (clip != null) {
+                o.put("clip", clip);
+                o.put("clip_seq", Clip.seq());
             }
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             WifiInfo wi = wm == null ? null : wm.getConnectionInfo();
@@ -388,7 +409,7 @@ public final class DirectService extends Service {
         Proto.write(out, Proto.obj("ok", true, "input", InputService.get() != null));
         s.setSoTimeout(0);
         Streamer st = new Streamer(this, s, in, req.optInt("max_size", 1280), req.optInt("bit_rate", 4_000_000),
-                req.optInt("max_fps", 30));
+                req.optInt("max_fps", 30), req.optString("codec", "h264"));
         streams.add(st);
         setStatus("Mirroring to the PC");
         try {
@@ -481,6 +502,12 @@ public final class DirectService extends Service {
         String text = code != null ? "Pairing code " + code + (ip == null ? "" : " · " + ip + ":" + Direct.PORT)
                 : status + (ip == null ? " · no Wi-Fi" : " · " + ip + ":" + Direct.PORT);
         Notification.Builder b = Keeper.isAtLeast(26) ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
+        if (Keeper.isAtLeast(29) && !links.isEmpty()) {
+            // Android 10+ hides the clipboard from apps in the background.
+            Intent clip = new Intent(this, ClipActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            PendingIntent cp = PendingIntent.getActivity(this, 2, clip, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            b.addAction(new Notification.Action.Builder(null, "Send clipboard to PC", cp).build());
+        }
         return b.setSmallIcon(android.R.drawable.presence_video_online)
                 .setContentTitle("PC connection without ADB")
                 .setContentText(text)

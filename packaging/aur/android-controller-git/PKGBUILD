@@ -1,0 +1,65 @@
+# Maintainer: Chase Cunningham <chasecunningham2004@gmail.com>
+# AUR package: builds the latest commit from GitHub.
+# Publish: copy this folder into the AUR git repo, run
+#   makepkg --printsrcinfo > .SRCINFO
+# and push.
+pkgname=android-controller-git
+_pkgname=android-controller
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Mirror, control and test apps on up to five Android phones over Wi-Fi (GTK4)"
+url='https://github.com/Malverma/Android-Controller'
+arch=('x86_64' 'aarch64')
+license=('Apache-2.0')
+depends=('gtk4' 'libadwaita' 'glib2' 'android-tools' 'scrcpy' 'avahi' 'dbus' 'ffmpeg' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git' 'clang')
+optdepends=('nss-mdns: resolve .local hostnames'
+            'pipewire-audio: play the focused phone'\''s audio (pw-cat)'
+            'libva-intel-driver: hardware decoding on older Intel GPUs'
+            'libva-mesa-driver: hardware decoding on AMD GPUs'
+            'libva-nvidia-driver: hardware decoding on NVIDIA GPUs')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+install=android-controller.install
+options=('!lto' '!debug')
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  # v1.0.0 → 1.0.0.r0.g1234567; commits after a tag bump the r count.
+  if git describe --long --tags --abbrev=7 >/dev/null 2>&1; then
+    git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  else
+    printf '1.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  fi
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release --package android-controller
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --frozen --release --workspace --exclude android-controller
+}
+
+package() {
+  cd "$_pkgname"
+  local appid=org.androidcontroller.AndroidController
+  install -Dm755 target/release/android-controller "$pkgdir/usr/bin/android-controller"
+  install -Dm644 "data/$appid.desktop" "$pkgdir/usr/share/applications/$appid.desktop"
+  # The phone helper, for installing by hand (the app also offers it).
+  install -Dm644 android-helper/dist/wireless-debugging-keeper.apk \
+    "$pkgdir/usr/share/$_pkgname/wireless-debugging-keeper.apk"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

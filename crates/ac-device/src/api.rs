@@ -6,7 +6,7 @@ use std::time::Duration;
 use ac_core::{DeviceStats, ErrorCode, SlotId, TransportKind};
 use ac_discovery::ServiceKind;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
     /// `addr` is `ip[:port]`; port 5555 (or none) means a legacy transport.
     Connect { slot: Option<SlotId>, addr: String },
@@ -44,6 +44,120 @@ pub enum UiCommand {
     CancelTransfers { slot: SlotId },
     /// Keep the phone's screen on (never time out) or restore its timeout.
     SetStayAwake { slot: SlotId, on: bool },
+    /// Settings changed in Preferences. Stream settings apply the next time
+    /// a phone starts mirroring; ADB paths and slot count after a restart.
+    UpdateConfig(Box<ac_config::Config>),
+    /// App testing (Milestone 5): run an action on each phone; each answers
+    /// with `UiEvent::AppResult`. Installing goes through `SendFiles`.
+    AppAction { slots: Vec<SlotId>, action: AppAction },
+    /// The phone's own (not system) apps; answered with `UiEvent::Packages`.
+    ListPackages { slot: SlotId },
+    /// The app being tested: its memory is sampled with the other stats.
+    SetTestApp { package: Option<String> },
+    /// Start a test run: each phone's log, crashes and stats are saved in
+    /// one folder until `StopRun`.
+    StartRun { name: String },
+    StopRun,
+    /// Save a screenshot of each phone (full resolution over ADB).
+    Screenshot { slots: Vec<SlotId> },
+    /// Start or stop recording each phone's mirror to an MP4 file.
+    Record { slots: Vec<SlotId>, on: bool },
+    /// Sample frame rate, CPU, memory and temperature (always on during a run).
+    SetPerf { on: bool },
+    /// Install the Wireless Debugging Keeper this app ships over an older one.
+    UpdateHelper { slot: SlotId },
+}
+
+/// Something to do with an installed app, by package name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppAction {
+    Launch(String),
+    Stop(String),
+    ClearData(String),
+    Uninstall(String),
+}
+
+impl AppAction {
+    pub fn package(&self) -> &str {
+        match self {
+            Self::Launch(p) | Self::Stop(p) | Self::ClearData(p) | Self::Uninstall(p) => p,
+        }
+    }
+
+    pub fn kind(&self) -> AppKind {
+        match self {
+            Self::Launch(_) => AppKind::Launch,
+            Self::Stop(_) => AppKind::Stop,
+            Self::ClearData(_) => AppKind::ClearData,
+            Self::Uninstall(_) => AppKind::Uninstall,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppKind {
+    Install,
+    Launch,
+    Stop,
+    ClearData,
+    Uninstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashKind {
+    /// An uncaught Java/Kotlin exception.
+    Crash,
+    /// Application Not Responding.
+    Anr,
+    /// A native (C/C++) crash, e.g. in a game engine.
+    Native,
+}
+
+impl CrashKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Crash => "Crash",
+            Self::Anr => "ANR",
+            Self::Native => "Native crash",
+        }
+    }
+}
+
+/// A crash or ANR seen in a phone's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashView {
+    pub kind: CrashKind,
+    pub package: String,
+    /// One line: the exception, the ANR reason or the signal.
+    pub summary: String,
+    /// The phone's log time, `MM-DD hh:mm:ss.mmm`.
+    pub time: String,
+    /// The stack trace (up to 40 lines).
+    pub detail: String,
+}
+
+/// One performance sample of a phone.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PerfSample {
+    /// Frames the app on screen drew in the last second (`None`: unknown).
+    pub fps: Option<f32>,
+    pub cpu_pct: Option<f32>,
+    pub mem_used_mb: Option<u32>,
+    pub mem_total_mb: Option<u32>,
+    /// The test app's memory (PSS), when one is set.
+    pub app_mem_mb: Option<u32>,
+    pub app: Option<String>,
+    pub cpu_temp_c: Option<f32>,
+    pub battery_temp_c: Option<f32>,
+}
+
+/// The test run, if one is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunView {
+    pub active: bool,
+    pub name: String,
+    pub dir: std::path::PathBuf,
+    pub crashes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +189,8 @@ pub struct SlotView {
     pub stay_awake: Option<bool>,
     /// Something the user should fix on the phone (e.g. touch control off).
     pub warning: Option<String>,
+    /// The phone's helper app is older than the one this app ships.
+    pub helper_update: Option<String>,
     pub stream: StreamView,
 }
 
@@ -127,6 +243,20 @@ pub enum UiEvent {
     DeviceClipboard { slot: SlotId, text: String },
     /// A slot's transfer progress, ~4 Hz while active and once when it ends.
     Transfer(TransferView),
+    /// How an app action (or an APK install) went on one phone.
+    AppResult { slot: SlotId, kind: AppKind, ok: bool, message: String },
+    Packages { slot: SlotId, packages: Vec<String> },
+    /// An app crashed or stopped responding on the phone.
+    Crash { slot: SlotId, crash: CrashView },
+    Run(RunView),
+    Perf { slot: SlotId, sample: PerfSample },
+    /// A phone without ADB has no screenshot command: save its mirror's
+    /// current frame to `path` instead.
+    SaveFrame { slot: SlotId, path: std::path::PathBuf },
+    /// Recording started (`Some(file)`) or stopped on a phone.
+    Recording { slot: SlotId, file: Option<std::path::PathBuf> },
+    /// Files were saved: a toast with an "Open folder" button.
+    Saved { message: String, folder: std::path::PathBuf },
 }
 
 /// Aggregate progress of one slot's queued transfers (spec §5.7).

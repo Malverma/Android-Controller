@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.androidcontroller.keeper"
-    android:versionCode="5"
-    android:versionName="0.5.0">
+    android:versionCode="6"
+    android:versionName="0.6.0">
 
     <!-- Target 28 on purpose: since Android 10, only apps targeting 28 or lower
          may switch Wi-Fi off and on (WifiManager.setWifiEnabled), which is how
@@ -27,6 +27,9 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- App testing from the PC without ADB (0.6). -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
 
     <application
         android:label="Wireless Debugging Keeper"
@@ -79,6 +82,15 @@
             android:name=".ProjectionActivity"
             android:exported="false"
             android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Reads the clipboard for the PC from the foreground (Android 10+). -->
+        <activity
+            android:name=".ClipActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <receiver

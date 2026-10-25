@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub use config::*;
 pub use devices::{DeviceRecord, Devices};
 pub use state::{AppState, BroadcastState, WindowState};
-pub use validate::{ValidationError, validate};
+pub use validate::{ValidationError, check_target_dir, validate};
 
 const APP_DIR: &str = "android-controller";
 
@@ -137,7 +137,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(io)?;
     }
-    let tmp = path.with_extension("toml.tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     let mut f = fs::File::create(&tmp).map_err(io)?;
     f.write_all(bytes).map_err(io)?;
     f.sync_all().map_err(io)?;

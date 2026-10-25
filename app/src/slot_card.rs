@@ -2,12 +2,19 @@
 //! while not streaming), telemetry and actions.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ac_core::{DeviceStats, SlotId, TransportKind};
 use ac_device::transfer::human_bytes;
-use ac_device::{PhaseView, SlotView, StreamView, TransferView};
+use ac_device::{AppKind, CrashView, PerfSample, PhaseView, SlotView, StreamView, TransferView};
 use adw::prelude::*;
+use gtk::glib;
+
+/// Samples kept for a tile's graph.
+const PERF_HISTORY: usize = 90;
+/// An app action's result stays on the tile this long.
+const RESULT_SHOWN_S: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardAction {
@@ -26,6 +33,7 @@ pub enum CardAction {
     SendFolder,
     CancelTransfers,
     Rename,
+    UpdateHelper,
 }
 
 pub struct SlotCard {
@@ -55,6 +63,8 @@ pub struct SlotCard {
     stay_awake: gtk::ToggleButton,
     rename: gtk::Button,
     warning: gtk::Label,
+    helper_row: gtk::Box,
+    helper_label: gtk::Label,
     /// Set while `update` moves the toggle, so it doesn't echo a command.
     syncing: Rc<Cell<bool>>,
     drop_hint: gtk::Label,
@@ -64,6 +74,17 @@ pub struct SlotCard {
     phase: Rc<Cell<PhaseView>>,
     /// "Pixel 8, streaming" for the accessible description.
     a11y: RefCell<String>,
+    // ---- app testing ----
+    rec: gtk::Label,
+    crash_button: gtk::MenuButton,
+    crash_list: gtk::Box,
+    crashes: RefCell<Vec<CrashView>>,
+    result: gtk::Label,
+    result_gen: Rc<Cell<u64>>,
+    perf_row: gtk::Box,
+    perf_label: gtk::Label,
+    perf_graph: gtk::DrawingArea,
+    perf: Rc<RefCell<VecDeque<PerfSample>>>,
 }
 
 fn dim_label(text: &str) -> gtk::Label {
@@ -103,6 +124,23 @@ impl SlotCard {
         header.append(&target);
         header.append(&target_warning);
         header.append(&title);
+        // Recording indicator and the crash/ANR badge (app testing).
+        let rec = gtk::Label::builder().label("● REC").tooltip_text("Recording this phone's screen").visible(false).build();
+        rec.add_css_class("rec-badge");
+        let crash_list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let crash_scroll = gtk::ScrolledWindow::builder()
+            .child(&crash_list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(420)
+            .min_content_width(420)
+            .build();
+        let crash_popover = gtk::Popover::builder().child(&crash_scroll).build();
+        let crash_button = gtk::MenuButton::builder().popover(&crash_popover).visible(false).build();
+        crash_button.add_css_class("crash-badge");
+        crash_button.add_css_class("flat");
+        header.append(&rec);
+        header.append(&crash_button);
         header.append(&badge);
         let focus = gtk::Button::from_icon_name("view-fullscreen-symbolic");
         focus.set_tooltip_text(Some("Focus this phone (Alt+F)"));
@@ -215,11 +253,45 @@ impl SlotCard {
         transfer_row.append(&transfer_cancel);
         transfer_row.set_visible(false);
 
+        // How the last app action went (Install, Launch, …).
+        let result = gtk::Label::builder().wrap(true).xalign(0.0).visible(false).build();
+        result.add_css_class("caption");
+        result.add_css_class("result-chip");
+
+        // Performance graph: frame rate (accent) and CPU (orange).
+        let perf: Rc<RefCell<VecDeque<PerfSample>>> = Rc::default();
+        let perf_graph = gtk::DrawingArea::builder().content_height(34).hexpand(true).build();
+        perf_graph.add_css_class("perf-graph");
+        {
+            let perf = perf.clone();
+            perf_graph.set_draw_func(move |area, cr, w, h| draw_perf(area, cr, w, h, &perf.borrow()));
+        }
+        let perf_label = dim_label("");
+        perf_label.add_css_class("caption");
+        perf_label.add_css_class("numeric");
+        let perf_row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        perf_row.append(&perf_graph);
+        perf_row.append(&perf_label);
+        perf_row.set_visible(false);
+
         let detail = dim_label("");
         detail.add_css_class("caption");
         let warning = gtk::Label::builder().wrap(true).xalign(0.0).visible(false).build();
         warning.add_css_class("caption");
         warning.add_css_class("warning");
+        // An older helper app on the phone: offer the shipped one.
+        let helper_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let helper_label = gtk::Label::builder().wrap(true).xalign(0.0).hexpand(true).build();
+        helper_label.add_css_class("caption");
+        let helper_button = gtk::Button::builder().label("Update").valign(gtk::Align::Center).build();
+        helper_button.add_css_class("pill");
+        {
+            let on_action = on_action.clone();
+            helper_button.connect_clicked(move |_| on_action(slot, CardAction::UpdateHelper));
+        }
+        helper_row.append(&helper_label);
+        helper_row.append(&helper_button);
+        helper_row.set_visible(false);
 
         // Telemetry.
         let stats_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -296,7 +368,10 @@ impl SlotCard {
         root.append(&header);
         root.append(&frame_overlay);
         root.append(&transfer_row);
+        root.append(&result);
+        root.append(&perf_row);
         root.append(&warning);
+        root.append(&helper_row);
         root.append(&detail);
         root.append(&video_info);
         root.append(&stats_row);
@@ -329,6 +404,8 @@ impl SlotCard {
             stay_awake,
             rename,
             warning,
+            helper_row,
+            helper_label,
             syncing,
             drop_hint,
             transfer_row,
@@ -336,6 +413,16 @@ impl SlotCard {
             transfer_bar,
             phase,
             a11y: RefCell::default(),
+            rec,
+            crash_button,
+            crash_list,
+            crashes: RefCell::default(),
+            result,
+            result_gen: Rc::default(),
+            perf_row,
+            perf_label,
+            perf_graph,
+            perf,
         };
         card.update(&SlotView {
             slot,
@@ -351,6 +438,7 @@ impl SlotCard {
             error: None,
             stay_awake: None,
             warning: None,
+            helper_update: None,
             stream: StreamView::Off,
         });
         card
@@ -395,6 +483,8 @@ impl SlotCard {
         self.rename.set_visible(v.device_id.is_some() && v.phase != PhaseView::Empty);
         self.warning.set_label(v.warning.as_deref().unwrap_or_default());
         self.warning.set_visible(v.warning.is_some());
+        self.helper_label.set_label(v.helper_update.as_deref().unwrap_or_default());
+        self.helper_row.set_visible(v.helper_update.is_some());
 
         let online = v.phase == PhaseView::Online;
         let starting = online && matches!(v.stream, StreamView::Off | StreamView::Starting);
@@ -444,6 +534,9 @@ impl SlotCard {
 
         if v.phase != PhaseView::Online {
             self.stats_row.set_visible(false);
+            self.perf_row.set_visible(false);
+            self.perf.borrow_mut().clear();
+            self.rec.set_visible(false);
         }
 
         let state = match (v.phase, &v.stream) {
@@ -509,8 +602,10 @@ impl SlotCard {
 
     /// Broadcast checkbox, its ⚠ (with the reason as tooltip), and the red
     /// border on targets (spec §4.10).
-    pub fn set_broadcast(&self, enabled: bool, target: bool, warning: Option<&str>) {
-        self.target.set_visible(enabled);
+    /// With Mirror clicks every mirroring phone is a target and there is
+    /// nothing to pick, so `pick` hides the checkbox.
+    pub fn set_broadcast(&self, enabled: bool, pick: bool, target: bool, warning: Option<&str>) {
+        self.target.set_visible(enabled && pick);
         self.target.set_active(target);
         self.target_warning.set_visible(enabled && target && warning.is_some());
         self.target_warning.set_tooltip_text(warning);
@@ -556,6 +651,167 @@ impl SlotCard {
         self.wifi.set_label(&s.wifi_rssi_dbm.map(|r| format!("{r} dBm")).unwrap_or_default());
         self.rtt.set_label(&s.rtt_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "—".into()));
     }
+}
+
+impl SlotCard {
+    // ---- app testing -----------------------------------------------------------------
+
+    pub fn set_recording(&self, on: bool) {
+        self.rec.set_visible(on);
+    }
+
+    /// A crash or ANR: the red badge counts them; its popover lists them.
+    pub fn add_crash(&self, c: &CrashView) {
+        self.crashes.borrow_mut().push(c.clone());
+        let n = self.crashes.borrow().len();
+        self.crash_button.set_label(&format!("⚠ {n}"));
+        self.crash_button.set_tooltip_text(Some(&format!("{} in {}: {}", c.kind.label(), c.package, c.summary)));
+        self.crash_button.set_visible(true);
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let head = gtk::Label::builder()
+            .label(format!("{}  {} in {}", c.time, c.kind.label(), c.package))
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .build();
+        head.add_css_class("heading");
+        let summary = gtk::Label::builder().label(&c.summary).xalign(0.0).wrap(true).selectable(true).build();
+        row.append(&head);
+        row.append(&summary);
+        if !c.detail.is_empty() {
+            let detail = gtk::Label::builder().label(&c.detail).xalign(0.0).wrap(true).selectable(true).build();
+            detail.add_css_class("monospace");
+            detail.add_css_class("caption");
+            let exp = gtk::Expander::builder().label("Details").child(&detail).build();
+            row.append(&exp);
+        }
+        let copy = gtk::Button::builder().label("Copy").halign(gtk::Align::Start).build();
+        copy.add_css_class("flat");
+        let text = format!("{} {} in {}\n{}\n{}", c.time, c.kind.label(), c.package, c.summary, c.detail);
+        copy.connect_clicked(move |b| b.clipboard().set_text(&text));
+        row.append(&copy);
+        // Newest first.
+        self.crash_list.prepend(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        self.crash_list.prepend(&row);
+    }
+
+    pub fn clear_crashes(&self) {
+        self.crashes.borrow_mut().clear();
+        while let Some(c) = self.crash_list.first_child() {
+            self.crash_list.remove(&c);
+        }
+        self.crash_button.set_visible(false);
+    }
+
+    /// How an app action went; fades after a few seconds unless it failed.
+    pub fn set_app_result(&self, kind: AppKind, ok: bool, message: &str) {
+        let what = match kind {
+            AppKind::Install => "Install",
+            AppKind::Launch => "Launch",
+            AppKind::Stop => "Stop",
+            AppKind::ClearData => "Clear data",
+            AppKind::Uninstall => "Uninstall",
+        };
+        let text = if message.is_empty() { format!("{what}: {}", if ok { "done" } else { "failed" }) } else { message.to_owned() };
+        self.result.set_label(&format!("{} {text}", if ok { "✓" } else { "✗" }));
+        self.result.remove_css_class(if ok { "error" } else { "success" });
+        self.result.add_css_class(if ok { "success" } else { "error" });
+        self.result.set_visible(true);
+        // A newer result keeps its own time on screen.
+        let generation = self.result_gen.get() + 1;
+        self.result_gen.set(generation);
+        if ok {
+            let (label, gen_now) = (self.result.clone(), self.result_gen.clone());
+            glib::timeout_add_seconds_local_once(RESULT_SHOWN_S, move || {
+                if gen_now.get() == generation {
+                    label.set_visible(false);
+                }
+            });
+        }
+    }
+
+    pub fn clear_app_result(&self) {
+        self.result_gen.set(self.result_gen.get() + 1);
+        self.result.set_visible(false);
+    }
+
+    pub fn set_perf(&self, p: &PerfSample) {
+        if self.phase.get() != PhaseView::Online {
+            return;
+        }
+        {
+            let mut h = self.perf.borrow_mut();
+            if h.len() == PERF_HISTORY {
+                h.pop_front();
+            }
+            h.push_back(p.clone());
+        }
+        self.perf_label.set_label(&perf_text(p));
+        self.perf_row.set_visible(true);
+        self.perf_graph.queue_draw();
+    }
+
+    pub fn hide_perf(&self) {
+        self.perf_row.set_visible(false);
+        self.perf.borrow_mut().clear();
+    }
+}
+
+/// `58 fps · CPU 34% · RAM 2.1/3.8 GB · app 412 MB · 41 °C`
+pub fn perf_text(p: &PerfSample) -> String {
+    let mut parts = Vec::new();
+    if let Some(f) = p.fps {
+        parts.push(format!("{f:.0} fps"));
+    }
+    if let Some(c) = p.cpu_pct {
+        parts.push(format!("CPU {c:.0}%"));
+    }
+    if let (Some(u), Some(t)) = (p.mem_used_mb, p.mem_total_mb) {
+        parts.push(format!("RAM {:.1}/{:.1} GB", u as f32 / 1024.0, t as f32 / 1024.0));
+    }
+    if let Some(a) = p.app_mem_mb {
+        parts.push(format!("app {a} MB"));
+    }
+    match (p.cpu_temp_c, p.battery_temp_c) {
+        (Some(c), _) => parts.push(format!("{c:.0} °C")),
+        (None, Some(b)) => parts.push(format!("battery {b:.0} °C")),
+        _ => {}
+    }
+    if parts.is_empty() { "Measuring…".into() } else { parts.join(" · ") }
+}
+
+fn draw_perf(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32, hist: &VecDeque<PerfSample>) {
+    let (w, h) = (w as f64, h as f64);
+    let fg = area.color();
+    cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.06);
+    cr.rectangle(0.0, 0.0, w, h);
+    let _ = cr.fill();
+    if hist.len() < 2 {
+        return;
+    }
+    let step = w / (PERF_HISTORY - 1) as f64;
+    let x0 = w - step * (hist.len() - 1) as f64;
+    // Frame rate scaled to 60 (or the highest seen, for 90/120 Hz phones).
+    let top = hist.iter().filter_map(|p| p.fps).fold(60.0f32, f32::max) as f64;
+    let line = |vals: Vec<Option<f64>>, (r, g, b): (f64, f64, f64)| {
+        cr.set_source_rgb(r, g, b);
+        cr.set_line_width(1.5);
+        let mut drawing = false;
+        for (i, v) in vals.iter().enumerate() {
+            let x = x0 + step * i as f64;
+            match v {
+                Some(v) => {
+                    let y = h - 1.0 - v.clamp(0.0, 1.0) * (h - 2.0);
+                    if drawing { cr.line_to(x, y) } else { cr.move_to(x, y) }
+                    drawing = true;
+                }
+                None => drawing = false,
+            }
+        }
+        let _ = cr.stroke();
+    };
+    line(hist.iter().map(|p| p.cpu_pct.map(|c| c as f64 / 100.0)).collect(), (0.90, 0.55, 0.10));
+    line(hist.iter().map(|p| p.fps.map(|f| f as f64 / top)).collect(), (0.21, 0.52, 0.89));
 }
 
 pub fn android_version(sdk: u32) -> String {

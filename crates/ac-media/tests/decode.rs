@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 
-use ac_media::decoder::{PROBE_H264, probe};
+use ac_media::decoder::{PROBE_AV1, PROBE_H264, PROBE_HEVC, probe};
 use ac_media::{Backend, Decoder, FrameData, HwOutput, Mailbox, MediaContext, PlaneLayout, StreamEvents};
 use ac_scrcpy::VideoCodec;
 
@@ -21,12 +21,21 @@ fn software_decodes_probe() {
 }
 
 #[test]
+fn software_decodes_hevc_and_av1_probes() {
+    for (codec, data) in [(VideoCodec::H265, PROBE_HEVC), (VideoCodec::Av1, PROBE_AV1)] {
+        let mut d = Decoder::new(codec, None).unwrap();
+        let f = d.decode(data, 0, true, HwOutput::Copy).unwrap().unwrap_or_else(|| panic!("{codec:?}: a frame"));
+        assert_eq!((f.width, f.height), (256, 256), "{codec:?}");
+    }
+}
+
+#[test]
 fn vaapi_probe() {
     let (hw, result) = probe(None);
     match result.vaapi {
         Ok(()) => {
             assert!(hw.is_some());
-            eprintln!("VA-API ok, dma-buf export: {}", result.dmabuf_export);
+            eprintln!("VA-API ok, dma-buf export: {}, HEVC: {}, AV1: {}", result.dmabuf_export, result.hevc, result.av1);
         }
         Err(e) => eprintln!("skipped: VA-API unavailable here ({e})"),
     }

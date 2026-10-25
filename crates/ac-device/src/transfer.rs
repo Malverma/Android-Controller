@@ -1,10 +1,12 @@
 //! File transfer jobs (spec §5.3–§5.9): segmented, resumable pushes over
 //! `sync:` and streamed APK installs, with per-slot progress for the UI.
 //!
-//! Jobs live in memory: they survive Wi-Fi drops and reconnects (resuming at
-//! the last committed segment) but not an app restart.
+//! Jobs survive Wi-Fi drops and reconnects (resuming at the last committed
+//! segment), and app restarts through the `transfers.json` journal (spec
+//! §7.5): a journaled job waits for its phone and resumes from the `.part`
+//! file already on it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,12 +18,13 @@ use ac_config::Transfer;
 use ac_core::SlotId;
 use ac_scrcpy::ControlMsg;
 use ac_transfer::{Item, TokenBucket, apk, free_name, is_media, join, part_size_resume, segments, url_encode_path};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::AbortHandle;
 
-use crate::api::{TransferView, UiEvent};
+use crate::api::{AppKind, TransferView, UiEvent};
 use crate::stream::SlotIo;
 
 /// Host reads (spec §5.4).
@@ -77,6 +80,99 @@ struct Job {
     committed: u64,
     /// SHA-256 state of bytes `[0, committed)`, when verifying.
     hash: Option<Sha256>,
+    /// Unix seconds when queued.
+    created: u64,
+}
+
+/// One unfinished job in `transfers.json` (spec §7.5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Entry {
+    /// The job id as 16 hex digits; it names the `.part` file on the phone.
+    id: String,
+    device_id: String,
+    slot: SlotId,
+    /// The phone's name when queued, for toasts.
+    title: String,
+    /// `"push"` or `"install_apk"`.
+    kind: String,
+    local: PathBuf,
+    name: String,
+    remote_dir: String,
+    size: u64,
+    mtime: u32,
+    final_path: Option<String>,
+    /// Bytes on the phone at the last journal write (informational: a resume
+    /// reads the `.part` size).
+    committed: u64,
+    verify: bool,
+    created: u64,
+}
+
+impl Entry {
+    fn of(slot: SlotId, title: &str, job: &Job) -> Self {
+        Self {
+            id: format!("{:016x}", job.id),
+            device_id: job.device_id.clone(),
+            slot,
+            title: title.to_owned(),
+            kind: if job.kind == Kind::Install { "install_apk" } else { "push" }.into(),
+            local: job.local.clone(),
+            name: job.name.clone(),
+            remote_dir: job.remote_dir.clone(),
+            size: job.size,
+            mtime: job.mtime,
+            final_path: job.final_path.clone(),
+            committed: job.committed,
+            verify: job.hash.is_some(),
+            created: job.created,
+        }
+    }
+}
+
+const JOURNAL_SCHEMA: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct JournalFile {
+    schema_version: u32,
+    jobs: Vec<Entry>,
+}
+
+struct Journal {
+    path: Option<PathBuf>,
+    jobs: BTreeMap<u64, Entry>,
+}
+
+impl Journal {
+    fn save(&self) {
+        let Some(path) = &self.path else { return };
+        let file = JournalFile { schema_version: JOURNAL_SCHEMA, jobs: self.jobs.values().cloned().collect() };
+        let bytes = serde_json::to_vec_pretty(&file).expect("journal serializes");
+        if let Err(e) = ac_config::write_atomic(path, &bytes) {
+            tracing::warn!("saving the transfer journal: {e}");
+        }
+    }
+}
+
+fn load_journal(path: &Path) -> Result<Vec<Entry>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let file: JournalFile = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    if file.schema_version > JOURNAL_SCHEMA {
+        return Err(format!("{} was written by a newer version", path.display()));
+    }
+    Ok(file.jobs)
+}
+
+fn mtime_of(m: &std::fs::Metadata) -> u32 {
+    m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as u32)
+}
+
+/// Size and mtime of a local file, to tell whether it changed.
+fn local_stamp(path: &Path) -> Option<(u64, u32)> {
+    std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| (m.len(), mtime_of(&m)))
 }
 
 #[derive(Debug)]
@@ -156,7 +252,8 @@ struct SlotShared {
 }
 
 struct Ctx {
-    cfg: Transfer,
+    /// Preferences may replace it; running jobs pick up the change.
+    cfg: std::sync::RwLock<Transfer>,
     adb: AdbClient,
     io: Vec<Arc<SlotIo>>,
     slots: Vec<SlotShared>,
@@ -165,6 +262,7 @@ struct Ctx {
     reserved: Mutex<HashSet<(String, String)>>,
     next_id: AtomicU64,
     ui: async_channel::Sender<UiEvent>,
+    journal: Mutex<Journal>,
 }
 
 pub struct Transfers {
@@ -173,7 +271,14 @@ pub struct Transfers {
 }
 
 impl Transfers {
-    pub fn new(cfg: Transfer, adb_server: std::net::SocketAddr, io: Vec<Arc<SlotIo>>, ui: async_channel::Sender<UiEvent>) -> Self {
+    /// `journal` is where unfinished jobs are kept (`None`: memory only).
+    pub fn new(
+        cfg: Transfer,
+        adb_server: std::net::SocketAddr,
+        io: Vec<Arc<SlotIo>>,
+        ui: async_channel::Sender<UiEvent>,
+        journal: Option<PathBuf>,
+    ) -> Self {
         let (links, rxs): (Vec<_>, Vec<_>) = io.iter().map(|_| watch::channel(None)).unzip();
         let per_device = cfg.max_concurrent_per_device.clamp(1, 8) as usize;
         let slots = rxs
@@ -188,7 +293,7 @@ impl Transfers {
             .collect();
         let ctx = Arc::new(Ctx {
             global: Semaphore::new(cfg.max_concurrent_global.clamp(1, 16) as usize),
-            cfg,
+            cfg: std::sync::RwLock::new(cfg),
             // Device-side checksums and appends of big segments take a while.
             adb: AdbClient::new(adb_server).with_timeout(Duration::from_secs(120)),
             io,
@@ -196,6 +301,7 @@ impl Transfers {
             reserved: Mutex::default(),
             next_id: AtomicU64::new(rand::random::<u32>() as u64),
             ui,
+            journal: Mutex::new(Journal { path: journal, jobs: BTreeMap::new() }),
         });
         tokio::spawn(report(Arc::downgrade(&ctx)));
         Self { ctx, links }
@@ -212,8 +318,78 @@ impl Transfers {
         }
     }
 
+    /// New `[transfer]` settings (concurrency limits apply after a restart).
+    pub fn configure(&self, cfg: Transfer) {
+        *self.ctx.cfg.write().unwrap() = cfg;
+    }
+
     pub fn is_active(&self, slot: SlotId) -> bool {
         self.ctx.slot(slot).is_some_and(|s| s.batch.lock().unwrap().count > 0)
+    }
+
+    /// Re-queues the journal's jobs after an app restart. `slot_of` names the
+    /// slot each phone is saved in; jobs for phones no longer saved, or whose
+    /// local file changed, are dropped.
+    pub fn restore(&self, slot_of: impl Fn(&str) -> Option<SlotId>) {
+        let entries = {
+            let j = self.ctx.journal.lock().unwrap();
+            match j.path.as_deref().map(load_journal) {
+                Some(Ok(e)) => e,
+                Some(Err(e)) => {
+                    tracing::warn!("{e}; not resuming transfers");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
+        };
+        let mut by_slot: BTreeMap<SlotId, (String, Vec<Job>)> = BTreeMap::new();
+        let mut dropped = false;
+        for e in entries {
+            let Some(id) = u64::from_str_radix(&e.id, 16).ok() else { continue };
+            let Some(slot) = slot_of(&e.device_id).filter(|&s| self.ctx.slot(s).is_some()) else {
+                dropped = true;
+                continue;
+            };
+            if local_stamp(&e.local) != Some((e.size, e.mtime)) {
+                self.ctx.toast(format!("Resume skipped: {} changed", e.name));
+                dropped = true;
+                continue;
+            }
+            self.ctx.next_id.fetch_max(id + 1, Ordering::Relaxed);
+            if let Some(f) = &e.final_path {
+                self.ctx.reserved.lock().unwrap().insert((e.device_id.clone(), f.clone()));
+            }
+            let kind = if e.kind == "install_apk" { Kind::Install } else { Kind::Push };
+            let job = Job {
+                id,
+                kind,
+                part: join(&e.remote_dir, &[&format!(".ac-{id:016x}.part")]),
+                seg: join(&e.remote_dir, &[&format!(".ac-{id:016x}.seg")]),
+                device_id: e.device_id,
+                local: e.local,
+                name: e.name,
+                remote_dir: e.remote_dir,
+                size: e.size,
+                mtime: e.mtime,
+                final_path: e.final_path,
+                // The `.part` on the phone says how far it got.
+                committed: 0,
+                hash: (e.verify && kind == Kind::Push).then(Sha256::new),
+                created: e.created,
+            };
+            let entry = by_slot.entry(slot).or_insert_with(|| (e.title.clone(), Vec::new()));
+            entry.1.push(job);
+        }
+        if dropped {
+            let mut j = self.ctx.journal.lock().unwrap();
+            j.jobs.clear();
+            j.save();
+        }
+        for (slot, (title, jobs)) in by_slot {
+            let n = jobs.len();
+            self.ctx.toast(format!("Resuming {n} transfer{} to {title}", if n == 1 { "" } else { "s" }));
+            self.ctx.start(slot, title, jobs);
+        }
     }
 
     /// Queues `paths` (files and folders) for the phone `device_id` in `slot`.
@@ -221,7 +397,7 @@ impl Transfers {
     pub fn submit(&self, slot: SlotId, device_id: String, title: String, paths: Vec<PathBuf>, install_apks: bool) {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
-            let cfg = ctx.cfg.clone();
+            let cfg = ctx.cfg();
             let expanded = tokio::task::spawn_blocking(move || {
                 let (items, errors) = ac_transfer::expand(&paths, cfg.recursive_directories);
                 let items: Vec<(Item, bool)> = items
@@ -253,6 +429,8 @@ impl Transfers {
             if b.count == 0 {
                 return;
             }
+            let ids: Vec<u64> = b.aborts.keys().copied().collect();
+            self.ctx.journal_remove(&ids);
             let aborts: Vec<_> = b.aborts.drain().map(|(_, h)| h).collect();
             let cleanup: Vec<_> = b.cleanup.drain().map(|(_, c)| c).collect();
             let mut reserved = self.ctx.reserved.lock().unwrap();
@@ -281,6 +459,11 @@ impl Transfers {
 }
 
 impl Ctx {
+    /// A copy, so no lock is held across an await.
+    fn cfg(&self) -> Transfer {
+        self.cfg.read().unwrap().clone()
+    }
+
     fn slot(&self, slot: SlotId) -> Option<&SlotShared> {
         self.slots.get((slot as usize).wrapping_sub(1))
     }
@@ -290,25 +473,17 @@ impl Ctx {
     }
 
     fn enqueue(self: &Arc<Self>, slot: SlotId, device_id: String, title: String, items: Vec<(Item, bool)>) {
-        let Some(s) = self.slot(slot) else { return };
-        let mut b = s.batch.lock().unwrap();
-        if b.count == 0 {
-            *b = Batch { started: Some(Instant::now()), ..Batch::default() };
-        }
-        b.title = title;
+        let created = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let mut jobs = Vec::new();
         for (it, install) in items {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let name = it.local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let remote_dir = join(&self.cfg.default_target_dir, &[&it.rel_dir]);
-            let mtime = std::fs::metadata(&it.local)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs() as u32);
-            let verify = match self.cfg.verify_checksum.as_str() {
+            let remote_dir = join(&self.cfg().default_target_dir, &[&it.rel_dir]);
+            let mtime = std::fs::metadata(&it.local).map_or(0, |m| mtime_of(&m));
+            let verify = match self.cfg().verify_checksum.as_str() {
                 "always" => true,
                 "never" => false,
-                _ => it.size >= self.cfg.verify_checksum_threshold_mib as u64 * (1 << 20),
+                _ => it.size >= self.cfg().verify_checksum_threshold_mib as u64 * (1 << 20),
             };
             let job = Job {
                 id,
@@ -324,22 +499,73 @@ impl Ctx {
                 final_path: None,
                 committed: 0,
                 hash: (verify && !install).then(Sha256::new),
+                created,
             };
+            jobs.push(job);
+        }
+        self.start(slot, title, jobs);
+    }
+
+    /// Journals `jobs` and starts them.
+    fn start(self: &Arc<Self>, slot: SlotId, title: String, jobs: Vec<Job>) {
+        let Some(s) = self.slot(slot) else { return };
+        let mut b = s.batch.lock().unwrap();
+        if b.count == 0 {
+            *b = Batch { started: Some(Instant::now()), ..Batch::default() };
+        }
+        {
+            let mut j = self.journal.lock().unwrap();
+            for job in &jobs {
+                j.jobs.insert(job.id, Entry::of(slot, &title, job));
+            }
+            j.save();
+        }
+        b.title = title;
+        for job in jobs {
+            let id = job.id;
             b.names.insert(id, job.name.clone());
             b.count += 1;
-            b.total += it.size;
+            b.total += job.size;
             let ctx = self.clone();
             let h = tokio::spawn(async move {
-                let size = job.size;
+                let (size, install, name) = (job.size, job.kind == Kind::Install, job.name.clone());
                 let outcome = ctx.run(slot, job, id).await;
+                if install {
+                    // Per-phone result for the test bar.
+                    let (ok, message) = match &outcome {
+                        Outcome::Installed => (true, format!("Installed {name}")),
+                        Outcome::Failed(why) => (false, why.clone()),
+                        _ => (true, format!("{name}: nothing to do")),
+                    };
+                    let _ = ctx.ui.try_send(UiEvent::AppResult { slot, kind: AppKind::Install, ok, message });
+                }
                 ctx.finish(slot, id, size, outcome);
             });
             b.aborts.insert(id, h.abort_handle());
         }
     }
 
+    fn journal_update(&self, id: u64, f: impl FnOnce(&mut Entry)) {
+        let mut j = self.journal.lock().unwrap();
+        if let Some(e) = j.jobs.get_mut(&id) {
+            f(e);
+            j.save();
+        }
+    }
+
+    fn journal_remove(&self, ids: &[u64]) {
+        let mut j = self.journal.lock().unwrap();
+        let before = j.jobs.len();
+        for id in ids {
+            j.jobs.remove(id);
+        }
+        if j.jobs.len() != before {
+            j.save();
+        }
+    }
+
     fn segment_size(&self) -> u64 {
-        self.cfg.segment_size_mib.clamp(4, 256) as u64 * (1 << 20)
+        self.cfg().segment_size_mib.clamp(4, 256) as u64 * (1 << 20)
     }
 
     fn finish(&self, slot: SlotId, id: u64, size: u64, outcome: Outcome) {
@@ -348,6 +574,7 @@ impl Ctx {
         if b.aborts.remove(&id).is_none() {
             return; // cancelled meanwhile
         }
+        self.journal_remove(&[id]);
         b.cleanup.remove(&id);
         b.finals.remove(&id);
         b.progress.remove(&id);
@@ -510,7 +737,10 @@ impl Ctx {
         let part_size = out.lines().find_map(|l| l.trim().strip_prefix("@P ")?.trim().parse::<u64>().ok());
         if job.final_path.is_none() {
             match self.resolve_final(link, job, exists).await? {
-                Some(f) => job.final_path = Some(f),
+                Some(f) => {
+                    self.journal_update(job.id, |e| e.final_path = Some(f.clone()));
+                    job.final_path = Some(f);
+                }
                 None => return Ok(Outcome::Skipped),
             }
         }
@@ -583,6 +813,7 @@ impl Ctx {
             }
             job.committed = start + len;
             job.hash = hasher;
+            self.journal_update(job.id, |e| e.committed = start + len);
         }
 
         // Finalizing and verifying (steps 3–4).
@@ -604,7 +835,7 @@ impl Ctx {
             }
         }
         // Scanning (step 5).
-        if self.cfg.trigger_media_scan && is_media(&job.name) {
+        if self.cfg().trigger_media_scan && is_media(&job.name) {
             self.scan(slot, link, &final_path).await;
         }
         Ok(Outcome::Sent)
@@ -615,7 +846,7 @@ impl Ctx {
         let want = join(&job.remote_dir, &[&job.name]);
         let key = |p: &str| (job.device_id.clone(), p.to_owned());
         let in_flight = self.reserved.lock().unwrap().contains(&key(&want));
-        let chosen = match self.cfg.on_conflict.as_str() {
+        let chosen = match self.cfg().on_conflict.as_str() {
             "overwrite" => want,
             "skip" if exists || in_flight => return Ok(None),
             _ if !exists && !in_flight => want,
@@ -645,8 +876,7 @@ impl Ctx {
     /// The local file must not change under us (spec §5.6).
     async fn check_local(&self, job: &Job) -> Result<(), JobError> {
         let m = tokio::fs::metadata(&job.local).await.map_err(|e| JobError::Fatal(format!("{}: {e}", job.local.display())))?;
-        let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as u32);
-        if m.len() != job.size || mtime != job.mtime {
+        if (m.len(), mtime_of(&m)) != (job.size, job.mtime) {
             return Err(JobError::Fatal(format!("{} changed while it was being sent", job.name)));
         }
         Ok(())
@@ -654,7 +884,7 @@ impl Ctx {
 
     fn rate(&self, slot: SlotId) -> u64 {
         let streaming = self.io.get(slot as usize - 1).is_some_and(|io| io.is_streaming());
-        let mbps = if streaming { self.cfg.rate_limit_while_streaming_mbps } else { self.cfg.rate_limit_idle_mbps };
+        let mbps = if streaming { self.cfg().rate_limit_while_streaming_mbps } else { self.cfg().rate_limit_idle_mbps };
         mbps as u64 * 1_000_000 / 8
     }
 
@@ -711,7 +941,8 @@ impl Ctx {
     /// upload; the phone picks the final name and reports its checksum.
     async fn send_direct(&self, slot: SlotId, link: &Link, d: &DirectTarget, job: &Job, install: bool) -> Result<Outcome, JobError> {
         self.check_local(job).await?;
-        let base = self.cfg.default_target_dir.trim_end_matches('/');
+        let cfg = self.cfg();
+        let base = cfg.default_target_dir.trim_end_matches('/');
         let dir = job.remote_dir.strip_prefix(base).unwrap_or("").trim_matches('/').to_owned();
         let req = ac_direct::PushRequest {
             name: job.name.clone(),
@@ -719,7 +950,7 @@ impl Ctx {
             size: job.size,
             job: job.id,
             install,
-            conflict: self.cfg.on_conflict.clone(),
+            conflict: cfg.on_conflict.clone(),
         };
         let (mut s, start) = ac_direct::open_push(d.addr, &d.creds, &link.device_id, &req).await.map_err(direct_err)?;
         let offset = match start {
@@ -908,6 +1139,61 @@ async fn report(ctx: std::sync::Weak<Ctx>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(id: u64, local: &Path, size: u64, mtime: u32) -> Entry {
+        Entry {
+            id: format!("{id:016x}"),
+            device_id: "phone-a".into(),
+            slot: 2,
+            title: "Moto".into(),
+            kind: "push".into(),
+            local: local.to_owned(),
+            name: local.file_name().unwrap().to_string_lossy().into_owned(),
+            remote_dir: "/sdcard/Download".into(),
+            size,
+            mtime,
+            final_path: Some("/sdcard/Download/a.bin".into()),
+            committed: 32 << 20,
+            verify: true,
+            created: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_resumes_unchanged_files_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("ac-journal-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"world").unwrap();
+        let (size, mtime) = local_stamp(&a).unwrap();
+        let path = dir.join("transfers.json");
+        let file = JournalFile {
+            schema_version: 1,
+            // b.bin's size differs from the journal: it changed while the app was closed.
+            jobs: vec![entry(0x10, &a, size, mtime), entry(0x11, &b, 99, mtime), Entry { device_id: "gone".into(), ..entry(0x12, &a, size, mtime) }],
+        };
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let (ui, events) = async_channel::unbounded();
+        let io: Vec<_> = (0..4).map(|_| Arc::new(SlotIo::default())).collect();
+        let t = Transfers::new(Transfer::default(), "127.0.0.1:9".parse().unwrap(), io, ui, Some(path.clone()));
+        t.restore(|id| (id == "phone-a").then_some(3));
+        assert!(t.is_active(3) && !t.is_active(2), "jobs follow the phone to its saved slot");
+        let toasts: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| if let UiEvent::Toast { message, .. } = e { Some(message) } else { None })
+            .collect();
+        assert!(toasts.contains(&"Resume skipped: b.bin changed".to_owned()), "{toasts:?}");
+        assert!(toasts.contains(&"Resuming 1 transfer to Moto".to_owned()), "{toasts:?}");
+        let kept = load_journal(&path).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].id.as_str(), kept[0].slot, kept[0].final_path.as_deref()), ("0000000000000010", 3, Some("/sdcard/Download/a.bin")));
+        assert!(t.ctx.next_id.load(Ordering::Relaxed) > 0x10);
+
+        t.cancel(3);
+        assert!(load_journal(&path).unwrap().is_empty(), "cancelled jobs leave the journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_df() {

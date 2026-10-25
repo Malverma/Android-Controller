@@ -14,7 +14,7 @@ fn real_capture_demuxes() {
     assert_eq!(d.next_item().unwrap(), DemuxItem::Session { width: 360, height: 720, client_resized: false });
 
     // First packet: SPS/PPS config (32 bytes) prepended to the IDR frame.
-    let DemuxItem::Packet { data, pts_us, key_frame } = d.next_item().unwrap() else { panic!("expected a packet") };
+    let DemuxItem::Packet { data, pts_us, key_frame, .. } = d.next_item().unwrap() else { panic!("expected a packet") };
     assert!(key_frame);
     assert_eq!(data.len(), 32 + 22240);
     assert_eq!(&data[..5], &[0, 0, 0, 1, 0x67], "Annex B SPS first");
@@ -24,7 +24,7 @@ fn real_capture_demuxes() {
     let mut frames = 1;
     loop {
         match d.next_item() {
-            Ok(DemuxItem::Packet { data, pts_us, key_frame }) => {
+            Ok(DemuxItem::Packet { data, pts_us, key_frame, .. }) => {
                 assert!(!key_frame);
                 assert_eq!(data[4] & 0x1f, 1, "non-IDR slice");
                 assert!(pts_us > last, "presentation timestamps increase");

@@ -3,7 +3,7 @@
 Native Arch Linux (GTK4 + libadwaita) app for viewing and controlling up to
 four Android phones over Wi-Fi (five with `max_slots = 5`). The full design is in [`spec.md`](spec.md).
 
-## Status: Milestones 3–4 in progress (needs real-phone testing)
+## Status: v1.0 — Milestones 1–6 built (awaiting feedback before release)
 
 Working (Milestones 1–2):
 
@@ -19,8 +19,7 @@ Working (Milestones 1–2):
 New in Milestone 3:
 
 - **Grid layout** (spec §6.1): every rows × columns shape is scored by visible
-  phone area and the best one wins (relayout animates over 200 ms). Empty slots
-  collapse into a narrow column, or are hidden with `ui.hide_empty_slots`.
+  phone area and the best one wins (relayout animates over 200 ms).
 - **Focus view thumbnails** (§6.2): the other phones stay live in a rail on the
   left; click one or press Alt+1…5 to switch. Escape (pointer off the phone)
   or Alt+G returns to the grid. Only the switched phone's stream restarts.
@@ -59,29 +58,91 @@ Started in Milestone 4:
   H.264 in scrcpy's stream format), takes taps, swipes and typing through an
   accessibility service, and receives files and APKs. Pair it under
   **Add Device › No ADB** with the code the phone shows (`crates/ac-direct`).
+- **Transfers survive an app restart**: unfinished jobs are kept in
+  `~/.local/state/android-controller/transfers.json` (spec §7.5). On the next
+  launch they wait for their phone and continue from the part already on
+  it. A file that changed while the app was closed is skipped with a notice.
+- **Audio in focus view**: the focused phone's sound plays on the PC through
+  PipeWire (`pw-cat`, from `pipewire-audio`). Needs Android 11+ and an ADB
+  connection; while it plays, the phone's own speaker is quiet. Turn it off
+  or set the volume in Preferences.
+- **Preferences** (menu › Preferences, or Ctrl+,): video quality, audio,
+  keyboard and mouse, file transfer folder/conflicts/speed limits, look.
+  Changes are saved to `config.toml` at once.
+- **Mirror clicks** (header button, or Alt+Shift+M): taps, swipes, keys and
+  typing on any phone repeat on every phone that is mirroring, at the same
+  relative spot on each screen. Useful for testing an app or game on several
+  phones at once; an APK dropped on one phone while it is on installs on all
+  of them. Unlike Broadcast, there are no phones to tick: it follows
+  whichever phones are connected.
 
-Not yet: transfers resuming after an app restart (the journal), adaptive
-bitrate (§3.6), audio, preferences UI. The 2-hour, 5-phone soak test from
-spec §9 has not been run.
+New in Milestone 5 — app testing on every phone (spec §9, M5), from the
+toolbar under the header. The toolbar also holds **Add Device** and
+**Nearby** (phones on the network or USB that can be added); empty slots get
+no tile, and a welcome page shows while no phone is added.
+
+- **Test runs**: *Start run* saves, per phone, the full system log
+  (`logcat.txt`), every crash and ANR with its stack trace (`crashes.txt`) and
+  the graphs (`stats.csv`) into one folder under `~/Documents/Android
+  Controller/Runs/`. *Stop run* adds a `summary.txt`. Change the folder in
+  Preferences › Testing.
+- **Crash watch**: when an app crashes, freezes (ANR) or dies natively on a
+  phone, its tile gets a red ⚠ count. Click it for the stack traces. On by
+  default, also outside runs. Needs ADB.
+- **Install, launch, stop, clear data, uninstall** on all connected phones
+  at once. Choose an APK (its package fills in) or pick an installed app.
+  Each tile shows ✓ or ✗ with the phone's reason.
+- **Screenshot** at full resolution, and **Record**
+  every phone into MP4 files. Recordings are made on the
+  PC from the mirror stream, so there is no time limit and phones without
+  ADB record too.
+- **Graphs** (monitor button): frame rate of the app on screen, CPU, memory
+  (and the test app's), and temperature, on every tile.
+
+New in Milestone 6:
+
+- **Adaptive bitrate** (§3.6): when a phone's video falls behind on a busy
+  Wi-Fi, its quality steps down, and back up once the network keeps up. The
+  tile says “reduced for Wi-Fi” meanwhile. Preferences › Video › *Adapt to
+  the Wi-Fi*.
+- **H.265**: each phone's hardware encoders and the PC's VA-API decoder are
+  checked once. Focus view uses H.265 when both ends have it, and falls back
+  to H.264 by itself if it fails.
+- **Helper 0.6** for phones without ADB:
+  - multi-touch (pinch, two-finger swipe);
+  - the phone's clipboard reaches the PC (Android 10+: tap *Send clipboard to
+    PC* in its notification);
+  - memory, temperature and CPU graphs;
+  - app launch, stop and uninstall, and the app list;
+  - H.265 encoding.
+- **Helper updates**: the app carries the latest helper. A phone with an older
+  one gets an *Update* button on its tile.
+- **AUR package**: [`packaging/aur/android-controller-git`](packaging/aur/android-controller-git/PKGBUILD).
+
+Not run yet: the 2-hour, 5-phone soak test from spec §9.
 
 ## Run
 
 ```sh
-sudo pacman -S --needed rust gtk4 libadwaita android-tools scrcpy avahi
+sudo pacman -S --needed rust gtk4 libadwaita android-tools scrcpy avahi pipewire-audio
 sudo systemctl enable --now avahi-daemon.service
 cargo run --release -p android-controller
 ```
 
 On the phone: **Settings › Developer options › Wireless debugging**, then
-**Add Device** (Ctrl+N) in the app.
+**Add Device** (toolbar, or Ctrl+N) in the app.
 
 ## Test
 
 ```sh
-cargo test --workspace     # 172 tests, no phone needed (uses an in-process mock ADB server)
+cargo test --workspace     # no phone needed (uses an in-process mock ADB server)
 cargo clippy --workspace --all-targets
 cargo run -p ac-adb --example probe            # talk to your real adb server
 cargo run -p ac-discovery --example browse     # list ADB mDNS services for 10 s
+cargo run -p ac-device --example audio_probe -- <serial>   # check a phone's audio capture
+cargo run -p ac-scrcpy --example encoders -- <serial>      # a phone's video encoders
+cargo run -p ac-device --example testing_probe -- <serial> [pkg]  # perf, screenshot, crash parser
+cargo run -p ac-device --example testing_e2e -- <out-dir>  # a test run on every phone, headless
 ```
 
 ## Layout
@@ -94,6 +155,8 @@ cargo run -p ac-discovery --example browse     # list ADB mDNS services for 10 s
 | `crates/ac-discovery` | Avahi browser, LAN filter, mDNS serial parsing, ARP lookup        |
 | `crates/ac-device` | Device manager actor, the pure slot state machine, transfer jobs     |
 | `crates/ac-transfer` | Transfer planning: segments, conflict names, APK check, rate limit |
+| `crates/ac-direct` | PC side of the helper's no-ADB connection (pairing, stream, files)  |
+| `crates/ac-audio`  | Focus-view audio: raw PCM from scrcpy-server played via PipeWire    |
 | `crates/adb-mock`  | Fake ADB server for integration tests                                |
 | `app`              | GTK4/libadwaita UI                                                   |
 
@@ -102,3 +165,12 @@ cargo run -p ac-discovery --example browse     # list ADB mDNS services for 10 s
 ```sh
 cd packaging/arch && makepkg -si   # builds the last committed revision
 ```
+
+From the AUR (builds the latest commit on GitHub):
+
+```sh
+cd packaging/aur/android-controller-git && makepkg -si   # or: yay -S android-controller-git
+```
+
+Both install the phone helper to
+`/usr/share/android-controller/wireless-debugging-keeper.apk` as well.

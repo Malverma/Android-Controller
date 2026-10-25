@@ -1,0 +1,13 @@
+[package]
+name = "ac-audio"
+description = "Focus-view audio: scrcpy's raw PCM stream played through PipeWire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2"
+thiserror.workspace = true
+tracing.workspace = true

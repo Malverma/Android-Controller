@@ -44,8 +44,9 @@ impl VideoCodec {
 pub enum DemuxItem {
     /// Capture (re)started: new frame size, the input coordinate space.
     Session { width: u32, height: u32, client_resized: bool },
-    /// One access unit, with any preceding config (SPS/PPS) prepended.
-    Packet { data: Vec<u8>, pts_us: u64, key_frame: bool },
+    /// One access unit, with any preceding config (SPS/PPS) prepended:
+    /// the first `config_len` bytes of `data` (a recorder's extradata).
+    Packet { data: Vec<u8>, pts_us: u64, key_frame: bool, config_len: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,11 +133,13 @@ impl<R: Read> Demuxer<R> {
                 }
                 continue;
             }
+            let mut config_len = 0;
             if let Some(mut config) = self.pending_config.take() {
+                config_len = config.len();
                 config.extend_from_slice(&data);
                 data = config;
             }
-            return Ok(DemuxItem::Packet { data, pts_us: flags & PTS_MASK, key_frame: flags & FLAG_KEY_FRAME != 0 });
+            return Ok(DemuxItem::Packet { data, pts_us: flags & PTS_MASK, key_frame: flags & FLAG_KEY_FRAME != 0, config_len });
         }
     }
 
@@ -174,8 +177,8 @@ mod tests {
         let mut d = Demuxer::new(&s[..]);
         assert_eq!(d.read_codec().unwrap(), VideoCodec::H264);
         assert_eq!(d.next_item().unwrap(), DemuxItem::Session { width: 1080, height: 2400, client_resized: false });
-        assert_eq!(d.next_item().unwrap(), DemuxItem::Packet { data: b"SPSIDR".to_vec(), pts_us: 1000, key_frame: true });
-        assert_eq!(d.next_item().unwrap(), DemuxItem::Packet { data: b"P".to_vec(), pts_us: 2000, key_frame: false });
+        assert_eq!(d.next_item().unwrap(), DemuxItem::Packet { data: b"SPSIDR".to_vec(), pts_us: 1000, key_frame: true, config_len: 3 });
+        assert_eq!(d.next_item().unwrap(), DemuxItem::Packet { data: b"P".to_vec(), pts_us: 2000, key_frame: false, config_len: 0 });
         assert_eq!(d.next_item().unwrap(), DemuxItem::Session { width: 2400, height: 1080, client_resized: true });
         assert!(matches!(d.next_item(), Err(DemuxError::Io(_))), "EOF");
     }

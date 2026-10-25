@@ -3,8 +3,10 @@ mod dnd;
 mod grid_layout;
 mod mirror;
 mod pairing;
+mod preferences;
 mod qr;
 mod slot_card;
+mod testbar;
 mod texture;
 mod window;
 
@@ -41,6 +43,7 @@ fn main() -> glib::ExitCode {
         .expect("failed to start the tokio runtime");
     let slots = config.general.max_slots.clamp(1, ac_core::MAX_SLOTS as u8);
     let state_path = paths.as_ref().map(|p| p.state.clone());
+    let config_path = paths.as_ref().map(|p| p.config.clone());
     let mut state = match state_path.as_deref().map(ac_config::load_state) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
@@ -63,7 +66,7 @@ fn main() -> glib::ExitCode {
             return;
         }
         if let Some(m) = manager.borrow_mut().take() {
-            let restore = window::Restore { state: state.clone(), path: state_path.clone() };
+            let restore = window::Restore { state: state.clone(), path: state_path.clone(), config_path: config_path.clone() };
             window::build(app, m, &config, slots, config_error.clone(), restore);
         }
     });

@@ -305,6 +305,9 @@ unsafe fn export_dmabuf(f: *const ff::AVFrame) -> Result<DmabufFrame, DecodeErro
 
 /// The embedded 64×64 H.264 IDR frame used by [`probe`].
 pub const PROBE_H264: &[u8] = include_bytes!("../assets/probe.h264");
+/// 256×256 HEVC Main and AV1 key frames (some drivers refuse HEVC below 144 px).
+pub const PROBE_HEVC: &[u8] = include_bytes!("../assets/probe.hevc");
+pub const PROBE_AV1: &[u8] = include_bytes!("../assets/probe.av1");
 
 /// Which decode paths work on this host, without involving the display.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,26 +315,40 @@ pub struct ProbeResult {
     pub vaapi: Result<(), String>,
     /// The VA-API surface could be exported as a dma-buf.
     pub dmabuf_export: bool,
+    /// VA-API decodes HEVC Main / AV1 (spec §4.3: H.265 only when it does).
+    pub hevc: bool,
+    pub av1: bool,
+}
+
+impl ProbeResult {
+    fn none(why: String) -> Self {
+        Self { vaapi: Err(why), dmabuf_export: false, hevc: false, av1: false }
+    }
 }
 
 /// Decodes the probe frame with VA-API (copy and export) on `device`.
 pub fn probe(device: Option<&str>) -> (Option<HwDevice>, ProbeResult) {
     let hw = match HwDevice::open_vaapi(device) {
         Ok(hw) => hw,
-        Err(e) => return (None, ProbeResult { vaapi: Err(e.to_string()), dmabuf_export: false }),
+        Err(e) => return (None, ProbeResult::none(e.to_string())),
     };
-    let run = |out| -> Result<Frame, String> {
-        let mut d = Decoder::new(VideoCodec::H264, Some(&hw)).map_err(|e| e.to_string())?;
-        d.decode(PROBE_H264, 0, true, out).map_err(|e| e.to_string())?.ok_or_else(|| "no frame".to_owned())
+    let run = |codec, data, out| -> Result<Frame, String> {
+        let mut d = Decoder::new(codec, Some(&hw)).map_err(|e| e.to_string())?;
+        d.decode(data, 0, true, out).map_err(|e| e.to_string())?.ok_or_else(|| "no frame".to_owned())
     };
     // VA-API downloads come back as NV12; a software fallback (VA-API
     // refused the stream) comes back as I420.
-    match run(HwOutput::Copy) {
-        Ok(Frame { data: FrameData::Memory(MemoryFrame { layout: PlaneLayout::Nv12, .. }), .. }) => {
-            let dmabuf_export = run(HwOutput::Dmabuf).is_ok_and(|f| f.is_dmabuf());
-            (Some(hw), ProbeResult { vaapi: Ok(()), dmabuf_export })
+    let in_hw = |r: &Result<Frame, String>| {
+        matches!(r, Ok(Frame { data: FrameData::Memory(MemoryFrame { layout: PlaneLayout::Nv12, .. }), .. }))
+    };
+    match run(VideoCodec::H264, PROBE_H264, HwOutput::Copy) {
+        r if in_hw(&r) => {
+            let dmabuf_export = run(VideoCodec::H264, PROBE_H264, HwOutput::Dmabuf).is_ok_and(|f| f.is_dmabuf());
+            let hevc = in_hw(&run(VideoCodec::H265, PROBE_HEVC, HwOutput::Copy));
+            let av1 = in_hw(&run(VideoCodec::Av1, PROBE_AV1, HwOutput::Copy));
+            (Some(hw), ProbeResult { vaapi: Ok(()), dmabuf_export, hevc, av1 })
         }
-        Ok(_) => (None, ProbeResult { vaapi: Err("VA-API did not decode the probe frame".into()), dmabuf_export: false }),
-        Err(e) => (None, ProbeResult { vaapi: Err(e), dmabuf_export: false }),
+        Ok(_) => (None, ProbeResult::none("VA-API did not decode the probe frame".into())),
+        Err(e) => (None, ProbeResult::none(e)),
     }
 }

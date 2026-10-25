@@ -16,12 +16,16 @@ ac-scrcpy.workspace = true
 ac-media.workspace = true
 ac-transfer.workspace = true
 ac-direct.workspace = true
+ac-audio.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["process"] }
 async-channel.workspace = true
 tracing.workspace = true
 rand.workspace = true
 chrono.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json = "1"
 
 [dev-dependencies]
 adb-mock.workspace = true

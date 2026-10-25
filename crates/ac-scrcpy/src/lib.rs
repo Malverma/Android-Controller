@@ -10,7 +10,7 @@ pub mod server;
 pub use control::{ControlMsg, KeyAction, MotionAction, Position};
 pub use demux::{DemuxError, DemuxItem, Demuxer, VideoCodec};
 pub use device_msg::DeviceMsg;
-pub use launch::{LaunchError, Launched, ServerProcess, Stage, launch};
+pub use launch::{Encoder, LaunchError, Launched, ServerProcess, Stage, launch, list_encoders, parse_encoders};
 pub use server::{DEVICE_JAR, ServerParams, detect_version, is_compatible, parse_version};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

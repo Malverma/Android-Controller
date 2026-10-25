@@ -81,6 +81,17 @@ pub fn validate(cfg: &Config) -> Vec<ValidationError> {
         err("transfer.segment_size_mib".into(), "must be 4..=256".into());
     }
 
+    if !(0.0..=1.0).contains(&cfg.audio.volume) {
+        err("audio.volume".into(), "must be 0.0..=1.0".into());
+    }
+    if !(64..=16384).contains(&cfg.audio.pipewire_latency_frames) {
+        err("audio.pipewire_latency_frames".into(), "must be 64..=16384".into());
+    }
+
+    if !(500..=60_000).contains(&cfg.testing.perf_interval_ms) {
+        err("testing.perf_interval_ms".into(), "must be 500..=60000".into());
+    }
+
     let mut seen: HashMap<&str, &str> = HashMap::new();
     for (action, accel) in &cfg.keybindings {
         if accel.is_empty() {

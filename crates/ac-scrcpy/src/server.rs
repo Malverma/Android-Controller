@@ -44,6 +44,8 @@ pub struct ServerParams {
     pub stay_awake: bool,
     pub show_touches: bool,
     pub power_on: bool,
+    /// Also capture the phone's audio (Android 11+), as raw 48 kHz s16 PCM.
+    pub audio: bool,
 }
 
 impl Default for ServerParams {
@@ -60,6 +62,7 @@ impl Default for ServerParams {
             stay_awake: false,
             show_touches: false,
             power_on: true,
+            audio: false,
         }
     }
 }
@@ -76,7 +79,7 @@ impl ServerParams {
             "log_level=info".into(),
             "tunnel_forward=true".into(),
             "video=true".into(),
-            "audio=false".into(),
+            format!("audio={}", self.audio),
             format!("video_codec={}", self.codec.option()),
             format!("video_bit_rate={}", self.bit_rate),
             format!("max_size={}", self.max_size),
@@ -86,6 +89,10 @@ impl ServerParams {
         }
         if !self.codec_options.is_empty() {
             a.push(format!("video_codec_options={}", self.codec_options));
+        }
+        if self.audio {
+            // Uncompressed: nothing to decode, and 1.5 Mbit/s is little on a LAN.
+            a.push("audio_codec=raw".into());
         }
         a.extend([
             format!("control={}", self.control),
@@ -144,5 +151,8 @@ mod tests {
         assert!(cmd.contains(" 'video_codec_options=a:int=1'\\''b' "), "{cmd}");
         assert!(cmd.contains(" 'send_stream_meta=true' "));
         assert_eq!(p.socket_name(), "scrcpy_0000abcd");
+        assert!(cmd.contains(" 'audio=false' ") && !cmd.contains("audio_codec"));
+        let cmd = ServerParams { audio: true, ..Default::default() }.command("4.1");
+        assert!(cmd.contains(" 'audio=true' ") && cmd.contains(" 'audio_codec=raw' "), "{cmd}");
     }
 }

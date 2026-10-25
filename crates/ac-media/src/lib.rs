@@ -12,6 +12,7 @@
 pub mod decoder;
 pub mod frame;
 pub mod mailbox;
+pub mod recorder;
 pub mod stream;
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -71,7 +72,7 @@ impl MediaContext {
     /// "software"); `device` is `video.vaapi_device` ("auto" or a path).
     pub fn new(decoder: &str, device: &str) -> Self {
         if decoder == "software" {
-            let probe = ProbeResult { vaapi: Err("disabled by video.decoder".into()), dmabuf_export: false };
+            let probe = ProbeResult { vaapi: Err("disabled by video.decoder".into()), dmabuf_export: false, hevc: false, av1: false };
             return Self { hw: None, backend: AtomicU8::new(Backend::Software as u8), probe };
         }
         let device = (device != "auto").then_some(device);
@@ -83,7 +84,12 @@ impl MediaContext {
             (Some(_), _) => Backend::VaapiCopy,
         };
         match &probe.vaapi {
-            Ok(()) => tracing::info!("video decoding: {backend} (dma-buf export: {})", probe.dmabuf_export),
+            Ok(()) => tracing::info!(
+                "video decoding: {backend} (dma-buf export: {}, HEVC: {}, AV1: {})",
+                probe.dmabuf_export,
+                probe.hevc,
+                probe.av1
+            ),
             Err(e) => tracing::warn!("VA-API unavailable ({e}); video decoding: software"),
         }
         Self { hw, backend: AtomicU8::new(backend as u8), probe }

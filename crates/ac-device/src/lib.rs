@@ -1,12 +1,16 @@
 //! Device management: discovery routing, pairing, connection lifecycle,
 //! heartbeat and telemetry for up to `general.max_slots` slots (default 4, at most 5).
 
+pub mod adaptive;
 mod api;
+pub mod logcat;
 mod manager;
+pub mod perf;
 pub mod probe;
 pub mod qr;
 pub mod slot;
 pub mod stream;
+pub mod testing;
 pub mod transfer;
 
 pub use api::*;

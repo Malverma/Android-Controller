@@ -53,6 +53,7 @@ impl DeviceAction {
     }
 }
 
+#[derive(Clone)]
 pub struct InputPrefs {
     pub mode: InjectMode,
     pub right_click: DeviceAction,
@@ -81,7 +82,8 @@ impl InputPrefs {
 pub struct SlotInput {
     pub slot: SlotId,
     pub io: Arc<SlotIo>,
-    prefs: Rc<InputPrefs>,
+    /// Shared by all slots; Preferences replaces it in place.
+    prefs: Rc<RefCell<InputPrefs>>,
     /// Fans input out to the other selected phones while broadcast is on.
     broadcast: Rc<Broadcast>,
     /// Android keycode → repeat count, for keys sent DOWN and not yet UP.
@@ -94,7 +96,7 @@ impl SlotInput {
     pub fn new(
         slot: SlotId,
         io: Arc<SlotIo>,
-        prefs: Rc<InputPrefs>,
+        prefs: Rc<RefCell<InputPrefs>>,
         broadcast: Rc<Broadcast>,
         on_activate: Rc<dyn Fn(SlotId)>,
     ) -> Rc<Self> {
@@ -247,7 +249,7 @@ fn attach_pointer(w: &gtk::Widget, input: &Rc<SlotInput>) {
     {
         let (input, held, w) = (input.clone(), held.clone(), w.clone());
         click.connect_pressed(move |g, n, _, _| {
-            let p = &input.prefs;
+            let p = input.prefs.borrow().clone();
             let a = match g.current_button() {
                 gdk::BUTTON_PRIMARY => return,
                 gdk::BUTTON_MIDDLE => p.middle_click,
@@ -294,7 +296,7 @@ fn attach_scroll(w: &gtk::Widget, input: &Rc<SlotInput>) {
         let (last, input, w) = (last.clone(), input.clone(), w.clone());
         motion.connect_motion(move |_, x, y| {
             last.set((x, y));
-            if input.prefs.forward_hover
+            if input.prefs.borrow().forward_hover
                 && let Some(lb) = input.letterbox(&w)
                 && let Some((px, py)) = lb.map(x, y)
             {
@@ -319,7 +321,7 @@ fn attach_scroll(w: &gtk::Widget, input: &Rc<SlotInput>) {
         let Some(lb) = input.letterbox(&w2) else { return gtk::glib::Propagation::Proceed };
         let (x, y) = last.get();
         let Some((px, py)) = lb.map(x, y) else { return gtk::glib::Propagation::Proceed };
-        let div = if c.unit() == gdk::ScrollUnit::Wheel { 1.0 } else { input.prefs.pixels_per_notch };
+        let div = if c.unit() == gdk::ScrollUnit::Wheel { 1.0 } else { input.prefs.borrow().pixels_per_notch };
         let position = Position { x: px, y: py, screen_w: lb.frame_w as u16, screen_h: lb.frame_h as u16 };
         input.send(ControlMsg::InjectScroll {
             position,
@@ -354,7 +356,7 @@ fn is_modifier(key: gdk::Key) -> bool {
 
 fn attach_keys(w: &gtk::Widget, input: &Rc<SlotInput>) {
     let keys = gtk::EventControllerKey::new();
-    let raw = input.prefs.mode == InjectMode::Raw;
+    let raw = input.prefs.borrow().mode == InjectMode::Raw;
     let im = (!raw).then(gtk::IMMulticontext::new);
     if let Some(im) = &im {
         im.set_client_widget(Some(w));
@@ -363,7 +365,7 @@ fn attach_keys(w: &gtk::Widget, input: &Rc<SlotInput>) {
         // Ctrl/Alt combinations never reach commit (the IM passes them on to
         // key-pressed), so the modifier check in `sends_as_text` is moot here.
         im.connect_commit(move |_, text| {
-            if sends_as_text(input.prefs.mode, text, 0) {
+            if sends_as_text(input.prefs.borrow().mode, text, 0) {
                 input.inject_text(text);
             }
         });

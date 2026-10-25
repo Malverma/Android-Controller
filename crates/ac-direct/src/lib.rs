@@ -383,10 +383,18 @@ pub struct Hello {
     pub input: bool,
     /// Screen capture is already allowed.
     pub capture: bool,
+    /// The helper's version code (0 before 0.6, which did not send it).
+    pub version: u32,
+    /// Video codecs the helper can encode (`["h264"]` before 0.6).
+    pub codecs: Vec<String>,
 }
 
+/// The helper version that knows app actions, multi-touch, the phone's
+/// clipboard and performance stats.
+pub const HELPER_V6: u32 = 6;
+
 /// Telemetry in a heartbeat answer.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pong {
     pub battery: Option<u8>,
     pub charging: bool,
@@ -394,6 +402,15 @@ pub struct Pong {
     pub link_mbps: Option<u32>,
     pub input: bool,
     pub capture: bool,
+    /// Helper 0.6+: performance stats (see `ac-device` perf).
+    pub cpu_pct: Option<f32>,
+    pub mem_used_mb: Option<u32>,
+    pub mem_total_mb: Option<u32>,
+    pub battery_temp_c: Option<f32>,
+    /// Helper 0.6+: the phone's clipboard, when it changed (`clip_seq`
+    /// counts changes so the same text copied twice still arrives).
+    pub clip: Option<String>,
+    pub clip_seq: u64,
 }
 
 /// The long-lived connection: heartbeat, telemetry, "keep screen on".
@@ -416,6 +433,11 @@ impl Link {
             release: s("release"),
             input: b("input"),
             capture: b("capture"),
+            version: reply.get("version").and_then(Value::as_u64).unwrap_or(0) as u32,
+            codecs: match reply.get("codecs").and_then(Value::as_array) {
+                Some(a) => a.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                None => vec!["h264".to_owned()],
+            },
         };
         Ok(Link { stream, hello })
     }
@@ -442,6 +464,12 @@ impl Link {
                 link_mbps: v.get("link_mbps").and_then(Value::as_u64).map(|m| m as u32),
                 input: v.get("input").and_then(Value::as_bool).unwrap_or(false),
                 capture: v.get("capture").and_then(Value::as_bool).unwrap_or(false),
+                cpu_pct: v.get("cpu").and_then(Value::as_f64).map(|c| c as f32),
+                mem_used_mb: v.get("mem_used_mb").and_then(Value::as_u64).map(|m| m as u32),
+                mem_total_mb: v.get("mem_total_mb").and_then(Value::as_u64).map(|m| m as u32),
+                battery_temp_c: v.get("battery_temp").and_then(Value::as_f64).map(|t| t as f32),
+                clip: v.get("clip").and_then(Value::as_str).map(str::to_owned),
+                clip_seq: v.get("clip_seq").and_then(Value::as_u64).unwrap_or(0),
             },
             rtt,
         ))
@@ -451,6 +479,24 @@ impl Link {
     pub async fn stay_awake(&mut self, on: Option<bool>, limit: Duration) -> Result<bool, Error> {
         let v = self.request(json!({ "op": "stay_awake", "on": on }), limit).await?;
         Ok(v.get("on").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    /// Helper 0.6+: `action` is `launch`, `stop`, `clear` or `uninstall`.
+    /// Uninstalling asks on the phone (Android lets no app do it silently).
+    /// `Ok(Err(reason))` when the phone said no.
+    pub async fn app(&mut self, action: &str, package: &str, limit: Duration) -> Result<Result<String, String>, Error> {
+        let v = self.request(json!({ "op": "app", "action": action, "package": package }), limit).await?;
+        let msg = v.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok(if v.get("ok").and_then(Value::as_bool).unwrap_or(false) { Ok(msg) } else { Err(msg) })
+    }
+
+    /// Helper 0.6+: the apps the user installed (package names).
+    pub async fn packages(&mut self, limit: Duration) -> Result<Vec<String>, Error> {
+        let v = self.request(json!({ "op": "packages" }), limit).await?;
+        let mut list: Vec<String> =
+            v.get("packages").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+        list.sort();
+        Ok(list)
     }
 }
 
@@ -463,12 +509,14 @@ pub struct StreamParams {
     pub bit_rate: u32,
     pub max_fps: u32,
     pub power_on: bool,
+    /// `"h264"` or `"h265"`; helpers before 0.6 always send H.264.
+    pub codec: &'static str,
 }
 
 /// Opens a mirroring session. Returns the socket (positioned at the codec
 /// id of the video stream) and whether touch control is on.
 pub async fn open_stream(addr: SocketAddr, creds: &Credentials, expect: &str, p: StreamParams) -> Result<(TcpStream, bool), Error> {
-    let params = json!({ "max_size": p.max_size, "bit_rate": p.bit_rate, "max_fps": p.max_fps, "power_on": p.power_on });
+    let params = json!({ "max_size": p.max_size, "bit_rate": p.bit_rate, "max_fps": p.max_fps, "power_on": p.power_on, "codec": p.codec });
     let s = open(addr, creds, Some(expect), Purpose::Stream, params).await?;
     let input = s.reply.get("input").and_then(Value::as_bool).unwrap_or(false);
     Ok((s.stream, input))

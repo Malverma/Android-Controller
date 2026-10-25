@@ -9,6 +9,7 @@ use ac_scrcpy::{DemuxError, DemuxItem, Demuxer};
 
 use crate::decoder::{Decoder, HwOutput};
 use crate::mailbox::Mailbox;
+use crate::recorder::RecMsg;
 use crate::{Backend, MediaContext};
 
 /// Spec Appendix A `E_DECODER`: 5 errors within 2 s.
@@ -46,22 +47,45 @@ pub fn run<R: Read>(video: R, mailbox: &Mailbox, media: &MediaContext, events: &
     let mut errors: VecDeque<Instant> = VecDeque::new();
     let mut lag = LagEstimator::default();
     let mut last_bytes = 0;
+    // For a recording: the capture size, the latest codec config, and the
+    // recording generation this thread already introduced itself to.
+    let mut size = (0, 0);
+    let mut config: Vec<u8> = Vec::new();
+    let mut rec_seen = 0;
 
     loop {
         let item = demux.next_item()?;
         let bytes = demux.bytes_read();
         mailbox.stats.bytes.fetch_add(bytes - last_bytes, Ordering::Relaxed);
         last_bytes = bytes;
-        let (data, pts_us, key_frame) = match item {
+        let (data, pts_us, key_frame, config_len) = match item {
             DemuxItem::Session { width, height, .. } => {
                 mailbox.set_size(width, height);
                 events.session(width, height);
                 lag = LagEstimator::default();
+                size = (width, height);
                 continue;
             }
-            DemuxItem::Packet { data, pts_us, key_frame } => (data, pts_us, key_frame),
+            DemuxItem::Packet { data, pts_us, key_frame, config_len } => (data, pts_us, key_frame, config_len),
         };
         mailbox.stats.lag_ms.store(lag.push(pts_us, Instant::now()), Ordering::Relaxed);
+        if config_len > 0 {
+            config = data[..config_len].to_vec();
+        }
+        if let Some((generation, rec)) = mailbox.recorder() {
+            let fresh = generation != rec_seen;
+            if (fresh || config_len > 0) && !config.is_empty() {
+                let _ = rec.send(RecMsg::Config { codec, width: size.0, height: size.1, config: config.clone() });
+            }
+            if fresh {
+                rec_seen = generation;
+                if !key_frame {
+                    // A recording starts on a key frame: ask for one now.
+                    events.request_key_frame();
+                }
+            }
+            let _ = rec.send(RecMsg::Packet { data: data[config_len..].to_vec(), pts_us, key: key_frame });
+        }
 
         // The UI may have rejected dma-bufs since the last frame.
         if backend == Backend::VaapiDmabuf && media.backend() != Backend::VaapiDmabuf {

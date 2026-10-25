@@ -21,6 +21,8 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     pub input: Input,
     pub transfer: Transfer,
+    pub audio: Audio,
+    pub testing: Testing,
     pub ui: Ui,
     #[serde(deserialize_with = "merge_keybindings")]
     pub keybindings: BTreeMap<String, String>,
@@ -45,6 +47,8 @@ impl Default for Config {
             profiles: default_profiles(),
             input: Input::default(),
             transfer: Transfer::default(),
+            audio: Audio::default(),
+            testing: Testing::default(),
             ui: Ui::default(),
             keybindings: default_keybindings(),
         }
@@ -311,6 +315,40 @@ impl Default for Transfer {
     }
 }
 
+/// Focus-view audio (spec §4.4 step 5), played through PipeWire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Audio {
+    /// PipeWire buffer at 48 kHz: lower is snappier, higher survives Wi-Fi hiccups.
+    pub pipewire_latency_frames: u32,
+    /// 0.0..=1.0.
+    pub volume: f64,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self { pipewire_latency_frames: 2048, volume: 1.0 }
+    }
+}
+
+/// App testing on every phone at once (Milestone 5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Testing {
+    /// Test runs, screenshots and recordings; empty = `~/Documents/Android Controller`.
+    pub output_dir: String,
+    /// Watch each phone's log for crashes and ANRs (a red badge on the tile).
+    pub watch_crashes: bool,
+    /// How often frame rate, CPU, memory and temperature are sampled.
+    pub perf_interval_ms: u64,
+}
+
+impl Default for Testing {
+    fn default() -> Self {
+        Self { output_dir: String::new(), watch_crashes: true, perf_interval_ms: 2000 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ui {
@@ -350,6 +388,9 @@ pub fn default_keybindings() -> BTreeMap<String, String> {
         ("toggle_focus", "<Alt>f"),
         ("grid_view", "<Alt>g"),
         ("broadcast_toggle", "<Alt><Shift>b"),
+        ("mirror_clicks_toggle", "<Alt><Shift>m"),
+        ("screenshot_all", "<Alt><Shift>s"),
+        ("record_all", "<Alt><Shift>r"),
         ("focus_slot_1", "<Alt>1"),
         ("focus_slot_2", "<Alt>2"),
         ("focus_slot_3", "<Alt>3"),

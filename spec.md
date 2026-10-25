@@ -1613,7 +1613,7 @@ DBusActivatable=false
 
 ## 9. Implementation Roadmap & Verification Plan
 
-Each milestone ends with a tagged release (`v0.1`…`v0.4`) and must pass its exit criteria before the
+Each milestone ends with a tagged release (`v0.1`…`v0.4`, then `v1.0` after Milestone 6) and must pass its exit criteria before the
 next starts. CI (`cargo test --workspace`, `cargo clippy -- -D warnings`, `cargo fmt --check`) runs
 on every commit from M1 onward.
 
@@ -1724,6 +1724,139 @@ transfer overlays/toasts, PipeWire audio for focus, preferences UI, packaging, d
   transfer resumes automatically and completes with a verified checksum.
 - Packaging: `makepkg -si` in a clean `extra-x86_64-build` chroot succeeds; `namcap` reports no errors;
   the app launches from the desktop entry on Hosts A–C.
+
+### Milestone 5 — App Testing on Every Phone
+
+**Scope:** testing an app or game on all connected phones at once, from the **toolbar**
+under the header (always visible; it also holds Add Device and the Nearby popover, which
+replace the empty-slot tiles and the Nearby list under the grid). Record-and-replay of input is out of scope; Mirror clicks
+(§4.10) covers driving several phones live.
+
+- **Test runs.** *Start run* (optional name) creates
+  `<testing.output_dir>/Runs/YYYY-MM-DD HH-MM-SS <name>/` (default output dir
+  `~/Documents/Android Controller`), with one folder per phone, `"<slot> <name>"`. Each holds:
+  - `logcat.txt`: the phone's full log for the run (`logcat -v threadtime -T 1 -b main -b system`,
+    plus `-b crash` from Android 7).
+  - `crashes.txt`: every crash or ANR with its stack trace.
+  - `stats.csv`: `time,fps,cpu_pct,mem_used_mb,mem_total_mb,app_mem_mb,cpu_temp_c,battery_temp_c`.
+  - Screenshots and recordings taken during the run.
+
+  *Stop run* writes `summary.txt` (duration, crash count, each crash per phone). A phone that
+  connects during a run gets its folder then. Phones without ADB get no log: Android lets no app
+  read the system log.
+- **Crash and ANR watch** (`testing.watch_crashes`, on by default). Outside a run, each ADB phone
+  runs a filtered `logcat` (`AndroidRuntime:E ActivityManager:E DEBUG:F *:S`). A stream that ends
+  is restarted at most every 5 s. The parser recognises three kinds:
+  - *Java/Kotlin crash*: `FATAL EXCEPTION` plus `Process: <pkg>` and the exception line.
+  - *ANR*: `ANR in <pkg>` plus `Reason:`.
+  - *Native crash*: tombstone `*** *** ***`, `>>> <pkg> <<<` and the `signal` line.
+
+  The stack trace keeps at most 40 lines. Crashes of scrcpy-server (`app_process`) are ignored.
+  A crash shows a red ⚠ count on the tile; its popover lists the crashes, newest first, with
+  details and *Copy*. A toast names the app.
+- **App actions on every phone.**
+  - *Choose APK* reads the APK's package and version from the binary manifest in pure Rust
+    (ZIP central directory, inflate, AXML string pool and attributes `0x0101021b`/`0x0101021c`).
+    *Install* sends it to all connected phones through the transfer queue (§5).
+  - The package box (filled from the APK, typed in, or picked from `pm list packages -3` of the
+    phones) drives the other actions:
+    - *Launch*: `monkey -p <pkg> -c android.intent.category.LAUNCHER 1`
+    - *Stop*: `am force-stop`
+    - *Clear data*: `pm clear`; asks first.
+    - *Uninstall*: `pm uninstall`; asks first.
+  - Each phone's result appears on its tile: ✓ or ✗ with the phone's reason. A success fades
+    after 10 s; a failure stays until the next action.
+- **Screenshots and recordings.**
+  - *Screenshot* (`<Alt><Shift>s`): `exec:screencap -p` at full resolution over ADB. Without ADB,
+    the window saves the mirror's current frame. Saved to the run's phone folder, else
+    `<output>/Screenshots/<phone> HH-MM-SS.png`.
+  - *Record* (`<Alt><Shift>r`) muxes each phone's mirror stream into MP4 on the PC, with no
+    re-encode and no phone-side time limit:
+    - The stream is fragmented MP4 (`+frag_keyframe+empty_moov+default_base_moof`), so a cut-off
+      file still plays.
+    - The codec config becomes the MP4 extradata, and a recording starts on a requested key frame.
+    - A new capture size or codec (rotation, profile switch) starts `name (2).mp4`.
+    - Recording outlives stream restarts and stops when the phone leaves.
+- **Graphs** (the monitor toggle; always on during a run), every `testing.perf_interval_ms`
+  (default 2000, 500–60 000):
+  - *Frame rate*: present times from `dumpsys SurfaceFlinger --latency` on the resumed
+    activity's layers. A game's `SurfaceView` comes first, the window second; the layer list is
+    re-read every 5 samples.
+  - *CPU*: the `/proc/stat` busy share.
+  - *Memory*: `MemTotal`/`MemAvailable`, plus the test app's (or the foreground app's) PSS from
+    `dumpsys meminfo`.
+  - *Temperature*: the hottest CPU thermal zone, and the battery.
+
+  Each tile draws frame rate and CPU as sparklines over the last 90 samples, with a one-line
+  summary below.
+
+**Verification:**
+- Unit: logcat line and crash parser (Java crash, ANR, native tombstone, ignoring scrcpy); app
+  command results (`Success`, `Failure [...]`, monkey output); perf parsers (`/proc/stat`
+  deltas, SurfaceFlinger latency, resumed-activity layer choice on Android 11 and 13, meminfo on
+  Android 9 and 10+); run folders and `summary.txt`; MP4 part naming; the APK manifest (UTF-8 and
+  UTF-16 string pools).
+- Integration: a real scrcpy capture recorded to MP4 has every frame (`ffprobe -count_frames`).
+  A size change gives two parts.
+- Manual (`crates/ac-device/examples/testing_probe.rs` and `testing_e2e.rs`):
+  - `am crash <pkg>` is reported within 2 s on Android 11 and 13.
+  - Each phone folder of a run has a log, stats, a screenshot and a playable recording.
+  - *Launch*/*Stop* report ✓ on every phone.
+
+### Milestone 6 — Adaptive Quality, H.265 and the Helper 0.6 (v1.0)
+
+**Scope:**
+- **Adaptive bitrate** (§3.6, `video.adaptive_bitrate`), driven by the decode loop's p95 lag
+  each second:
+  - *Down*: 3 s above `video.lag_downgrade_ms` (250) restarts the stream at 0.6× the bitrate,
+    never below 1000 kbit/s. Grid streams also lose 10 fps, down to a floor of 15.
+  - *Up*: 30 s below `video.lag_upgrade_ms` (80) raises it by 1.25×, up to the profile's values.
+  - At most one adaptive restart per 10 s per phone.
+  - A second with no video counts as neither. Switching profile starts again from the profile.
+  - The status strip says “reduced for Wi-Fi” while lowered.
+- **Real H.265.**
+  - *Phone side*: once per phone, scrcpy-server's `list_encoders` runs from a separate jar path
+    (not to collide with a running session). Codecs with a hardware encoder are saved in
+    `devices.toml` `supported_codecs`.
+  - *Host side*: the startup probe decodes embedded HEVC and AV1 frames with VA-API.
+  - `h265-if-supported` / `av1-if-supported` need both ends, else H.264. An H.265/AV1 stream that
+    fails before its first frame removes that codec for the phone and retries in H.264.
+- **Wireless Debugging Keeper 0.6** (phones without ADB):
+  - *Multi-touch*: a second pointer switches to recording every finger; the gesture is replayed,
+    all strokes together with their timing, when the last finger lifts. Pinch and two-finger
+    swipe work.
+  - *Clipboard phone → PC* in the heartbeat (`clip`, `clip_seq`). Up to Android 9 a listener sees
+    every copy. From Android 10 the notification action *Send clipboard to PC* briefly opens an
+    invisible activity, because only the front app may read the clipboard.
+  - *Graphs*: memory, battery temperature, and CPU where `/proc/stat` is readable.
+  - *App actions*:
+    - *Launch*.
+    - *Stop*: home, then `killBackgroundProcesses`.
+    - *Uninstall*: the system's confirmation.
+    - *Clear data* opens the app's settings page, since Android lets only ADB do it.
+  - The app list.
+  - *H.265 encoding* when the phone has a hardware HEVC encoder, falling back to H.264 before
+    the stream header.
+  - The hello carries `version` and `codecs`.
+- **Helper updates**: the app ships the helper APK (`android-helper/dist/`, embedded at build
+  time). It compares the version code with what each phone has (`dumpsys package` over ADB, or
+  the hello without ADB). An older helper gets an *Update* row on the tile: a silent `pm install`
+  over ADB, or the phone's install prompt without ADB.
+- **Packaging**: the AUR package `android-controller-git` (`packaging/aur/`), and version 1.0.0.
+
+**Verification:**
+- Unit: the adaptive controller (downgrade after exactly 3 s, the floors, the 10 s gap, the climb
+  back without overshoot, idle seconds), codec choice (needs both ends), the encoder list parser.
+- Host probe on Host C: HEVC = true, AV1 = false (RTX 2080 Super, `nvidia` VA-API).
+- Manual exit criteria:
+  1. A 2.4 GHz link loaded with a download: the grid tile drops to ≤ 1800 kbit/s within 4 s, and
+     climbs back within 2 minutes of the download ending.
+  2. A phone with a hardware HEVC encoder streams H.265 in focus view. A phone without one stays
+     on H.264 with no failed attempt.
+  3. Without ADB: pinch-zoom in a map app; copying text on the phone reaches the PC clipboard
+     (Android 9 by itself, Android 10+ through the notification); *Launch* opens the app.
+  4. A phone with helper 0.5 shows *Update*; after updating, the tile no longer offers it.
+  5. `makepkg -si` from `packaging/aur/android-controller-git` builds and installs v1.0.0.
 
 ---
 

@@ -20,7 +20,11 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Touch, keys and text from the PC, through Android's accessibility API (the
@@ -29,7 +33,9 @@ import java.util.List;
  *
  * <p>A finger drag is replayed live as a chain of continued strokes
  * (Android 8+); if Android cancels one, the rest of the drag is replayed in
- * one piece when the finger lifts.
+ * one piece when the finger lifts. With a second finger (pinch, two-finger
+ * swipe) every finger is recorded and the whole gesture is replayed, all
+ * fingers together, when the last one lifts.
  */
 public final class InputService extends AccessibilityService {
     private static volatile InputService instance;
@@ -44,9 +50,14 @@ public final class InputService extends AccessibilityService {
     private boolean upPending;
     private boolean live;
     private final List<float[]> pending = new ArrayList<>();
-    /** Whole-stroke fallback: every point since the finger went down. */
+    /** Whole-stroke fallback: every point since the finger went down (ms after {@link #downAt}). */
     private final List<float[]> all = new ArrayList<>();
     private long downAt;
+    // Multi-touch: the first finger's pointer id, and every finger's points.
+    private long primary = -1;
+    private boolean multi;
+    private final Map<Long, List<float[]>> fingers = new LinkedHashMap<>();
+    private final Set<Long> lifted = new HashSet<>();
     // Wheel scrolling, accumulated briefly so one flick is one swipe.
     private float scrollV, scrollH, scrollX, scrollY;
     private int scrollW, scrollH0;
@@ -130,10 +141,73 @@ public final class InputService extends AccessibilityService {
 
     // ---- touch ----------------------------------------------------------------------
 
-    /** action: 0 down, 1 up, 2 move, 3 cancel (MotionEvent). Real screen pixels. */
-    void touch(int action, float x, float y) {
+    /** action: 0 down, 1 up, 2 move, 3 cancel (MotionEvent), per pointer. Real screen pixels. */
+    void touch(int action, long pointer, float x, float y) {
         if (!Keeper.isAtLeast(24)) return; // gestures need Android 7
-        main.post(() -> onTouch(action, Math.max(0, x), Math.max(0, y)));
+        main.post(() -> onPointer(action, pointer, Math.max(0, x), Math.max(0, y)));
+    }
+
+    private void onPointer(int action, long id, float x, float y) {
+        if (multi) {
+            float t = SystemClock.uptimeMillis() - downAt;
+            List<float[]> f = fingers.get(id);
+            if (action == 0) {
+                if (f != null || fingers.size() >= GestureDescription.getMaxStrokeCount()) return;
+                f = new ArrayList<>();
+                fingers.put(id, f);
+            }
+            if (f == null || lifted.contains(id)) return;
+            f.add(new float[] {x, y, t});
+            if (action == 1 || action == 3) {
+                lifted.add(id);
+                if (lifted.size() == fingers.size()) replayFingers();
+            }
+            return;
+        }
+        if (action == 0 && down && id != primary) {
+            // A second finger: stop the live replay and record them all.
+            multi = true;
+            live = false;
+            stroke = null;
+            pending.clear();
+            upPending = false;
+            fingers.clear();
+            lifted.clear();
+            fingers.put(primary, new ArrayList<>(all));
+            List<float[]> f = new ArrayList<>();
+            f.add(new float[] {x, y, SystemClock.uptimeMillis() - downAt});
+            fingers.put(id, f);
+            all.clear();
+            return;
+        }
+        if (down && id != primary) return;
+        if (action == 0) primary = id;
+        onTouch(action, x, y);
+    }
+
+    /** Every finger at once, each starting and lasting as it was drawn. */
+    private void replayFingers() {
+        long max = GestureDescription.getMaxGestureDuration();
+        GestureDescription.Builder b = new GestureDescription.Builder();
+        for (List<float[]> f : fingers.values()) {
+            float[] first = f.get(0), last = f.get(f.size() - 1);
+            Path p = new Path();
+            p.moveTo(first[0], first[1]);
+            for (int i = 1; i < f.size(); i++) p.lineTo(f.get(i)[0], f.get(i)[1]);
+            long start = Math.max(0, Math.min((long) first[2], max - 1));
+            long duration = Math.max(1, Math.min((long) (last[2] - first[2]), max - start));
+            b.addStroke(new GestureDescription.StrokeDescription(p, start, duration));
+        }
+        multi = false;
+        fingers.clear();
+        lifted.clear();
+        down = false;
+        primary = -1;
+        try {
+            dispatchGesture(b.build(), null, main);
+        } catch (RuntimeException e) {
+            Log.w(Direct.TAG, "multi-touch gesture failed", e);
+        }
     }
 
     private void onTouch(int action, float x, float y) {
@@ -145,8 +219,8 @@ public final class InputService extends AccessibilityService {
                 upPending = false;
                 pending.clear();
                 all.clear();
-                all.add(new float[] {x, y, now});
                 downAt = now;
+                all.add(new float[] {x, y, 0});
                 lastX = x;
                 lastY = y;
                 live = Keeper.isAtLeast(26);
@@ -160,7 +234,7 @@ public final class InputService extends AccessibilityService {
                 break;
             case 2:
                 if (!down) return;
-                all.add(new float[] {x, y, now});
+                all.add(new float[] {x, y, now - downAt});
                 if (live) {
                     pending.add(new float[] {x, y});
                     if (!inFlight) flush();
@@ -169,7 +243,7 @@ public final class InputService extends AccessibilityService {
             case 1:
             case 3:
                 if (!down) return;
-                all.add(new float[] {x, y, now});
+                all.add(new float[] {x, y, now - downAt});
                 if (live) {
                     pending.add(new float[] {x, y});
                     upPending = true;
@@ -272,7 +346,7 @@ public final class InputService extends AccessibilityService {
         Path p = new Path();
         p.moveTo(first[0], first[1]);
         for (int i = 1; i < all.size(); i++) p.lineTo(all.get(i)[0], all.get(i)[1]);
-        long duration = Math.max(1, Math.min((long) last[2] - downAt, GestureDescription.getMaxGestureDuration()));
+        long duration = Math.max(1, Math.min((long) last[2], GestureDescription.getMaxGestureDuration()));
         all.clear();
         try {
             dispatchGesture(new GestureDescription.Builder()
@@ -420,6 +494,7 @@ public final class InputService extends AccessibilityService {
     void setClipboard(String text, boolean paste) {
         main.post(() -> {
             ClipboardManager cm = getSystemService(ClipboardManager.class);
+            Clip.fromPc(text);
             if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Android Controller", text));
             if (paste) {
                 AccessibilityNodeInfo n = focused();

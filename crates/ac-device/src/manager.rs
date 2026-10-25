@@ -15,15 +15,21 @@ use rand::Rng;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::adaptive::{Adaptive, Rate};
 use crate::api::*;
+use crate::logcat::LogEvent;
+use crate::perf::{LAYERS_CMD, PerfState, parse_layers, parse_sample, sample_cmd};
+use crate::testing::{Run, app_cmd, app_result, capture_name, crash_entry, output_root, parse_packages};
 use crate::probe::{IDENTIFY_CMD, STATS_CMD, parse_identity, parse_stats};
 use crate::qr::QrSecret;
 use crate::slot::{DeviceInfo, Effect, PAIR_QR_TIMEOUT, Phase, Slot, SlotEvent, StreamPhase, StreamProfile, TimerKind};
 use crate::transfer::{DirectTarget, Link, Transfers};
 use crate::stream::{
-    DirectEnv, SessionHandle, SessionMsg, SlotIo, StreamEnv, max_size_for, resolve_profile, server_params, spawn_direct_session, spawn_session,
+    DirectEnv, SessionHandle, SessionMsg, SlotIo, StreamEnv, max_size_for, pick_codec, resolve_profile, server_params, spawn_direct_session,
+    spawn_session,
 };
 use ac_media::MediaContext;
+use ac_scrcpy::VideoCodec;
 
 /// Phone-side copy of the user's screen timeout while "keep screen on" is
 /// active. Living on the phone, it survives app crashes and restarts.
@@ -36,6 +42,7 @@ const STAY_AWAKE_TIMEOUT: u32 = i32::MAX as u32;
 /// granted over adb. Prints `@granted` when it did the setup now.
 const HELPER_SETUP_CMD: &str = "p=org.androidcontroller.keeper; \
 pm path $p >/dev/null 2>&1 || { echo @none; exit 0; }; \
+echo @$(dumpsys package $p | grep -m 1 -o 'versionCode=[0-9]*'); \
 dumpsys package $p | grep -q 'WRITE_SECURE_SETTINGS: granted=true' && { echo @ready; exit 0; }; \
 pm grant $p android.permission.WRITE_SECURE_SETTINGS && echo @granted; \
 pm grant $p android.permission.POST_NOTIFICATIONS >/dev/null 2>&1; \
@@ -49,6 +56,15 @@ const LEGACY_PROBE_EVERY: Duration = Duration::from_secs(30);
 
 /// Stale mDNS entries are kept this long so brief flaps don't flicker the UI.
 const NEARBY_GRACE: Duration = Duration::from_secs(30);
+/// The Wireless Debugging Keeper build this app ships (android-helper/dist):
+/// phones with an older one are offered the update.
+const HELPER_APK: &[u8] = include_bytes!("../../../android-helper/dist/wireless-debugging-keeper.apk");
+
+/// A slot's logcat stream that ended is restarted no sooner than this.
+const LOGCAT_RETRY: Duration = Duration::from_secs(5);
+/// The perf sampler lists SurfaceFlinger layers every N samples.
+const LAYERS_EVERY: u32 = 5;
+
 /// Run the stats command every N heartbeats.
 const STATS_EVERY: u32 = 5;
 /// A grid `max_size: auto` change restarts the stream only past this
@@ -113,6 +129,18 @@ enum Msg {
     DirectGone { slot: SlotId, conn: u64 },
     /// The helper's touch control (accessibility service) came on or went off.
     DirectInput { slot: SlotId, conn: u64, on: bool },
+    /// Once a second: feed the adaptive bitrate controllers.
+    AdaptiveTick,
+    /// The phone's hardware video encoders (codec names), or why not known.
+    Codecs { slot: SlotId, device_id: String, codecs: Result<Vec<String>, String> },
+    Log(LogEvent),
+    Perf { slot: SlotId, sample: PerfSample },
+    /// The phone's clipboard, from the helper (no ADB).
+    DirectClip { slot: SlotId, text: String },
+    /// Pass this on to the UI.
+    Emit(UiEvent),
+    /// The helper's version code on the phone `device_id` (over ADB).
+    HelperVersion { slot: SlotId, device_id: String, version: u32 },
 }
 
 /// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
@@ -127,6 +155,15 @@ struct DirectLink {
 
 enum LinkCmd {
     StayAwake { set: Option<bool>, device_id: String },
+    App { action: AppAction },
+    Packages,
+}
+
+/// A slot's running logcat stream and what it was started for.
+struct LogTask {
+    task: JoinHandle<()>,
+    serial: String,
+    file: Option<PathBuf>,
 }
 
 struct Nearby {
@@ -217,6 +254,27 @@ struct Manager {
     /// Per slot: the link attempt whose answer is still wanted (0 = none).
     direct_pending: Vec<u64>,
     direct_conn: u64,
+    /// Per slot: adaptive bitrate (spec §3.6), the profile rate of the
+    /// running stream, and the video byte count at the last tick.
+    adaptive: Vec<Adaptive>,
+    stream_rate: Vec<Option<(Rate, StreamProfile)>>,
+    video_bytes: Vec<u64>,
+    /// Per slot: the encoder list was asked for the phone online now, and
+    /// the codec the current stream asked for.
+    codecs_checked: Vec<bool>,
+    stream_codec: Vec<VideoCodec>,
+    // ---- app testing (Milestone 5) ----
+    logcat: Vec<Option<LogTask>>,
+    logcat_started: Vec<Option<Instant>>,
+    /// Per slot: the perf sampler and the serial it samples.
+    perf: Vec<Option<(JoinHandle<()>, String)>>,
+    perf_on: bool,
+    test_app: tokio::sync::watch::Sender<Option<String>>,
+    run: Option<Run>,
+    /// The shipped helper written to disk, and its version code.
+    helper_apk: Option<(PathBuf, u32)>,
+    /// Per slot: the phone's older helper version, while an update is offered.
+    helper_old: Vec<Option<u32>>,
 }
 
 impl Manager {
@@ -253,6 +311,7 @@ impl Manager {
         let (session_tx, session_rx) = mpsc::unbounded_channel();
         let adb = AdbClient::new(opts.config.general.adb_server)
             .with_timeout(Duration::from_millis(opts.config.connection.connect_timeout_ms.max(1000) * 2));
+        let journal = opts.paths.as_ref().map(|p| p.state_dir.join("transfers.json"));
         Self {
             adb,
             paths: opts.paths,
@@ -277,7 +336,13 @@ impl Manager {
             rescan: None,
             tx,
             rx: Some(rx),
-            transfers: Transfers::new(opts.config.transfer.clone(), opts.config.general.adb_server, io.clone(), ui.clone()),
+            transfers: Transfers::new(
+                opts.config.transfer.clone(),
+                opts.config.general.adb_server,
+                io.clone(),
+                ui.clone(),
+                journal,
+            ),
             io,
             ui,
             cfg: opts.config,
@@ -289,6 +354,19 @@ impl Manager {
             direct: (0..n).map(|_| None).collect(),
             direct_pending: vec![0; n as usize],
             direct_conn: 0,
+            adaptive: vec![Adaptive::default(); n as usize],
+            stream_rate: vec![None; n as usize],
+            video_bytes: vec![0; n as usize],
+            codecs_checked: vec![false; n as usize],
+            stream_codec: vec![VideoCodec::H264; n as usize],
+            logcat: (0..n).map(|_| None).collect(),
+            logcat_started: vec![None; n as usize],
+            perf: (0..n).map(|_| None).collect(),
+            perf_on: false,
+            test_app: tokio::sync::watch::channel(None).0,
+            run: None,
+            helper_apk: None,
+            helper_old: vec![None; n as usize],
         }
     }
 
@@ -306,6 +384,8 @@ impl Manager {
             tracing::warn!("{reason}");
             self.toast(Some(ErrorCode::ServerIncompatible), reason.clone());
         }
+        // Transfers left unfinished when the app last closed (spec §7.5).
+        self.transfers.restore(|id| self.slots.iter().find(|s| s.device_id() == Some(id)).map(|s| s.id));
         let _tracker = tokio::spawn(track_devices(self.adb.clone(), self.cfg.clone(), self.tx.clone()));
         let _discovery = (self.discovery && self.cfg.discovery.avahi).then(|| {
             let (rescan, rescan_rx) = mpsc::unbounded_channel();
@@ -319,6 +399,18 @@ impl Manager {
                 loop {
                     t.tick().await;
                     if tx.send(Msg::Prune).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let _adaptive = {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let mut t = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    t.tick().await;
+                    if tx.send(Msg::AdaptiveTick).is_err() {
                         return;
                     }
                 }
@@ -391,6 +483,19 @@ impl Manager {
                 _ => None,
             },
             stay_awake: self.stay_awake[i],
+            helper_update: match (self.helper_old[i], &self.helper_apk, &s.phase) {
+                (Some(old), Some((_, new)), Phase::Online { .. }) => Some(format!(
+                    "Wireless Debugging Keeper {} is on this phone; {} is available{}",
+                    helper_version_name(old),
+                    helper_version_name(*new),
+                    if s.transport == TransportKind::Direct {
+                        " (multi-touch, the phone's clipboard, app actions and graphs). The phone asks to confirm the install"
+                    } else {
+                        ""
+                    }
+                )),
+                _ => None,
+            },
             warning: match (&self.direct[i], &s.phase) {
                 (Some(l), Phase::Online { .. }) if !l.hello.input => Some(
                     "Touch control is off on the phone, so it only shows the screen. On the phone open Wireless Debugging Keeper, \
@@ -419,7 +524,14 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
             if !matches!(self.slots[i].phase, Phase::Online { .. }) {
                 self.stay_awake[i] = None;
                 self.helper_checked[i] = false;
+                self.adaptive[i].reset();
+                self.codecs_checked[i] = false;
+                self.helper_old[i] = None;
                 continue;
+            }
+            if !self.codecs_checked[i] {
+                self.codecs_checked[i] = true;
+                self.probe_codecs(i);
             }
             if self.stay_awake[i].is_none() && !self.stay_awake_busy[i] {
                 self.run_stay_awake(i, None);
@@ -427,6 +539,12 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
             if !self.helper_checked[i] {
                 self.helper_checked[i] = true;
                 self.setup_helper(i);
+                // Without ADB the helper said its version when it connected
+                // (0.5 and older did not say: 5).
+                if let Some(l) = &self.direct[i] {
+                    let v = if l.hello.version == 0 { 5 } else { l.hello.version };
+                    self.check_helper_version(i, v);
+                }
             }
         }
         for (i, s) in self.slots.iter().enumerate() {
@@ -454,6 +572,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 self.send(UiEvent::Slot(v));
             }
         }
+        self.reconcile_testing();
         let nearby = self.nearby_views();
         if nearby != self.last_nearby {
             self.last_nearby = nearby.clone();
@@ -589,12 +708,26 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                             tracing::warn!(slot, "{err}");
                             self.toast(None, err);
                         }
-                        let params = server_params(&self.cfg, &p, self.tile_px[i], None);
+                        let mut params = server_params(&self.cfg, &p, self.tile_px[i], None);
                         if profile == StreamProfile::Grid && matches!(p.max_size, ac_config::MaxSize::Auto(_)) {
                             self.auto_max_size[i] = Some(params.max_size);
                         }
+                        adapt(&self.cfg, &self.adaptive[i], &mut self.stream_rate[i], &self.io[i], profile, &p, &mut params);
+                        let codecs = record.map_or(&[][..], |r| r.supported_codecs.as_slice());
+                        params.codec = pick_codec(&p.codec, codecs, &env.media.probe);
+                        self.stream_codec[i] = params.codec;
+                        // Audio capture needs Android 11 (spec §4.1); older phones
+                        // are not asked, so they don't report a failure each time.
+                        params.audio &= self.slots[i].device.as_ref().is_some_and(|d| d.sdk >= 30);
+                        let audio = ac_audio::Options {
+                            node_name: format!("android-controller.slot{slot}"),
+                            description: self.views[i].as_ref().map_or_else(|| self.slots[i].display_name(), |v| v.title.clone()),
+                            volume: self.cfg.audio.volume,
+                            latency_frames: self.cfg.audio.pipewire_latency_frames,
+                            ..ac_audio::Options::default()
+                        };
                         let io = self.io[i].clone();
-                        let h = spawn_session(env.clone(), serial, shell_v2, params, slot, id, io, self.session_tx.clone());
+                        let h = spawn_session(env.clone(), serial, shell_v2, params, audio, slot, id, io, self.session_tx.clone());
                         self.sessions[i] = Some(h);
                     }
                     Err(reason) => {
@@ -708,10 +841,19 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 };
                 let record = self.devices.get(&device_id);
                 let (p, _) = resolve_profile(&self.cfg, *profile, record);
-                let params = server_params(&self.cfg, &p, self.tile_px[i], None);
+                let mut params = server_params(&self.cfg, &p, self.tile_px[i], None);
                 if *profile == StreamProfile::Grid && matches!(p.max_size, ac_config::MaxSize::Auto(_)) {
                     self.auto_max_size[i] = Some(params.max_size);
                 }
+                adapt(&self.cfg, &self.adaptive[i], &mut self.stream_rate[i], &self.io[i], *profile, &p, &mut params);
+                // Helper 0.6 encodes H.265 where the phone has the hardware;
+                // AV1 is never offered by it.
+                // devices.toml narrows it once a format failed on this phone.
+                let known = record.map_or(&[][..], |r| r.supported_codecs.as_slice());
+                let codecs: Vec<String> =
+                    link.hello.codecs.iter().filter(|c| *c != "av1" && (known.is_empty() || known.contains(c))).cloned().collect();
+                params.codec = pick_codec(&p.codec, &codecs, &media.probe);
+                self.stream_codec[i] = params.codec;
                 let env = DirectEnv { media, addr: link.addr, creds: self.keys.credentials(), device_id };
                 let h = spawn_direct_session(env, params, slot, *id, self.io[i].clone(), self.session_tx.clone());
                 self.sessions[i] = Some(h);
@@ -871,9 +1013,15 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
         }
         let shell_v2 = d.shell_v2();
         let title = if s.alias.is_empty() && !d.model.is_empty() { d.model.clone() } else { s.display_name() };
-        let adb = self.adb.clone();
+        let (adb, tx, slot, device_id) = (self.adb.clone(), self.tx.clone(), s.id, d.id.clone());
         self.spawn_msg(async move {
-            match adb.shell(&serial, HELPER_SETUP_CMD, shell_v2).await {
+            let out = adb.shell(&serial, HELPER_SETUP_CMD, shell_v2).await;
+            if let Ok(o) = &out
+                && let Some(v) = o.stdout.lines().find_map(|l| l.trim().strip_prefix("@versionCode=")?.parse().ok())
+            {
+                let _ = tx.send(Msg::HelperVersion { slot, device_id, version: v });
+            }
+            match out {
                 Ok(out) if out.stdout.lines().any(|l| l.trim() == "@granted") => {
                     tracing::info!("set up Wireless Debugging Keeper on {title}");
                     Msg::Toast(None, format!("Wireless Debugging Keeper is set up on {title}: wireless debugging now stays on"))
@@ -889,6 +1037,47 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             }
         });
+    }
+
+    /// The shipped helper APK on disk (written once) and its version code.
+    fn helper_apk(&mut self) -> Option<(PathBuf, u32)> {
+        if self.helper_apk.is_none() {
+            let dir = self.paths.as_ref().map_or_else(std::env::temp_dir, |p| p.state_dir.clone());
+            let path = dir.join("wireless-debugging-keeper.apk");
+            let fresh = std::fs::read(&path).is_ok_and(|b| b == HELPER_APK);
+            if !fresh && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, HELPER_APK)) {
+                tracing::warn!("writing {}: {e}", path.display());
+                return None;
+            }
+            match ac_transfer::apk::info(&path) {
+                Ok(info) => self.helper_apk = Some((path, info.version_code.unwrap_or(0) as u32)),
+                Err(e) => tracing::warn!("the shipped helper APK: {e}"),
+            }
+        }
+        self.helper_apk.clone()
+    }
+
+    fn check_helper_version(&mut self, i: usize, version: u32) {
+        let Some((_, shipped)) = self.helper_apk() else { return };
+        if version < shipped {
+            tracing::info!(slot = i + 1, version, shipped, "the phone's helper is older than the shipped one");
+            self.helper_old[i] = Some(version);
+        }
+    }
+
+    /// Installs the shipped helper on the phone (silently over ADB; without
+    /// ADB the phone asks its user).
+    fn update_helper(&mut self, slot: SlotId) {
+        let Some(i) = self.idx(slot) else { return };
+        let (Some((path, _)), Some(d)) = (self.helper_apk(), self.slots[i].device.as_ref()) else { return };
+        if !matches!(self.slots[i].phase, Phase::Online { .. }) {
+            return;
+        }
+        let title = self.title(i);
+        self.transfers.submit(slot, d.id.clone(), title, vec![path], true);
+        self.helper_old[i] = None;
+        // Check again once it has restarted.
+        self.helper_checked[i] = self.slots[i].transport == TransportKind::Direct;
     }
 
     /// Reads (`set = None`) or changes the phone's "keep screen on" state.
@@ -920,6 +1109,404 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
             };
             Msg::StayAwake { slot, device_id, on }
         });
+    }
+
+    /// Asks a newly seen phone which video encoders it has (spec §4.3),
+    /// once: the answer is kept in devices.toml.
+    fn probe_codecs(&self, i: usize) {
+        let s = &self.slots[i];
+        let (Ok(env), Some(serial), Some(d)) = (&self.stream_env, s.adb_serial.clone(), s.device.as_ref()) else { return };
+        if s.transport == TransportKind::Direct || self.devices.get(&d.id).is_some_and(|r| !r.supported_codecs.is_empty()) {
+            return;
+        }
+        let (env, slot, device_id, shell_v2) = (env.clone(), s.id, d.id.clone(), d.shell_v2());
+        self.spawn_msg(async move {
+            let codecs = ac_scrcpy::list_encoders(&env.adb, &serial, &env.server_jar, &env.server_version, shell_v2)
+                .await
+                .map(|list| hardware_codecs(&list))
+                .map_err(|e| format!("{e}{}", if e.server_output.is_empty() { String::new() } else { format!("\n{}", e.server_output) }));
+            Msg::Codecs { slot, device_id, codecs }
+        });
+    }
+
+    fn on_codecs(&mut self, slot: SlotId, device_id: &str, codecs: Result<Vec<String>, String>) {
+        match codecs {
+            Ok(codecs) => {
+                tracing::info!(slot, "{device_id} has hardware encoders for {}", codecs.join(", "));
+                if let Some(rec) = self.devices.get_mut(device_id) {
+                    rec.supported_codecs = codecs;
+                    self.save_devices();
+                }
+            }
+            Err(e) => tracing::warn!(slot, "listing {device_id}'s video encoders failed: {e}"),
+        }
+    }
+
+    /// An H.265/AV1 stream that never got going: forget that codec for this
+    /// phone, so the retry (and later sessions) use H.264.
+    fn check_codec_failure(&mut self, slot: SlotId, ev: &SlotEvent) {
+        let Some(i) = self.idx(slot) else { return };
+        let SlotEvent::StreamEnded { id, error: Some(error) } = ev else { return };
+        let codec = self.stream_codec[i];
+        if *id != self.slots[i].stream_id() || codec == VideoCodec::H264 || !matches!(self.slots[i].stream, StreamPhase::Starting { .. }) {
+            return;
+        }
+        self.stream_codec[i] = VideoCodec::H264;
+        let name = codec_name(codec);
+        let Some(rec) = self.slots[i].device_id().and_then(|id| self.devices.get_mut(id)) else { return };
+        if rec.supported_codecs.is_empty() {
+            // A phone without ADB: its helper's list was used.
+            rec.supported_codecs = vec!["h264".into(), codec.option().into()];
+        }
+        let before = rec.supported_codecs.len();
+        rec.supported_codecs.retain(|c| c != codec.option());
+        if rec.supported_codecs.len() != before {
+            let who = rec.display_name().to_owned();
+            tracing::warn!(slot, "{name} failed on {who} ({error}); using H.264 from now on");
+            self.save_devices();
+            self.toast(None, format!("{who}: {name} mirroring did not start, so it uses H.264 from now on"));
+        }
+    }
+
+    /// One second of lag samples for every live stream.
+    fn adaptive_tick(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.slots.len() {
+            let bytes = self.io[i].mailbox.stats.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let moved = bytes != std::mem::replace(&mut self.video_bytes[i], bytes);
+            let live = matches!(self.slots[i].phase, Phase::Online { .. }) && matches!(self.slots[i].stream, StreamPhase::Live { .. });
+            let (Some((base, profile)), true, true) = (self.stream_rate[i], live, self.cfg.video.adaptive_bitrate) else {
+                continue;
+            };
+            if !moved {
+                self.adaptive[i].idle();
+                continue;
+            }
+            let lag = self.io[i].mailbox.stats.lag_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let v = &self.cfg.video;
+            let grid = profile == StreamProfile::Grid;
+            if let Some(r) = self.adaptive[i].sample(lag, now, base, grid, v.lag_downgrade_ms, v.lag_upgrade_ms) {
+                let slot = self.slots[i].id;
+                tracing::info!(slot, lag, kbps = r.kbps, fps = r.fps, "adaptive bitrate: restarting the stream");
+                self.feed(slot, SlotEvent::RestartStream);
+            }
+        }
+    }
+
+    // ---- app testing (Milestone 5) ---------------------------------------------------
+
+    fn title(&self, i: usize) -> String {
+        self.views[i].as_ref().map_or_else(|| self.slots[i].display_name(), |v| v.title.clone())
+    }
+
+    /// `(serial, shell_v2, sdk)` of an online phone reached over ADB.
+    fn adb_target(&self, i: usize) -> Option<(String, bool, u32)> {
+        let s = &self.slots[i];
+        match (&s.phase, &s.adb_serial, &s.device) {
+            (Phase::Online { .. }, Some(serial), Some(d)) if s.transport != TransportKind::Direct => {
+                Some((serial.clone(), d.shell_v2(), d.sdk))
+            }
+            _ => None,
+        }
+    }
+
+    fn run_view(&self) -> RunView {
+        match &self.run {
+            Some(r) => RunView { active: true, name: r.name.clone(), dir: r.dir.clone(), crashes: r.crash_count() },
+            None => RunView { active: false, name: String::new(), dir: PathBuf::new(), crashes: 0 },
+        }
+    }
+
+    /// Starts and stops each slot's logcat stream and perf sampler to match
+    /// what is wanted: crash watching, a test run, the perf graphs. A phone
+    /// joining during a run gets its folder.
+    fn reconcile_testing(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.slots.len() {
+            let online = matches!(self.slots[i].phase, Phase::Online { .. });
+            if !online {
+                if self.io[i].mailbox.stop_recording() {
+                    tracing::info!(slot = i + 1, "phone gone: recording stopped");
+                }
+            } else if self.run.is_some() && self.views[i].is_some() {
+                let (title, logs) = (self.title(i), self.slots[i].transport != TransportKind::Direct);
+                if let Some(run) = &mut self.run
+                    && run.phones[i].is_none()
+                {
+                    run.phone(i, &title, logs);
+                }
+            }
+            let target = self.adb_target(i);
+            // Logcat: the full log into the run's folder, else crash lines only.
+            let file = self.run.as_ref().and_then(|r| r.phones[i].as_ref()).map(|p| p.dir.join("logcat.txt"));
+            let want_log = target.as_ref().filter(|_| self.cfg.testing.watch_crashes || file.is_some());
+            let keep = match (&self.logcat[i], want_log) {
+                (Some(t), Some((serial, ..))) => !t.task.is_finished() && t.serial == *serial && t.file == file,
+                _ => false,
+            };
+            if !keep {
+                if let Some(t) = self.logcat[i].take() {
+                    t.task.abort();
+                }
+                if let Some((serial, shell_v2, sdk)) = want_log
+                    && self.logcat_started[i].is_none_or(|t| now.duration_since(t) >= LOGCAT_RETRY)
+                {
+                    self.logcat_started[i] = Some(now);
+                    let (adb, slot, tx) = (self.adb.clone(), i as SlotId + 1, self.tx.clone());
+                    let (serial, shell_v2, sdk, f) = (serial.clone(), *shell_v2, *sdk, file.clone());
+                    let watched = serial.clone();
+                    let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+                    let task = tokio::spawn(async move {
+                        let forward = async {
+                            while let Some(ev) = log_rx.recv().await {
+                                if tx.send(Msg::Log(ev)).is_err() {
+                                    return;
+                                }
+                            }
+                        };
+                        tokio::join!(crate::logcat::run(adb, serial, shell_v2, sdk, slot, f, log_tx), forward);
+                    });
+                    self.logcat[i] = Some(LogTask { task, serial: watched, file });
+                }
+            }
+            // Perf sampler (ADB; the helper reports in its heartbeat).
+            let want_perf = target.filter(|_| self.perf_on || self.run.is_some());
+            let keep = matches!((&self.perf[i], &want_perf), (Some((t, s)), Some((serial, ..))) if !t.is_finished() && s == serial);
+            if !keep {
+                if let Some((t, _)) = self.perf[i].take() {
+                    t.abort();
+                }
+                if let Some((serial, shell_v2, _)) = want_perf {
+                    let every = Duration::from_millis(self.cfg.testing.perf_interval_ms.clamp(500, 60_000));
+                    let (adb, slot, tx, app) = (self.adb.clone(), i as SlotId + 1, self.tx.clone(), self.test_app.subscribe());
+                    let task = tokio::spawn(sample_perf(adb, serial.clone(), shell_v2, slot, every, app, tx));
+                    self.perf[i] = Some((task, serial));
+                }
+            }
+        }
+    }
+
+    fn on_log(&mut self, ev: LogEvent) {
+        let LogEvent::Crash(slot, crash) = ev else { return }; // an ended stream is restarted by reconcile
+        let Some(i) = self.idx(slot) else { return };
+        tracing::info!(slot, "{} in {}: {}", crash.kind.label(), crash.package, crash.summary);
+        if let Some(p) = self.run.as_mut().and_then(|r| r.phones[i].as_mut()) {
+            p.crashes.push(crash.clone());
+            append(&p.dir.join("crashes.txt"), &crash_entry(&crash));
+        }
+        if self.run.is_some() {
+            self.send(UiEvent::Run(self.run_view()));
+        }
+        self.send(UiEvent::Crash { slot, crash });
+    }
+
+    fn on_perf(&mut self, slot: SlotId, sample: PerfSample) {
+        let Some(i) = self.idx(slot) else { return };
+        if !matches!(self.slots[i].phase, Phase::Online { .. }) || !(self.perf_on || self.run.is_some()) {
+            return;
+        }
+        if let Some(p) = self.run.as_ref().and_then(|r| r.phones[i].as_ref()) {
+            let path = p.dir.join("stats.csv");
+            if !path.exists() {
+                append(&path, crate::perf::CSV_HEADER);
+            }
+            append(&path, &crate::perf::csv_row(&chrono::Local::now().format("%H:%M:%S").to_string(), &sample));
+        }
+        self.send(UiEvent::Perf { slot, sample });
+    }
+
+    fn start_run(&mut self, name: &str) {
+        if self.run.is_some() {
+            self.stop_run();
+        }
+        let root = output_root(&self.cfg.testing.output_dir);
+        match Run::new(&root, name, self.slots.len(), chrono::Local::now()) {
+            Ok(run) => {
+                tracing::info!("test run started in {}", run.dir.display());
+                self.run = Some(run);
+                // Phone folders, logcat files and samplers follow in reconcile.
+                self.send(UiEvent::Run(self.run_view()));
+            }
+            Err(e) => self.toast(None, format!("Could not create the test run folder in {}: {e}", root.display())),
+        }
+    }
+
+    fn stop_run(&mut self) {
+        let Some(run) = self.run.take() else { return };
+        let summary = run.summary(chrono::Local::now());
+        if let Err(e) = std::fs::write(run.dir.join("summary.txt"), &summary) {
+            tracing::warn!("writing summary.txt: {e}");
+        }
+        for i in 0..self.slots.len() {
+            if self.io[i].mailbox.is_recording() && run.phones[i].is_some() {
+                self.io[i].mailbox.stop_recording();
+            }
+        }
+        let n = run.crash_count();
+        let what = match n {
+            0 => "no crashes".to_owned(),
+            1 => "1 crash or ANR".to_owned(),
+            n => format!("{n} crashes or ANRs"),
+        };
+        self.send(UiEvent::Run(self.run_view()));
+        self.send(UiEvent::Saved { message: format!("Test run saved: {what}"), folder: run.dir });
+    }
+
+    /// Where a capture of slot `i` goes: its phone folder in the test run,
+    /// else `<root>/<what>`. Returns the folder and the file stem.
+    fn capture_target(&mut self, i: usize, what: &str, folder: &str) -> (PathBuf, String) {
+        let now = chrono::Local::now();
+        let title = self.title(i);
+        let logs = self.slots[i].transport != TransportKind::Direct;
+        match &mut self.run {
+            Some(run) => (run.phone(i, &title, logs).dir.clone(), capture_name(what, now, "x").trim_end_matches(".x").to_owned()),
+            None => {
+                let dir = output_root(&self.cfg.testing.output_dir).join(folder);
+                let _ = std::fs::create_dir_all(&dir);
+                (dir, capture_name(&crate::testing::safe_name(&title), now, "x").trim_end_matches(".x").to_owned())
+            }
+        }
+    }
+
+    fn screenshot(&mut self, slots: Vec<SlotId>) {
+        let mut jobs = Vec::new();
+        let mut folder = None;
+        for slot in slots {
+            let Some(i) = self.idx(slot) else { continue };
+            if !matches!(self.slots[i].phase, Phase::Online { .. }) {
+                continue;
+            }
+            let (dir, stem) = self.capture_target(i, "Screenshot", "Screenshots");
+            let path = unique(&dir, &stem, "png");
+            folder.get_or_insert(dir);
+            match self.adb_target(i) {
+                Some((serial, ..)) => jobs.push((self.title(i), serial, path)),
+                // No ADB: the window saves the mirror's frame.
+                None => self.send(UiEvent::SaveFrame { slot, path }),
+            }
+        }
+        let Some(mut folder) = folder else { return self.toast(None, "No connected phone to take a screenshot of") };
+        if let Some(run) = &self.run
+            && jobs.len() > 1
+        {
+            folder = run.dir.clone(); // one folder per phone in there
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let (adb, ui) = (self.adb.clone(), self.ui.clone());
+        tokio::spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            for (title, serial, path) in jobs {
+                let adb = adb.clone();
+                set.spawn(async move { (title, screencap(&adb, &serial, &path).await) });
+            }
+            let (mut ok, mut failed) = (0, Vec::new());
+            while let Some(Ok((title, r))) = set.join_next().await {
+                match r {
+                    Ok(()) => ok += 1,
+                    Err(e) => {
+                        tracing::warn!("screenshot of {title}: {e}");
+                        failed.push(title);
+                    }
+                }
+            }
+            if ok > 0 {
+                let message = if ok == 1 { "Screenshot saved".to_owned() } else { format!("{ok} screenshots saved") };
+                let _ = ui.try_send(UiEvent::Saved { message, folder });
+            }
+            if !failed.is_empty() {
+                let _ = ui.try_send(UiEvent::Toast { code: None, message: format!("No screenshot from {}", failed.join(", ")) });
+            }
+        });
+    }
+
+    fn record(&mut self, slots: Vec<SlotId>, on: bool) {
+        for slot in slots {
+            let Some(i) = self.idx(slot) else { continue };
+            if !on {
+                self.io[i].mailbox.stop_recording();
+                continue;
+            }
+            if self.io[i].mailbox.is_recording() || !matches!(self.slots[i].phase, Phase::Online { .. }) {
+                continue;
+            }
+            if !matches!(self.slots[i].stream, StreamPhase::Live { .. } | StreamPhase::Starting { .. }) {
+                self.toast(None, format!("{} is not mirroring, so there is nothing to record", self.title(i)));
+                continue;
+            }
+            let (dir, stem) = self.capture_target(i, "Recording", "Recordings");
+            let ui = self.ui.clone();
+            let on_done: ac_media::recorder::OnDone = Box::new(move |r| {
+                let _ = ui.try_send(UiEvent::Recording { slot, file: None });
+                let ev = match r {
+                    Ok(files) if files.is_empty() => UiEvent::Toast { code: None, message: "The recording is empty: no video arrived".into() },
+                    Ok(files) => UiEvent::Saved {
+                        message: if files.len() == 1 { "Recording saved".into() } else { format!("Recording saved in {} parts", files.len()) },
+                        folder: files[0].parent().map(PathBuf::from).unwrap_or_default(),
+                    },
+                    Err(e) => UiEvent::Toast { code: None, message: format!("Recording failed: {e}") },
+                };
+                let _ = ui.try_send(ev);
+            });
+            let path = dir.join(&stem);
+            match self.io[i].mailbox.start_recording(path.clone(), on_done) {
+                Ok(()) => {
+                    // A still screen sends nothing: ask for a key frame now so
+                    // the file starts at once (the decode loop asks again if
+                    // other frames come first).
+                    self.io[i].send(ac_scrcpy::ControlMsg::ResetVideo);
+                    self.send(UiEvent::Recording { slot, file: Some(path.with_extension("mp4")) });
+                }
+                Err(e) => self.toast(None, format!("Could not start recording: {e}")),
+            }
+        }
+    }
+
+    fn app_action(&mut self, slot: SlotId, action: AppAction) {
+        let Some(i) = self.idx(slot) else { return };
+        let kind = action.kind();
+        let reply = move |ok: bool, message: String| UiEvent::AppResult { slot, kind, ok, message };
+        if !matches!(self.slots[i].phase, Phase::Online { .. }) {
+            return self.send(reply(false, "Not connected".into()));
+        }
+        if let Some((serial, shell_v2, _)) = self.adb_target(i) {
+            let (adb, ui) = (self.adb.clone(), self.ui.clone());
+            tokio::spawn(async move {
+                let ev = match adb.shell(&serial, &app_cmd(&action), shell_v2).await {
+                    Ok(out) => match app_result(&action, &format!("{}{}", out.stdout, out.stderr)) {
+                        Ok(m) => reply(true, m),
+                        Err(m) => reply(false, m),
+                    },
+                    Err(e) => reply(false, e.to_string()),
+                };
+                let _ = ui.try_send(ev);
+            });
+            return;
+        }
+        match &self.direct[i] {
+            Some(l) if l.hello.version < ac_direct::HELPER_V6 => {
+                self.send(reply(false, "Update Wireless Debugging Keeper on this phone (0.6 or newer) for app actions".into()))
+            }
+            Some(l) => {
+                let _ = l.cmds.send(LinkCmd::App { action });
+            }
+            None => self.send(reply(false, "Not connected".into())),
+        }
+    }
+
+    fn list_packages(&mut self, slot: SlotId) {
+        let Some(i) = self.idx(slot) else { return };
+        if let Some((serial, shell_v2, _)) = self.adb_target(i) {
+            let (adb, ui) = (self.adb.clone(), self.ui.clone());
+            tokio::spawn(async move {
+                if let Ok(out) = adb.shell(&serial, "pm list packages -3", shell_v2).await {
+                    let _ = ui.try_send(UiEvent::Packages { slot, packages: parse_packages(&out.stdout) });
+                }
+            });
+        } else if let Some(l) = self.direct[i].as_ref().filter(|l| l.hello.version >= ac_direct::HELPER_V6) {
+            let _ = l.cmds.send(LinkCmd::Packages);
+        }
     }
 
     fn rescan(&self, kind: ServiceKind) {
@@ -1097,7 +1684,15 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                     self.save_devices();
                 }
             }
-            UiCommand::SetProfile { slot, profile } => self.feed(slot, SlotEvent::SetProfile(profile)),
+            UiCommand::SetProfile { slot, profile } => {
+                // Each profile starts from its own bitrate.
+                if let Some(i) = self.idx(slot)
+                    && self.slots[i].profile != profile
+                {
+                    self.adaptive[i].reset();
+                }
+                self.feed(slot, SlotEvent::SetProfile(profile));
+            }
             UiCommand::RestartStream { slot } => self.feed(slot, SlotEvent::RestartStream),
             UiCommand::SendFiles { slots, paths, install_apks } => {
                 for slot in slots {
@@ -1113,6 +1708,22 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                 }
             }
             UiCommand::CancelTransfers { slot } => self.transfers.cancel(slot),
+            UiCommand::UpdateConfig(cfg) => {
+                self.transfers.configure(cfg.transfer.clone());
+                // What the running tasks copied at start (ADB server, slot
+                // count, the device tracker) stays until the next launch.
+                let general = self.cfg.general.clone();
+                if cfg.testing.perf_interval_ms != self.cfg.testing.perf_interval_ms {
+                    // The samplers restart with the new interval.
+                    for p in &mut self.perf {
+                        if let Some((t, _)) = p.take() {
+                            t.abort();
+                        }
+                    }
+                }
+                self.cfg = *cfg;
+                self.cfg.general = general;
+            }
             UiCommand::SetStayAwake { slot, on } => {
                 if let Some(i) = self.idx(slot)
                     && matches!(self.slots[i].phase, Phase::Online { .. })
@@ -1120,6 +1731,22 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                     self.run_stay_awake(i, Some(on));
                 }
             }
+            UiCommand::AppAction { slots, action } => {
+                for slot in slots {
+                    self.app_action(slot, action.clone());
+                }
+            }
+            UiCommand::ListPackages { slot } => self.list_packages(slot),
+            UiCommand::SetTestApp { package } => {
+                let package = package.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty());
+                self.test_app.send_replace(package);
+            }
+            UiCommand::StartRun { name } => self.start_run(&name),
+            UiCommand::StopRun => self.stop_run(),
+            UiCommand::Screenshot { slots } => self.screenshot(slots),
+            UiCommand::Record { slots, on } => self.record(slots, on),
+            UiCommand::SetPerf { on } => self.perf_on = on,
+            UiCommand::UpdateHelper { slot } => self.update_helper(slot),
             UiCommand::SetTileSize { slot, px } => {
                 let Some(i) = self.idx(slot) else { return };
                 self.tile_px[i] = Some(px);
@@ -1163,8 +1790,12 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
             Msg::Ui(cmd) => self.on_ui(cmd),
             Msg::Slot(slot, SlotEvent::Identified(info)) => self.on_identified(slot, info),
             Msg::Slot(slot, ev) => self.feed(slot, ev),
-            Msg::Session(SessionMsg::Slot(slot, ev)) => self.feed(slot, ev),
+            Msg::Session(SessionMsg::Slot(slot, ev)) => {
+                self.check_codec_failure(slot, &ev);
+                self.feed(slot, ev);
+            }
             Msg::Session(SessionMsg::DeviceClipboard(slot, text)) => self.send(UiEvent::DeviceClipboard { slot, text }),
+            Msg::Session(SessionMsg::Notice(_, message)) => self.toast(None, message),
             Msg::ConnectResult(slot, r) => {
                 let ok = r.is_ok();
                 self.feed(slot, SlotEvent::ConnectDone(r));
@@ -1230,6 +1861,19 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                     self.feed(slot, SlotEvent::Connect { addr, transport, expect_serial: expect, silent: true });
                 }
             }
+            Msg::AdaptiveTick => self.adaptive_tick(),
+            Msg::Log(ev) => self.on_log(ev),
+            Msg::Perf { slot, sample } => self.on_perf(slot, sample),
+            Msg::DirectClip { slot, text } => self.send(UiEvent::DeviceClipboard { slot, text }),
+            Msg::Emit(ev) => self.send(ev),
+            Msg::HelperVersion { slot, device_id, version } => {
+                if let Some(i) = self.idx(slot)
+                    && self.slots[i].device_id() == Some(device_id.as_str())
+                {
+                    self.check_helper_version(i, version);
+                }
+            }
+            Msg::Codecs { slot, device_id, codecs } => self.on_codecs(slot, &device_id, codecs),
             Msg::DirectPaired { slot, addr, result } => self.on_direct_paired(slot, addr, result),
             Msg::DirectLinked { slot, conn, result } => self.on_direct_linked(slot, conn, result),
             Msg::DirectInput { slot, conn, on } => {
@@ -1419,6 +2063,50 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
 
 // ---- free functions running on worker tasks -------------------------------------------
 
+/// Version code 6 → `0.6`.
+fn helper_version_name(code: u32) -> String {
+    format!("0.{code}")
+}
+
+/// devices.toml `supported_codecs`: H.264 (always: it marks the list as
+/// probed) plus the codecs a hardware encoder handles.
+fn hardware_codecs(list: &[ac_scrcpy::Encoder]) -> Vec<String> {
+    let mut out = vec!["h264".to_owned()];
+    for c in [VideoCodec::H265, VideoCodec::Av1] {
+        if list.iter().any(|e| e.codec == c && e.hw) {
+            out.push(c.option().to_owned());
+        }
+    }
+    out
+}
+
+fn codec_name(c: VideoCodec) -> &'static str {
+    match c {
+        VideoCodec::H264 => "H.264",
+        VideoCodec::H265 => "H.265",
+        VideoCodec::Av1 => "AV1",
+    }
+}
+
+/// Launches with the adapted bitrate and frame rate, if the controller
+/// lowered them (spec §3.6), and remembers the profile's own values.
+fn adapt(
+    cfg: &Config,
+    a: &Adaptive,
+    rate: &mut Option<(Rate, StreamProfile)>,
+    io: &SlotIo,
+    profile: StreamProfile,
+    p: &ac_config::Profile,
+    params: &mut ac_scrcpy::ServerParams,
+) {
+    let base = Rate { kbps: p.bitrate_kbps, fps: p.max_fps };
+    *rate = Some((base, profile));
+    let r = if cfg.video.adaptive_bitrate { a.rate(base) } else { base };
+    params.bit_rate = r.kbps.saturating_mul(1000);
+    params.max_fps = r.fps;
+    io.set_reduced(r != base);
+}
+
 /// Shell command that reads (`None`) or sets "keep screen on". Prints `@on`
 /// when it is on afterwards, and always ends with `@ok`.
 fn stay_awake_cmd(set: Option<bool>) -> String {
@@ -1552,6 +2240,7 @@ async fn run_direct_link(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline = Duration::from_millis(cfg.heartbeat_timeout_ms);
     let mut input = link.hello.input;
+    let mut clip_seq = u64::MAX;
     loop {
         tokio::select! {
             _ = tick.tick() => match link.ping(deadline).await {
@@ -1571,6 +2260,27 @@ async fn run_direct_link(
                     };
                     if tx.send(Msg::Stats(slot, stats)).is_err() {
                         return;
+                    }
+                    if pong.clip_seq != clip_seq {
+                        // The first answer only tells where the count is.
+                        if clip_seq != u64::MAX
+                            && let Some(text) = pong.clip.clone()
+                        {
+                            let _ = tx.send(Msg::DirectClip { slot, text });
+                        }
+                        clip_seq = pong.clip_seq;
+                    }
+                    // Helper 0.6+ measures itself; the manager keeps it only
+                    // while the graphs or a test run want it.
+                    if pong.mem_total_mb.is_some() {
+                        let sample = PerfSample {
+                            cpu_pct: pong.cpu_pct,
+                            mem_used_mb: pong.mem_used_mb,
+                            mem_total_mb: pong.mem_total_mb,
+                            battery_temp_c: pong.battery_temp_c,
+                            ..PerfSample::default()
+                        };
+                        let _ = tx.send(Msg::Perf { slot, sample });
                     }
                 }
                 Err(e) => {
@@ -1592,10 +2302,109 @@ async fn run_direct_link(
                     };
                     let _ = tx.send(Msg::StayAwake { slot, device_id, on });
                 }
+                Some(LinkCmd::App { action }) => {
+                    let name = match &action {
+                        AppAction::Launch(_) => "launch",
+                        AppAction::Stop(_) => "stop",
+                        AppAction::ClearData(_) => "clear",
+                        AppAction::Uninstall(_) => "uninstall",
+                    };
+                    // Uninstalling waits for the user to confirm on the phone.
+                    let limit = if name == "uninstall" { Duration::from_secs(60) } else { deadline * 4 };
+                    let (ok, message) = match link.app(name, action.package(), limit).await {
+                        Ok(Ok(m)) => (true, m),
+                        Ok(Err(m)) => (false, m),
+                        Err(e) => {
+                            // A timed-out request leaves an answer in flight.
+                            let _ = tx.send(Msg::Emit(UiEvent::AppResult { slot, kind: action.kind(), ok: false, message: e.to_string() }));
+                            let _ = tx.send(Msg::DirectGone { slot, conn });
+                            return;
+                        }
+                    };
+                    let _ = tx.send(Msg::Emit(UiEvent::AppResult { slot, kind: action.kind(), ok, message }));
+                }
+                Some(LinkCmd::Packages) => match link.packages(deadline * 4).await {
+                    Ok(packages) => {
+                        let _ = tx.send(Msg::Emit(UiEvent::Packages { slot, packages }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(slot, "listing apps: {e}");
+                        let _ = tx.send(Msg::DirectGone { slot, conn });
+                        return;
+                    }
+                },
                 None => return,
             },
         }
     }
+}
+
+/// Samples a phone's performance every `every` until aborted.
+async fn sample_perf(
+    adb: AdbClient,
+    serial: String,
+    shell_v2: bool,
+    slot: SlotId,
+    every: Duration,
+    app: tokio::sync::watch::Receiver<Option<String>>,
+    tx: mpsc::UnboundedSender<Msg>,
+) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut state = PerfState::default();
+    let (mut top, mut layers) = (None, Vec::new());
+    for n in 0u32.. {
+        tick.tick().await;
+        if n % LAYERS_EVERY == 0
+            && let Ok(Ok(out)) = tokio::time::timeout(every * 2, adb.shell(&serial, LAYERS_CMD, shell_v2)).await
+        {
+            (top, layers) = parse_layers(&out.stdout);
+        }
+        // The test app's memory; without one, the app on screen's.
+        let want = app.borrow().clone().or_else(|| top.clone());
+        let cmd = sample_cmd(&layers, want.as_deref());
+        let Ok(Ok(out)) = tokio::time::timeout(every * 2, adb.shell(&serial, &cmd, shell_v2)).await else { continue };
+        let sample = parse_sample(&out.stdout, &mut state, want.as_deref());
+        if tx.send(Msg::Perf { slot, sample }).is_err() {
+            return;
+        }
+    }
+}
+
+/// Saves a full-resolution screenshot (PNG) from the phone.
+async fn screencap(adb: &AdbClient, serial: &str, path: &std::path::Path) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    let mut s = adb.open_service(serial, "exec:screencap -p").await.map_err(|e| e.to_string())?;
+    let mut png = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), s.read_to_end(&mut png))
+        .await
+        .map_err(|_| "timed out".to_owned())?
+        .map_err(|e| e.to_string())?;
+    if !png.starts_with(b"\x89PNG") {
+        let text = String::from_utf8_lossy(&png[..png.len().min(200)]).trim().to_owned();
+        return Err(if text.is_empty() { "the phone sent no image".into() } else { text });
+    }
+    tokio::fs::write(path, &png).await.map_err(|e| e.to_string())
+}
+
+/// Appends to a test run file (best effort: a full disk must not stop the run).
+fn append(path: &std::path::Path, text: &str) {
+    use std::io::Write;
+    let r = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(e) = r {
+        tracing::warn!("writing {}: {e}", path.display());
+    }
+}
+
+/// `dir/stem.ext`, or `dir/stem (2).ext` when that exists.
+fn unique(dir: &std::path::Path, stem: &str, ext: &str) -> PathBuf {
+    let mut p = dir.join(format!("{stem}.{ext}"));
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("{stem} ({n}).{ext}"));
+        n += 1;
+    }
+    p
 }
 
 /// Keeps a `host:track-devices-l` stream open, restarting the ADB server once
