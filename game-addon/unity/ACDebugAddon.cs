@@ -1,8 +1,8 @@
-// Android Controller debug add-on for Unity: protocol v1 (see ACaddon.md).
+// Test Bed Multi debug add-on for Unity: protocol v1 (see ACaddon.md).
 //
 // Drop this file anywhere under Assets/. In Development Builds (and the
 // Editor) it starts by itself and listens on 127.0.0.1:27191 on the phone;
-// Android Controller (and Claude through its MCP server) can then read the
+// Test Bed Multi (and Claude through its MCP server) can then read the
 // game's state and logs, see exceptions, and run the commands you register:
 //
 //     ACDebug.Command("give_coins", "Add coins", new[] { "amount:int" },

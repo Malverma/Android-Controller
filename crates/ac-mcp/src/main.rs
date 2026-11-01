@@ -1,12 +1,12 @@
-//! `android-controller-mcp`: an MCP server (stdio) that lets Claude drive the
-//! phones connected to a running Android Controller: see what is on screen,
+//! `test-bed-multi-mcp`: an MCP server (stdio) that lets Claude drive the
+//! phones connected to a running Test Bed Multi: see what is on screen,
 //! tap and type, install and launch apps, read crashes, logs and performance,
 //! and talk to games built with the debug add-on (ACaddon.md).
 //!
 //! It is a thin translator: every tool is a request on the app's automation
-//! socket (`$XDG_RUNTIME_DIR/android-controller/control.sock`, JSON lines).
+//! socket (`$XDG_RUNTIME_DIR/test-bed-multi/control.sock`, JSON lines).
 //! Cursor: `~/.cursor/mcp.json` →
-//! `{"mcpServers": {"android-controller": {"command": "android-controller-mcp"}}}`.
+//! `{"mcpServers": {"test-bed-multi": {"command": "test-bed-multi-mcp"}}}`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -24,7 +24,7 @@ const PROTOCOL: &str = "2025-06-18";
 const SHOT_MAX: u32 = 1024;
 
 const INSTRUCTIONS: &str = "\
-Android Controller drives the real Android phones connected to it on this PC.\n\
+Test Bed Multi drives the real Android phones connected to it on this PC.\n\
 - Start with `phones` to see which phones are connected and how (ADB or helper).\n\
 - Every tool takes `phone`: a name, slot number, or \"all\" (where it makes sense). Leave it out when only one phone is connected.\n\
 - To see the screen: `ui_tree` (fast, text, with tap centres) for normal apps; `screenshot` for games and anything drawn as pixels.\n\
@@ -76,7 +76,7 @@ fn handle(app: &App, msg: &Value) -> Option<Value> {
             Ok(json!({
                 "protocolVersion": asked,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "android-controller", "version": env!("CARGO_PKG_VERSION") },
+                "serverInfo": { "name": "test-bed-multi", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": INSTRUCTIONS,
             }))
         }
@@ -233,15 +233,16 @@ struct Conn {
 }
 
 fn socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("ANDROID_CONTROLLER_SOCKET") {
+    // The old name still works, so existing MCP configs keep connecting.
+    if let Some(p) = std::env::var_os("TEST_BED_MULTI_SOCKET").or_else(|| std::env::var_os("ANDROID_CONTROLLER_SOCKET")) {
         return p.into();
     }
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir).join("android-controller").join("control.sock"),
+        Some(dir) => PathBuf::from(dir).join("test-bed-multi").join("control.sock"),
         None => {
             // SAFETY: getuid has no failure mode.
             let uid = unsafe { getuid() };
-            PathBuf::from(format!("/tmp/android-controller-{uid}")).join("control.sock")
+            PathBuf::from(format!("/tmp/test-bed-multi-{uid}")).join("control.sock")
         }
     }
 }
@@ -259,7 +260,7 @@ impl App {
         let path = socket_path();
         let s = UnixStream::connect(&path).map_err(|e| {
             format!(
-                "Android Controller is not running, or automation is off (Preferences › Testing › Automation). ({}: {e})",
+                "Test Bed Multi is not running, or automation is off (Preferences › Testing › Automation). ({}: {e})",
                 path.display()
             )
         })?;
@@ -282,7 +283,7 @@ impl App {
             }
             a.store(false, Ordering::Relaxed);
             for (_, tx) in p.lock().unwrap().drain() {
-                let _ = tx.send(Err("Android Controller closed the connection".into()));
+                let _ = tx.send(Err("Test Bed Multi closed the connection".into()));
             }
         });
         *conn = Some(Conn { writer: s, pending, alive });
@@ -300,10 +301,10 @@ impl App {
             let line = json!({ "id": id, "method": method, "params": params }).to_string() + "\n";
             if let Err(e) = conn.writer.write_all(line.as_bytes()) {
                 conn.alive.store(false, Ordering::Relaxed);
-                return Err(format!("Android Controller went away: {e}"));
+                return Err(format!("Test Bed Multi went away: {e}"));
             }
         }
-        rx.recv_timeout(limit).map_err(|_| format!("no answer from Android Controller within {} s", limit.as_secs()))?
+        rx.recv_timeout(limit).map_err(|_| format!("no answer from Test Bed Multi within {} s", limit.as_secs()))?
     }
 }
 
@@ -361,7 +362,7 @@ fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "phones",
-            description: "List the phones in Android Controller: name, slot, connection (ADB or helper), Android version, screen size, mirroring, whether a game with the debug add-on is running, and the test run.",
+            description: "List the phones in Test Bed Multi: name, slot, connection (ADB or helper), Android version, screen size, mirroring, whether a game with the debug add-on is running, and the test run.",
             schema: json!({ "type": "object", "properties": {} }),
             request: pass!("phones"),
         },
@@ -633,7 +634,7 @@ mod tests {
             }
         });
         // SAFETY: tests in this binary that read the variable all agree on it.
-        unsafe { std::env::set_var("ANDROID_CONTROLLER_SOCKET", &path) };
+        unsafe { std::env::set_var("TEST_BED_MULTI_SOCKET", &path) };
         let app = App::default();
         let r = call_tool(&app, &json!({ "name": "tap", "arguments": { "x": 7, "y": 5 } }));
         assert_eq!(r["content"][0]["text"].as_str().unwrap().replace(char::is_whitespace, ""), r#"{"x":7,"y":5}"#);

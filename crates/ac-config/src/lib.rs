@@ -15,7 +15,9 @@ pub use devices::{DeviceRecord, Devices};
 pub use state::{AppState, BroadcastState, WindowState};
 pub use validate::{ValidationError, check_target_dir, validate};
 
-const APP_DIR: &str = "android-controller";
+const APP_DIR: &str = "test-bed-multi";
+/// The folder name before the app was renamed.
+const OLD_APP_DIR: &str = "android-controller";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -38,15 +40,20 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `$XDG_CONFIG_HOME/android-controller/*` and `$XDG_STATE_HOME/android-controller`.
+    /// `$XDG_CONFIG_HOME/test-bed-multi/*` and `$XDG_STATE_HOME/test-bed-multi`.
     pub fn xdg() -> Option<Self> {
         let base = directories::BaseDirs::new()?;
         let config_dir = base.config_dir().join(APP_DIR);
         let state_dir = base
             .state_dir()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| base.home_dir().join(".local/state"))
-            .join(APP_DIR);
+            .unwrap_or_else(|| base.home_dir().join(".local/state"));
+        let state_dir = state_dir.join(APP_DIR);
+        for dir in [&config_dir, &state_dir] {
+            if let Some(old) = dir.parent().map(|p| p.join(OLD_APP_DIR)) {
+                migrate_dir(&old, dir);
+            }
+        }
         Some(Self::in_dirs(&config_dir, &state_dir))
     }
 
@@ -58,6 +65,22 @@ impl Paths {
             state: state_dir.join("state.toml"),
         }
     }
+}
+
+/// Moves the folder from the old app name to the new one, once. Does nothing
+/// when the new folder exists, so old leftovers never overwrite newer settings.
+/// A failed move is logged and the app starts with defaults.
+pub fn migrate_dir(old: &Path, new: &Path) -> bool {
+    if new.exists() || !old.is_dir() {
+        return false;
+    }
+    let moved = new.parent().is_none_or(|p| fs::create_dir_all(p).is_ok()) && fs::rename(old, new).is_ok();
+    if moved {
+        tracing::info!("moved {} to {}", old.display(), new.display());
+    } else {
+        tracing::warn!("could not move {} to {}", old.display(), new.display());
+    }
+    moved
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {

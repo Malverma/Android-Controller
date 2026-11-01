@@ -112,7 +112,7 @@ final class Streamer {
                 realW = real.x;
                 realH = real.y;
                 if (vd == null) {
-                    vd = projection.createVirtualDisplay("android-controller", size[0], size[1], metrics.densityDpi,
+                    vd = projection.createVirtualDisplay("test-bed-multi", size[0], size[1], metrics.densityDpi,
                             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null);
                 } else {
                     vd.resize(size[0], size[1], metrics.densityDpi);

@@ -60,7 +60,7 @@ public final class MainActivity extends Activity {
 
         TextView about = new TextView(this);
         about.setText("Turns Android's Wireless debugging back on whenever Wi-Fi reconnects or the phone restarts, "
-                + "so Android Controller on your PC can reconnect by itself.");
+                + "so Test Bed Multi on your PC can reconnect by itself.");
         about.setPadding(0, dp(8), 0, dp(16));
         col.addView(about);
 
@@ -154,7 +154,7 @@ public final class MainActivity extends Activity {
         if (!Keeper.hasWirelessDebugging()) {
             s.append("This phone runs Android ").append(Build.VERSION.RELEASE)
                     .append(", which has no wireless debugging (it needs Android 11). Either connect it once by USB and use ")
-                    .append("\"Enable Wi-Fi ADB\" in Android Controller (this app then keeps Wi-Fi connected), or turn on ")
+                    .append("\"Enable Wi-Fi ADB\" in Test Bed Multi (this app then keeps Wi-Fi connected), or turn on ")
                     .append("\"PC connection without ADB\" below.\n\n");
         }
         s.append("Wireless debugging: ").append(Keeper.wirelessDebuggingOn(this) ? "on" : "off").append('\n');
@@ -168,7 +168,7 @@ public final class MainActivity extends Activity {
         battery.setVisibility(unrestricted ? View.GONE : View.VISIBLE);
         setup.setText(granted || !Keeper.hasWirelessDebugging() ? ""
                 : "One-time setup: connect the phone to the PC with USB debugging on, then run\n\n"
-                        + Keeper.GRANT_COMMAND + "\n\n(or android-helper/setup.sh from the Android Controller repository).");
+                        + Keeper.GRANT_COMMAND + "\n\n(or android-helper/setup.sh from the Test Bed Multi repository).");
         renderDirect();
     }
 
@@ -182,7 +182,7 @@ public final class MainActivity extends Activity {
         col.addView(head);
 
         TextView about = new TextView(this);
-        about.setText("For phones without wireless debugging (Android 10 and older) and no USB cable: Android Controller "
+        about.setText("For phones without wireless debugging (Android 10 and older) and no USB cable: Test Bed Multi "
                 + "mirrors and controls this phone over Wi-Fi through this app. Taps, swipes and typing go through "
                 + "Android's accessibility service. Phones with wireless debugging don't need this.");
         about.setTextSize(13);
@@ -270,7 +270,7 @@ public final class MainActivity extends Activity {
         String code = Direct.pairCode();
         if (on && code != null) {
             pairView.setText("Pairing code:  " + code.substring(0, 3) + " " + code.substring(3) + "\n"
-                    + "In Android Controller on the PC: Add Device › No ADB. Pick this phone (or type "
+                    + "In Test Bed Multi on the PC: Add Device › No ADB. Pick this phone (or type "
                     + (ip == null ? "its IP" : ip + ":" + Direct.PORT) + ") and enter the code. "
                     + Direct.pairSecondsLeft() + " s left.");
             pairView.setTextSize(17);

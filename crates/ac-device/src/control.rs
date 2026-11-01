@@ -1,6 +1,6 @@
-//! The automation socket: lets tools on this PC (the `android-controller-mcp`
+//! The automation socket: lets tools on this PC (the `test-bed-multi-mcp`
 //! server for Claude, scripts) drive the running app. A Unix socket under
-//! `$XDG_RUNTIME_DIR/android-controller/`, readable by this user only.
+//! `$XDG_RUNTIME_DIR/test-bed-multi/`, readable by this user only.
 //!
 //! Wire format: one JSON object per line.
 //! Request `{"id": 1, "method": "tap", "params": {...}}`, answer
@@ -24,15 +24,15 @@ pub struct ControlRequest {
     pub reply: oneshot::Sender<Result<Value, String>>,
 }
 
-/// `$XDG_RUNTIME_DIR/android-controller/control.sock`, else under /tmp
+/// `$XDG_RUNTIME_DIR/test-bed-multi/control.sock`, else under /tmp
 /// (per user).
 pub fn socket_path() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir).join("android-controller").join("control.sock"),
+        Some(dir) => PathBuf::from(dir).join("test-bed-multi").join("control.sock"),
         None => {
             // SAFETY: getuid has no failure mode.
             let uid = unsafe { libc_getuid() };
-            PathBuf::from(format!("/tmp/android-controller-{uid}")).join("control.sock")
+            PathBuf::from(format!("/tmp/test-bed-multi-{uid}")).join("control.sock")
         }
     }
 }
@@ -73,7 +73,7 @@ async fn bind(path: &Path) -> std::io::Result<UnixListener> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     if path.exists() {
         if UnixStream::connect(path).await.is_ok() {
-            return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "another Android Controller is running"));
+            return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "another Test Bed Multi is running"));
         }
         std::fs::remove_file(path)?; // left over from a crash
     }

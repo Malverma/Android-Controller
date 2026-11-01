@@ -42,7 +42,7 @@ pub enum Error {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
-    /// PipeWire `node.name`, e.g. `android-controller.slot2`.
+    /// PipeWire `node.name`, e.g. `test-bed-multi.slot2`.
     pub node_name: String,
     /// Shown in volume mixers: the phone's name.
     pub description: String,
@@ -56,7 +56,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            node_name: "android-controller".into(),
+            node_name: "test-bed-multi".into(),
             description: "Android phone".into(),
             volume: 1.0,
             latency_frames: 2048,
@@ -76,7 +76,7 @@ impl Options {
             .arg(format!("{:.3}", self.volume.clamp(0.0, 1.0)))
             .arg("--properties")
             .arg(format!(
-                "{{ node.name = \"{}\" node.description = \"{}\" application.name = \"Android Controller\" }}",
+                "{{ node.name = \"{}\" node.description = \"{}\" application.name = \"Test Bed Multi\" }}",
                 sanitize(&self.node_name),
                 sanitize(&self.description)
             ))
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn command_line() {
-        let o = Options { node_name: "android-controller.slot2".into(), description: "Moto \"g\"".into(), volume: 1.7, ..Options::default() };
+        let o = Options { node_name: "test-bed-multi.slot2".into(), description: "Moto \"g\"".into(), volume: 1.7, ..Options::default() };
         let c = o.command();
         let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(c.get_program(), "pw-cat");

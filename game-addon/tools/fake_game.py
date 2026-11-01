@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""A stand-in game speaking the Android Controller debug add-on protocol v1
+"""A stand-in game speaking the Test Bed Multi debug add-on protocol v1
 (ACaddon.md), for checking the PC side without a real game.
 
 Run it on the PC and route the phone's port to it:
     adb -s <phone> reverse tcp:27191 tcp:27191
     python3 game-addon/tools/fake_game.py
-Android Controller then sees a game on that phone (game_info, game_state,
+Test Bed Multi then sees a game on that phone (game_info, game_state,
 game_command, game_logs). Commands: give_coins {amount}, load_level {level},
 throw (reports an exception), echo {any}.
 """
@@ -113,7 +113,7 @@ def main():
     print(f"fake game add-on on 127.0.0.1:{PORT}", flush=True)
     while True:
         conn, _ = s.accept()
-        print("Android Controller connected", flush=True)
+        print("Test Bed Multi connected", flush=True)
         threading.Thread(target=serve, args=(conn,), daemon=True).start()
 
 

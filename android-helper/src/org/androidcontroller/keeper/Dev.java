@@ -35,7 +35,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Automation for Android Controller's test tools (Claude through the MCP
+ * Automation for Test Bed Multi's test tools (Claude through the MCP
  * server): the screen's elements in ~50 ms, taps and swipes, text, popups
  * and toasts as they appear, "Allow" on permission prompts, test settings.
  *

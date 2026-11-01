@@ -15,7 +15,7 @@ use crate::demux::VideoCodec;
 use crate::server::{DEVICE_JAR, ServerParams};
 
 /// Where [`list_encoders`] pushes its own copy of the server.
-const PROBE_JAR: &str = "/data/local/tmp/android-controller-probe.jar";
+const PROBE_JAR: &str = "/data/local/tmp/test-bed-multi-probe.jar";
 
 /// Mode for the pushed jar: regular file, 0644.
 const JAR_MODE: u32 = 0o100644;

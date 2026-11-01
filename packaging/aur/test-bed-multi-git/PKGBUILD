@@ -3,8 +3,8 @@
 # Publish: copy this folder into the AUR git repo, run
 #   makepkg --printsrcinfo > .SRCINFO
 # and push.
-pkgname=android-controller-git
-_pkgname=android-controller
+pkgname=test-bed-multi-git
+_pkgname=test-bed-multi
 pkgver=1.1.0
 pkgrel=1
 pkgdesc="Mirror, control and test apps on up to five Android phones over Wi-Fi (GTK4)"
@@ -15,12 +15,14 @@ depends=('gtk4' 'libadwaita' 'glib2' 'android-tools' 'scrcpy' 'avahi' 'dbus' 'ff
 makedepends=('cargo' 'git' 'clang')
 optdepends=('nss-mdns: resolve .local hostnames'
             'pipewire-audio: play the focused phone'\''s audio (pw-cat)'
+            'intel-media-driver: hardware video on Intel GPUs (Broadwell and newer)'
             'libva-intel-driver: hardware decoding on older Intel GPUs'
             'libva-mesa-driver: hardware decoding on AMD GPUs'
             'libva-nvidia-driver: hardware decoding on NVIDIA GPUs')
 provides=("$_pkgname")
-conflicts=("$_pkgname")
-install=android-controller.install
+conflicts=("$_pkgname" 'android-controller' 'android-controller-git')
+replaces=('android-controller-git')
+install=test-bed-multi.install
 options=('!lto' '!debug')
 source=("$_pkgname::git+$url.git")
 sha256sums=('SKIP')
@@ -44,20 +46,20 @@ prepare() {
 build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-  cargo build --frozen --release --package android-controller --package ac-mcp
+  cargo build --frozen --release --package test-bed-multi --package ac-mcp
 }
 
 check() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-  cargo test --frozen --release --workspace --exclude android-controller
+  cargo test --frozen --release --workspace --exclude test-bed-multi
 }
 
 package() {
   cd "$_pkgname"
-  local appid=org.androidcontroller.AndroidController
-  install -Dm755 target/release/android-controller "$pkgdir/usr/bin/android-controller"
-  install -Dm755 target/release/android-controller-mcp "$pkgdir/usr/bin/android-controller-mcp"
+  local appid=org.testbedmulti.TestBedMulti
+  install -Dm755 target/release/test-bed-multi "$pkgdir/usr/bin/test-bed-multi"
+  install -Dm755 target/release/test-bed-multi-mcp "$pkgdir/usr/bin/test-bed-multi-mcp"
   install -Dm644 "data/$appid.desktop" "$pkgdir/usr/share/applications/$appid.desktop"
   # The phone helper, for installing by hand (the app also offers it).
   install -Dm644 android-helper/dist/wireless-debugging-keeper.apk \

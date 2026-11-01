@@ -1,4 +1,4 @@
-# Android Controller
+# Test Bed Multi
 
 Native Arch Linux (GTK4 + libadwaita) app for viewing and controlling up to
 four Android phones over Wi-Fi (five with `max_slots = 5`). The full design is in [`spec.md`](spec.md).
@@ -59,7 +59,7 @@ Started in Milestone 4:
   accessibility service, and receives files and APKs. Pair it under
   **Add Device › No ADB** with the code the phone shows (`crates/ac-direct`).
 - **Transfers survive an app restart**: unfinished jobs are kept in
-  `~/.local/state/android-controller/transfers.json` (spec §7.5). On the next
+  `~/.local/state/test-bed-multi/transfers.json` (spec §7.5). On the next
   launch they wait for their phone and continue from the part already on
   it. A file that changed while the app was closed is skipped with a notice.
 - **Audio in focus view**: the focused phone's sound plays on the PC through
@@ -117,23 +117,23 @@ New in Milestone 6:
   - H.265 encoding.
 - **Helper updates**: the app carries the latest helper. A phone with an older
   one gets an *Update* button on its tile.
-- **AUR package**: [`packaging/aur/android-controller-git`](packaging/aur/android-controller-git/PKGBUILD).
+- **AUR package**: [`packaging/aur/test-bed-multi-git`](packaging/aur/test-bed-multi-git/PKGBUILD).
 
 New in 1.1 — **automation for Claude** (spec §9, Milestone 7):
 
 - **Control socket**: the app listens on
-  `$XDG_RUNTIME_DIR/android-controller/control.sock` (your user only) for
+  `$XDG_RUNTIME_DIR/test-bed-multi/control.sock` (your user only) for
   JSON-line requests: list phones, screenshot, tap/swipe/type/keys, read the
   screen's elements, install/launch/stop apps, crashes, logs, performance,
   test runs, recording and test settings. Preferences › Testing ›
   Automation turns it off. Clearing app data or uninstalling waits for you
   to allow it in the window, and the status bar shows when a client is
   connected.
-- **MCP server** `android-controller-mcp` (`crates/ac-mcp`): gives Claude in
+- **MCP server** `test-bed-multi-mcp` (`crates/ac-mcp`): gives Claude in
   Cursor (or Claude Code) these as tools. Add it to `~/.cursor/mcp.json`:
 
   ```json
-  {"mcpServers": {"android-controller": {"command": "android-controller-mcp"}}}
+  {"mcpServers": {"test-bed-multi": {"command": "test-bed-multi-mcp"}}}
   ```
 
   Then ask Claude to test your app on the phones. The app must be running.
@@ -158,7 +158,7 @@ Not run yet: the 2-hour, 5-phone soak test from spec §9.
 ```sh
 sudo pacman -S --needed rust gtk4 libadwaita android-tools scrcpy avahi pipewire-audio
 sudo systemctl enable --now avahi-daemon.service
-cargo run --release -p android-controller
+cargo run --release -p test-bed-multi
 ```
 
 On the phone: **Settings › Developer options › Wireless debugging**, then
@@ -176,7 +176,7 @@ cargo run -p ac-scrcpy --example encoders -- <serial>      # a phone's video enc
 cargo run -p ac-device --example testing_probe -- <serial> [pkg]  # perf, screenshot, crash parser
 cargo run -p ac-device --example testing_e2e -- <out-dir>  # a test run on every phone, headless
 cargo run -p ac-device --example automation_host -- $XDG_RUNTIME_DIR/ac-test/control.sock  # headless control socket
-ANDROID_CONTROLLER_SOCKET=$XDG_RUNTIME_DIR/ac-test/control.sock android-controller-mcp  # MCP against it
+TEST_BED_MULTI_SOCKET=$XDG_RUNTIME_DIR/ac-test/control.sock test-bed-multi-mcp  # MCP against it
 python3 game-addon/tools/fake_game.py   # a fake game add-on (with: adb reverse tcp:27191 tcp:27191)
 ```
 
@@ -192,7 +192,7 @@ python3 game-addon/tools/fake_game.py   # a fake game add-on (with: adb reverse 
 | `crates/ac-transfer` | Transfer planning: segments, conflict names, APK check, rate limit |
 | `crates/ac-direct` | PC side of the helper's no-ADB connection (pairing, stream, files)  |
 | `crates/ac-audio`  | Focus-view audio: raw PCM from scrcpy-server played via PipeWire    |
-| `crates/ac-mcp`    | `android-controller-mcp`: MCP server for Claude over the control socket |
+| `crates/ac-mcp`    | `test-bed-multi-mcp`: MCP server for Claude over the control socket |
 | `crates/adb-mock`  | Fake ADB server for integration tests                                |
 | `app`              | GTK4/libadwaita UI                                                   |
 
@@ -205,9 +205,9 @@ cd packaging/arch && makepkg -si   # builds the last committed revision
 From the AUR (builds the latest commit on GitHub):
 
 ```sh
-cd packaging/aur/android-controller-git && makepkg -si   # or: yay -S android-controller-git
+cd packaging/aur/test-bed-multi-git && makepkg -si   # or: yay -S test-bed-multi-git
 ```
 
 Both install the phone helper to
-`/usr/share/android-controller/wireless-debugging-keeper.apk`, and
-`android-controller-mcp`, as well.
+`/usr/share/test-bed-multi/wireless-debugging-keeper.apk`, and
+`test-bed-multi-mcp`, as well.

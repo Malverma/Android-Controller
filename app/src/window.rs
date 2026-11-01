@@ -198,7 +198,7 @@ pub fn build(
     let saved = restore.state.clone();
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Android Controller")
+        .title("Test Bed Multi")
         .default_width(saved.window.width)
         .default_height(saved.window.height)
         .build();
@@ -208,7 +208,7 @@ pub fn build(
     let toasts = adw::ToastOverlay::new();
 
     let header = adw::HeaderBar::new();
-    let window_title = adw::WindowTitle::new("Android Controller", "");
+    let window_title = adw::WindowTitle::new("Test Bed Multi", "");
     header.set_title_widget(Some(&window_title));
     let grid_button = gtk::Button::builder()
         .icon_name("view-grid-symbolic")
@@ -1596,7 +1596,7 @@ impl App {
         self.send(UiCommand::SetProfile { slot, profile: StreamProfile::Grid });
         self.views.set_visible_child_name("grid");
         self.grid_button.set_visible(false);
-        self.window_title.set_title("Android Controller");
+        self.window_title.set_title("Test Bed Multi");
         self.window_title.set_subtitle("");
         self.cards[slot as usize - 1].picture.grab_focus();
         self.pointer_in_mirror.set(false);

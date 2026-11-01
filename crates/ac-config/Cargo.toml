@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tracing.workspace = true
 ac-core.workspace = true
 serde.workspace = true
 toml.workspace = true

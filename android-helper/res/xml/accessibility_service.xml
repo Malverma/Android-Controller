@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Touch, keys and typing from Android Controller when the phone has no ADB, and the
+<!-- Touch, keys and typing from Test Bed Multi when the phone has no ADB, and the
      screen's elements, popups and toasts for its test automation (Dev.java). -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_description"

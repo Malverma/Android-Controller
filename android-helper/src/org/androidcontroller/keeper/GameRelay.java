@@ -18,7 +18,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Relays the in-game debug add-on (ACaddon.md in the Android Controller
+ * Relays the in-game debug add-on (ACaddon.md in the Test Bed Multi
  * repository) to a PC connected without ADB. A game built with the add-on
  * listens on 127.0.0.1:{@code port} (27191 by default) and speaks newline
  * JSON; this connects to it while a PC is linked, keeps what the game sends

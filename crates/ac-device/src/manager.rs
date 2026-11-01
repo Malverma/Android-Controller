@@ -42,7 +42,8 @@ const STAY_AWAKE_TIMEOUT: u32 = i32::MAX as u32;
 /// Finishes setting up the Wireless Debugging Keeper helper (android-helper/)
 /// on a phone that has it installed: the one permission it needs can only be
 /// granted over adb. Prints `@granted` when it did the setup now.
-const HELPER_SETUP_CMD: &str = "p=org.androidcontroller.keeper; \
+const HELPER_SETUP_CMD: &str = "rm -f /data/local/tmp/android-controller-server.jar /data/local/tmp/android-controller-probe.jar /data/local/tmp/android-controller-ui.xml; \
+p=org.androidcontroller.keeper; \
 pm path $p >/dev/null 2>&1 || { echo @none; exit 0; }; \
 echo @$(dumpsys package $p | grep -m 1 -o 'versionCode=[0-9]*'); \
 dumpsys package $p | grep -q 'WRITE_SECURE_SETTINGS: granted=true' && { echo @ready; exit 0; }; \
@@ -531,7 +532,7 @@ impl Manager {
             warning: match (&self.direct[i], &s.phase) {
                 (Some(l), Phase::Online { .. }) if !l.hello.input => Some(
                     "Touch control is off on the phone, so it only shows the screen. On the phone open Wireless Debugging Keeper, \
-tap “Turn on touch control” and switch on “Android Controller touch control”."
+tap “Turn on touch control” and switch on “Test Bed Multi touch control”."
                         .into(),
                 ),
                 _ => None,
@@ -752,7 +753,7 @@ tap “Turn on touch control” and switch on “Android Controller touch contro
                         // are not asked, so they don't report a failure each time.
                         params.audio &= self.slots[i].device.as_ref().is_some_and(|d| d.sdk >= 30);
                         let audio = ac_audio::Options {
-                            node_name: format!("android-controller.slot{slot}"),
+                            node_name: format!("test-bed-multi.slot{slot}"),
                             description: self.views[i].as_ref().map_or_else(|| self.slots[i].display_name(), |v| v.title.clone()),
                             volume: self.cfg.audio.volume,
                             latency_frames: self.cfg.audio.pipewire_latency_frames,

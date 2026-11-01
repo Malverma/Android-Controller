@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Android Controller debug add-on for native Android apps and games (Java
+ * Test Bed Multi debug add-on for native Android apps and games (Java
  * or Kotlin): protocol v1, see ACaddon.md.
  *
  * <pre>

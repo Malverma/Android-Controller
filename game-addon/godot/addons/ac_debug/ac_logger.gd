@@ -1,6 +1,6 @@
 extends Logger
 ## Godot 4.5+: forwards the engine's errors and warnings and GDScript runtime
-## errors (with backtraces) to Android Controller. ac_debug.gd loads this
+## errors (with backtraces) to Test Bed Multi. ac_debug.gd loads this
 ## only when the Logger class exists. Called from any thread: hands over
 ## with call_deferred, and never prints (that would log again).
 

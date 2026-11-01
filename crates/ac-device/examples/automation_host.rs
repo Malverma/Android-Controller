@@ -1,5 +1,5 @@
 //! Hosts the device manager without the UI and serves the automation socket
-//! at `<socket>`, for checking `android-controller-mcp` against real phones:
+//! at `<socket>`, for checking `test-bed-multi-mcp` against real phones:
 //! `automation_host <socket> [output-dir]`. Mirroring is off; confirmation
 //! requests are answered "no" (set `AC_CONFIRM=yes` to allow them).
 use ac_device::{ManagerOptions, UiCommand, UiEvent};

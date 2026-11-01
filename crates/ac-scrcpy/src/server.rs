@@ -4,7 +4,7 @@ use crate::demux::VideoCodec;
 
 /// Where the server jar is pushed. The server unlinks itself as soon as it
 /// starts (`CleanUp.unlinkSelf`), so it is pushed before every launch.
-pub const DEVICE_JAR: &str = "/data/local/tmp/android-controller-server.jar";
+pub const DEVICE_JAR: &str = "/data/local/tmp/test-bed-multi-server.jar";
 
 /// Parses the first line of `scrcpy --version`: `scrcpy 4.1 <https://…>`.
 pub fn parse_version(output: &str) -> Option<String> {
@@ -14,9 +14,10 @@ pub fn parse_version(output: &str) -> Option<String> {
     (ok && v.contains('.')).then(|| v.to_owned())
 }
 
-/// This client implements the 4.x wire protocol.
+/// This client implements the wire protocol of 4.x, which 5.x kept: between
+/// 4.1 and 5.0.1 the server changed only in audio and camera capture.
 pub fn is_compatible(version: &str) -> bool {
-    version.split('.').next() == Some("4")
+    matches!(version.split('.').next(), Some("4" | "5"))
 }
 
 /// Runs `scrcpy --version` (blocking; call from `spawn_blocking`).
@@ -137,6 +138,8 @@ mod tests {
         assert_eq!(parse_version("scrcpy v4 <x>"), None);
         assert_eq!(parse_version("hello"), None);
         assert!(is_compatible("4.1"));
+        assert!(is_compatible("5.0.1"));
+        assert!(!is_compatible("6.0"));
         assert!(!is_compatible("3.3.4"));
         assert!(!is_compatible("40.1"));
     }
@@ -146,7 +149,7 @@ mod tests {
         let p = ServerParams { scid: 0xabcd, codec_options: "a:int=1'b".into(), ..Default::default() };
         let cmd = p.command("4.1");
         assert!(cmd.starts_with(
-            "CLASSPATH=/data/local/tmp/android-controller-server.jar app_process / com.genymobile.scrcpy.Server '4.1' 'scid=0000abcd' 'log_level=info' 'tunnel_forward=true'"
+            "CLASSPATH=/data/local/tmp/test-bed-multi-server.jar app_process / com.genymobile.scrcpy.Server '4.1' 'scid=0000abcd' 'log_level=info' 'tunnel_forward=true'"
         ));
         assert!(cmd.contains(" 'video_codec_options=a:int=1'\\''b' "), "{cmd}");
         assert!(cmd.contains(" 'send_stream_meta=true' "));

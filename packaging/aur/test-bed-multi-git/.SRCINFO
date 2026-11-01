@@ -1,9 +1,9 @@
-pkgbase = android-controller-git
+pkgbase = test-bed-multi-git
 	pkgdesc = Mirror, control and test apps on up to five Android phones over Wi-Fi (GTK4)
 	pkgver = 1.0.0
 	pkgrel = 1
 	url = https://github.com/Malverma/Android-Controller
-	install = android-controller.install
+	install = test-bed-multi.install
 	arch = x86_64
 	arch = aarch64
 	license = Apache-2.0
@@ -25,11 +25,11 @@ pkgbase = android-controller-git
 	optdepends = libva-intel-driver: hardware decoding on older Intel GPUs
 	optdepends = libva-mesa-driver: hardware decoding on AMD GPUs
 	optdepends = libva-nvidia-driver: hardware decoding on NVIDIA GPUs
-	provides = android-controller
-	conflicts = android-controller
+	provides = test-bed-multi
+	conflicts = test-bed-multi
 	options = !lto
 	options = !debug
-	source = android-controller::git+https://github.com/Malverma/Android-Controller.git
+	source = test-bed-multi::git+https://github.com/Malverma/Android-Controller.git
 	sha256sums = SKIP
 
-pkgname = android-controller-git
+pkgname = test-bed-multi-git

@@ -1,5 +1,5 @@
 [package]
-name = "android-controller"
+name = "test-bed-multi"
 description = "Mirror and control up to four Android phones over Wi-Fi"
 version.workspace = true
 edition.workspace = true

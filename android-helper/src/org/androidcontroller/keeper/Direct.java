@@ -20,7 +20,7 @@ import java.util.Map;
 
 /**
  * Settings and shared state of the no-ADB PC connection ("direct mode"):
- * the phone runs a small server that Android Controller connects to over
+ * the phone runs a small server that Test Bed Multi connects to over
  * Wi-Fi, for phones that cannot use wireless debugging or adb tcpip.
  */
 final class Direct {

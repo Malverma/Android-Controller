@@ -1,5 +1,5 @@
 //! The automation API behind the control socket (`crate::control`): what
-//! each method does. Claude (through `android-controller-mcp`) and scripts
+//! each method does. Claude (through `test-bed-multi-mcp`) and scripts
 //! drive the phones with these.
 //!
 //! Every method takes `params.phone`: a slot number, a phone's name (or part
@@ -27,7 +27,7 @@ const DEV_SOCKET: &str = "localabstract:android-controller-dev";
 /// Output longer than this is cut (keeping the end) so answers stay readable.
 const MAX_OUTPUT: usize = 30_000;
 /// Where `uiautomator dump` writes the screen (ADB phones without the helper).
-const UIAUTOMATOR_XML: &str = "/data/local/tmp/android-controller-ui.xml";
+const UIAUTOMATOR_XML: &str = "/data/local/tmp/test-bed-multi-ui.xml";
 /// Destructive actions wait this long for the user's answer.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 /// `perf` keeps sampling this long after it was last asked.
@@ -513,7 +513,7 @@ impl Manager {
         let names = || online.iter().map(|&i| format!("{} ({})", self.title(i), i + 1)).collect::<Vec<_>>().join(", ");
         let picked: Vec<usize> = match p.get("phone") {
             None | Some(Value::Null) => match online.len() {
-                0 => return Err("No phone is connected to Android Controller".into()),
+                0 => return Err("No phone is connected to Test Bed Multi".into()),
                 1 => online.clone(),
                 _ => return Err(format!("Several phones are connected; say which (phone: name, slot number or \"all\"): {}", names())),
             },
@@ -529,7 +529,7 @@ impl Manager {
                     return Err("This works on one phone at a time: name one".into());
                 }
                 if online.is_empty() {
-                    return Err("No phone is connected to Android Controller".into());
+                    return Err("No phone is connected to Test Bed Multi".into());
                 }
                 online.clone()
             }

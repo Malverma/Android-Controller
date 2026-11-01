@@ -1,14 +1,14 @@
-# ACaddon: the Android Controller game debug add-on
+# ACaddon: the Test Bed Multi game debug add-on
 
 **Protocol version 1.** This file is for Claude (or a developer) adding the add-on to a game or app project. It is self-contained: read it all before implementing, then follow §7's checklist.
 
-The add-on is a small debug-only server inside the game. Android Controller (a Linux PC app that mirrors and controls Android phones) connects to it. Claude then talks to the game through Android Controller's MCP server (`android-controller-mcp`), using the tools `game_info`, `game_state`, `game_command` and `game_logs`. With it, Claude can test a game it is developing on real phones without guessing from pixels. It can:
+The add-on is a small debug-only server inside the game. Test Bed Multi (a Linux PC app that mirrors and controls Android phones) connects to it. Claude then talks to the game through Test Bed Multi's MCP server (`test-bed-multi-mcp`), using the tools `game_info`, `game_state`, `game_command` and `game_logs`. With it, Claude can test a game it is developing on real phones without guessing from pixels. It can:
 
 - read the game's real state (scene, level, player, score, currency…) instead of squinting at screenshots;
 - jump straight to what it wants to test (`load_level 7`, `give_coins 500`, `skip_tutorial`) instead of playing there by tapping;
 - see the game's own logs, and every exception with its stack trace, even ones that don't crash the game.
 
-The reference implementations are in the Android Controller repository, under `game-addon/`:
+The reference implementations are in the Test Bed Multi repository, under `game-addon/`:
 
 | Engine | Files | Status |
 |---|---|---|
@@ -18,7 +18,7 @@ The reference implementations are in the Android Controller repository, under `g
 | Anything else | implement §4 (an hour of work in most engines) | — |
 | Test double | `game-addon/tools/fake_game.py` | a fake game for checking the PC side |
 
-On the PC this was built on, the repository is at `~/Projects/Android Controller`. Upstream: https://github.com/Malverma/Android-Controller.
+On the PC this was built on, the repository is at `~/Projects/TestBedMulti`. Upstream: https://github.com/Malverma/Android-Controller.
 
 ---
 
@@ -28,7 +28,7 @@ On the PC this was built on, the repository is at `~/Projects/Android Controller
  Claude (Cursor / Claude Code)
    │  MCP tools: game_info, game_state, game_command, game_logs (+ tap, screenshot, crashes...)
    ▼
- android-controller-mcp ──► Android Controller (PC app; control socket)
+ test-bed-multi-mcp ──► Test Bed Multi (PC app; control socket)
                                │
                                ├─ phone with ADB:    adb "tcp:27191" stream ─────────┐
                                └─ phone without ADB: helper app relays on its link ──┤
@@ -36,9 +36,9 @@ On the PC this was built on, the repository is at `~/Projects/Android Controller
                                                      the game: 127.0.0.1:27191 (debug builds only)
 ```
 
-- The game is the **server**. It listens on **`127.0.0.1:27191`** on the phone. Android Controller is the client.
-- Android Controller checks every phone for the add-on about every 3 s and connects when the game runs. When the game closes, it reconnects next time the game starts. The game never needs to know the PC exists.
-- Over ADB, Android Controller opens the port through adb. Phones without ADB run the Wireless Debugging Keeper helper (0.7+), which connects locally and relays.
+- The game is the **server**. It listens on **`127.0.0.1:27191`** on the phone. Test Bed Multi is the client.
+- Test Bed Multi checks every phone for the add-on about every 3 s and connects when the game runs. When the game closes, it reconnects next time the game starts. The game never needs to know the PC exists.
+- Over ADB, Test Bed Multi opens the port through adb. Phones without ADB run the Wireless Debugging Keeper helper (0.7+), which connects locally and relays.
 
 ## 2. Rules (must)
 
@@ -47,7 +47,7 @@ On the PC this was built on, the repository is at `~/Projects/Android Controller
 3. **Never block the game.** Network I/O runs on background threads or non-blocking polling. Game work (state, commands) runs on the game's main thread, a few requests per frame at most.
 4. **No secrets.** The state, logs and events go to the PC unencrypted (inside adb or the helper's authenticated link). Do not include passwords, tokens or other players' personal data.
 5. **Survive anything from the socket.** Malformed JSON, unknown types, huge lines, a client vanishing mid-request: ignore or answer with an error, and never crash or stall the game.
-6. **Keep the protocol exact** (§4). Android Controller and Claude rely on the field names.
+6. **Keep the protocol exact** (§4). Test Bed Multi and Claude rely on the field names.
 
 ## 3. What to expose
 
@@ -82,7 +82,7 @@ The reference implementations already include engine-level built-ins: Unity has 
 
 ### Logs and events
 
-- Forward the engine's log lines with their level, and **every exception with its stack trace** (level `exception`). Android Controller shows exceptions as a crash badge on the phone's tile and lists them in `crashes`.
+- Forward the engine's log lines with their level, and **every exception with its stack trace** (level `exception`). Test Bed Multi shows exceptions as a crash badge on the phone's tile and lists them in `crashes`.
 - Send `event`s for game milestones: `level_started`, `level_complete`, `player_died`, `purchase`, `achievement`, `ad_shown`… Claude uses them to confirm that an action did what it should.
 
 ## 4. Protocol v1 reference
@@ -154,7 +154,7 @@ Rules for answering requests:
 
 - **Unknown `type` or command:** answer with `"ok": false` and an error that names the problem, e.g. `"unknown command fly (see game_info)"`.
 - **Bad arguments:** fail with a helpful message, like `"level must be 1-40"`. Don't guess.
-- **Timing:** Android Controller waits up to 10 s by default (Claude can raise it to 60 s). On phones without ADB the wait is capped at 10 s. Answer quickly. For a long command (loading a level), start it, answer `"loading"`, and let Claude poll `state` or wait for an `event`.
+- **Timing:** Test Bed Multi waits up to 10 s by default (Claude can raise it to 60 s). On phones without ADB the wait is capped at 10 s. Answer quickly. For a long command (loading a level), start it, answer `"loading"`, and let Claude poll `state` or wait for an `event`.
 
 ### Example session
 
@@ -254,7 +254,7 @@ Copy the reference implementations' behaviour: JSON-safe values, cut long text, 
 
 ## 6. Testing the add-on
 
-**Talk to it directly** (no Android Controller needed):
+**Talk to it directly** (no Test Bed Multi needed):
 
 ```bash
 adb forward tcp:27191 tcp:27191          # PC port → the phone's loopback port
@@ -268,9 +268,9 @@ EOF
 adb forward --remove tcp:27191
 ```
 
-If you test with `adb forward`, remove it afterwards; it does not block Android Controller, which opens its own stream.
+If you test with `adb forward`, remove it afterwards; it does not block Test Bed Multi, which opens its own stream.
 
-**Through Android Controller:** with the game running, the MCP tool `phones` shows `"game": {"game": ..., "version": ..., "engine": ...}` for that phone within about 3 s. Then check, in order:
+**Through Test Bed Multi:** with the game running, the MCP tool `phones` shows `"game": {"game": ..., "version": ..., "engine": ...}` for that phone within about 3 s. Then check, in order:
 
 1. `game_info`: the `hello` you sent, with all commands.
 2. `game_state`: your state.
@@ -293,14 +293,14 @@ If you test with `adb forward`, remove it afterwards; it does not block Android 
 - [ ] Commands cover getting anywhere quickly (levels, currency, unlocks, skip tutorial) and their arguments are validated.
 - [ ] State is small and answers "where am I and what matters now".
 - [ ] Android: `INTERNET` permission present.
-- [ ] Tested with §6 (direct, then through Android Controller).
+- [ ] Tested with §6 (direct, then through Test Bed Multi).
 
 ## 8. How Claude should use it while developing a game
 
-The tools come from `android-controller-mcp`. Cursor's `~/.cursor/mcp.json`:
+The tools come from `test-bed-multi-mcp`. Cursor's `~/.cursor/mcp.json`:
 
 ```json
-{"mcpServers": {"android-controller": {"command": "android-controller-mcp"}}}
+{"mcpServers": {"test-bed-multi": {"command": "test-bed-multi-mcp"}}}
 ```
 
 A good loop for testing a change:
@@ -316,12 +316,12 @@ A good loop for testing a change:
 
 | Symptom | Check |
 |---|---|
-| `phones` shows `"game": null` | Is it a debug or development build? Is the game in the foreground and past its first frame? Is the `INTERNET` permission present? Is another process holding port 27191 on the phone? Is Automation on in Android Controller (Preferences › Testing)? |
+| `phones` shows `"game": null` | Is it a debug or development build? Is the game in the foreground and past its first frame? Is the `INTERNET` permission present? Is another process holding port 27191 on the phone? Is Automation on in Test Bed Multi (Preferences › Testing)? |
 | `game_command` times out | The handler blocks the main thread, or the main thread is frozen. Answer fast, and do long work over several frames. |
 | No exceptions in `crashes` | Forward exceptions as `level: "exception"` (not `error`). The same message within 10 s counts once. |
-| Works over ADB, not on phones without ADB | The phone needs Wireless Debugging Keeper **0.7+**; Android Controller offers the update on the tile. |
+| Works over ADB, not on phones without ADB | The phone needs Wireless Debugging Keeper **0.7+**; Test Bed Multi offers the update on the tile. |
 | Garbled data | One JSON object per line, UTF-8, `\n` at the end; no pretty-printed JSON. |
 
 ## 10. Versioning
 
-This is **protocol 1**. Fields may be added without changing the number; both sides ignore unknown fields. A breaking change would bump `protocol` in `hello`, and Android Controller would keep speaking 1 to games that say 1. Note the protocol version in the game's code next to the add-on.
+This is **protocol 1**. Fields may be added without changing the number; both sides ignore unknown fields. A breaking change would bump `protocol` in `hello`, and Test Bed Multi would keep speaking 1 to games that say 1. Note the protocol version in the game's code next to the add-on.

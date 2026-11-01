@@ -337,7 +337,7 @@ impl Default for Audio {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Testing {
-    /// Test runs, screenshots and recordings; empty = `~/Documents/Android Controller`.
+    /// Test runs, screenshots and recordings; empty = `~/Documents/Test Bed Multi`.
     pub output_dir: String,
     /// Watch each phone's log for crashes and ANRs (a red badge on the tile).
     pub watch_crashes: bool,
@@ -351,11 +351,11 @@ impl Default for Testing {
     }
 }
 
-/// The automation socket for Claude (`android-controller-mcp`) and scripts.
+/// The automation socket for Claude (`test-bed-multi-mcp`) and scripts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Automation {
-    /// Listen on `$XDG_RUNTIME_DIR/android-controller/control.sock` (this user only).
+    /// Listen on `$XDG_RUNTIME_DIR/test-bed-multi/control.sock` (this user only).
     pub enabled: bool,
     /// Ask in the window before an automated "clear data" or "uninstall".
     pub confirm_destructive: bool,

@@ -500,7 +500,7 @@ public final class InputService extends AccessibilityService {
         main.post(() -> {
             ClipboardManager cm = getSystemService(ClipboardManager.class);
             Clip.fromPc(text);
-            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Android Controller", text));
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Test Bed Multi", text));
             if (paste) {
                 AccessibilityNodeInfo n = focused();
                 if (n != null) n.performAction(AccessibilityNodeInfo.ACTION_PASTE);

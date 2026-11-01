@@ -1,7 +1,7 @@
 # Wireless Debugging Keeper (Android helper)
 
 A small app for the phones (Android 6+) that keeps **Wireless debugging**
-on (Android 11+), so Android Controller can reconnect by itself, and that
+on (Android 11+), so Test Bed Multi can reconnect by itself, and that
 lets phones **without** wireless debugging connect without ADB at all:
 
 - Android turns wireless debugging off whenever Wi-Fi drops and after a
@@ -27,8 +27,8 @@ lets phones **without** wireless debugging connect without ADB at all:
    older than Android 6, or the download is incomplete: delete it from
    Downloads and download it again.
 2. Turn on **Developer options › Wireless debugging** and pair the phone in
-   Android Controller (**Add Device**). Tick **Always allow on this network**.
-3. That's it: when the phone connects, Android Controller grants the
+   Test Bed Multi (**Add Device**). Tick **Always allow on this network**.
+3. That's it: when the phone connects, Test Bed Multi grants the
    helper its permission and starts it, and shows a toast. Until then the
    helper's notification says it needs setup from the PC.
 
@@ -40,9 +40,9 @@ connection itself:
 
 1. Install the app from the link above and open it.
 2. Switch on **Allow PC connection without ADB** and allow storing files.
-3. Tap **Turn on touch control** and enable *Android Controller touch
+3. Tap **Turn on touch control** and enable *Test Bed Multi touch
    control* under Accessibility (without it the PC can only watch).
-4. Tap **Pair with PC**. In Android Controller open **Add Device › No ADB**,
+4. Tap **Pair with PC**. In Test Bed Multi open **Add Device › No ADB**,
    pick the phone (or type the IP shown on the phone) and enter the 6-digit
    code.
 5. The first time the PC mirrors, Android asks to start capturing: tap
@@ -70,7 +70,7 @@ connection). The video and input are not encrypted on the network, like
 minutes. **Forget paired PCs** in the app revokes them.
 
 The helper listens on TCP port 27190 and announces `_acdirect._tcp` over
-mDNS. Keys on the PC are in `~/.config/android-controller/direct-keys.toml`.
+mDNS. Keys on the PC are in `~/.config/test-bed-multi/direct-keys.toml`.
 
 ## Install from the PC
 

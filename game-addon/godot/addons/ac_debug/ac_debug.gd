@@ -1,9 +1,9 @@
 extends Node
-## Android Controller debug add-on for Godot 4: protocol v1 (see ACaddon.md).
+## Test Bed Multi debug add-on for Godot 4: protocol v1 (see ACaddon.md).
 ##
 ## Add this script as an autoload named "ACDebug" (Project › Project Settings ›
 ## Globals › Autoload). In debug builds it listens on 127.0.0.1:27191 on the
-## phone; Android Controller (and Claude through its MCP server) can then read
+## phone; Test Bed Multi (and Claude through its MCP server) can then read
 ## the game's state and logs and run the commands you register:
 ##
 ##     ACDebug.command("give_coins", "Add coins", {"amount": "int"}, func(args):
@@ -112,7 +112,7 @@ func _hello() -> Dictionary:
 		"game": str(ProjectSettings.get_setting("application/config/name", "Godot game")),
 		"version": str(ProjectSettings.get_setting("application/config/version", "")),
 		"engine": "Godot " + Engine.get_version_info()["string"],
-		"package": "", # Android Controller fills in the app from the phone when empty
+		"package": "", # Test Bed Multi fills in the app from the phone when empty
 		"commands": list,
 	}
 

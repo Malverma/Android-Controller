@@ -241,7 +241,7 @@ final class Receiver {
         Notification n = new Notification.Builder(c, DirectService.CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .setContentTitle("Install " + name + "?")
-                .setContentText("Sent from Android Controller. Tap to install.")
+                .setContentText("Sent from Test Bed Multi. Tap to install.")
                 .setContentIntent(open)
                 .setAutoCancel(true)
                 .build();

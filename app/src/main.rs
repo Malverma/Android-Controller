@@ -18,7 +18,7 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing_subscriber::EnvFilter;
 
-const APP_ID: &str = "org.androidcontroller.AndroidController";
+const APP_ID: &str = "org.testbedmulti.TestBedMulti";
 
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()

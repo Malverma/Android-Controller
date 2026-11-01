@@ -181,8 +181,32 @@ fn devices_round_trip_and_normalize() {
 }
 
 #[test]
+fn old_folder_moves_once_and_never_overwrites() {
+    let tmp = std::env::temp_dir().join(format!("tbm-migrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (old, new) = (tmp.join("android-controller"), tmp.join("test-bed-multi"));
+
+    // Nothing to move.
+    assert!(!ac_config::migrate_dir(&old, &new));
+    assert!(!new.exists());
+
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("devices.toml"), "saved").unwrap();
+    assert!(ac_config::migrate_dir(&old, &new));
+    assert_eq!(std::fs::read_to_string(new.join("devices.toml")).unwrap(), "saved");
+    assert!(!old.exists());
+
+    // A leftover old folder must not replace the new one.
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("devices.toml"), "stale").unwrap();
+    assert!(!ac_config::migrate_dir(&old, &new));
+    assert_eq!(std::fs::read_to_string(new.join("devices.toml")).unwrap(), "saved");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
 fn missing_files_give_defaults() {
-    let dir = Path::new("/nonexistent/android-controller");
+    let dir = Path::new("/nonexistent/test-bed-multi");
     assert_eq!(load_config(&dir.join("config.toml")).unwrap(), Config::default());
     assert!(load_devices(&dir.join("devices.toml")).unwrap().devices.is_empty());
 }
