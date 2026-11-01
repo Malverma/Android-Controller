@@ -9,7 +9,10 @@ covers three changes:
    the Arch Linux PC.
 
 [`spec.md`](spec.md) stays the reference for everything not changed here.
-Section numbers such as "§3.5" refer to it. Nothing here has been built yet.
+Section numbers such as "§3.5" refer to it.
+
+**Status (2026-11-01):** M8 to M11 are built and pass their tests, except as listed
+in §10. M12's phone measurements and the GitHub and AUR rename are not done.
 
 ## 1. What was found
 
@@ -513,3 +516,46 @@ Say so if any of these is wrong. Each is cheaper to change before M9.
 | Network search | Active scan of the local subnet, only on click | mDNS only, which fails on routers that filter multicast |
 | Android package ID | Stays `org.androidcontroller.keeper` | Change it, and reinstall on every phone |
 | Version number | 2.0.0, because of the rename and new config paths | 1.2.0 |
+
+## 10. What changed while building, and what is still open
+
+**Changes from this plan**
+
+| Plan | Built | Why |
+|---|---|---|
+| Port the encoder to `ffmpeg-sys-next` (§5.4) | Uses `ffmpeg-next`, which sits on the same `ffmpeg-sys-next` | One copy of FFmpeg is linked either way, and the port would add only risk |
+| Direct path with AES-GCM (§5.5) | **Not built.** A phone on the no-ADB connection is told monitor mode needs wireless debugging | Touch must never travel unencrypted, and refusing is the safe state until the encrypted path exists |
+| `monitor_orientation` in `devices.toml` (§5.8) | `monitor_portrait`, plus a tile toggle | Two states only; hand edits would be overwritten while the app runs |
+| Short GOP (§5.3) | A keyframe every 2 s, each carrying SPS and PPS | The phone's decoder joins at any keyframe |
+| `monitor_start`, `monitor_stop` (§5.5) | `start`, `stop`, and separate `control` and `video` connections | Video never delays touch or control |
+| Reuse `adaptive.rs` (§5.3) | `RateControl` in `ac-monitor`: drops above 10% step the bitrate down, 20 clean seconds step it up | The monitor's signal is its own send queue, not the scrcpy stream |
+| `MonitorActivity` private | Exported, limited to the shell by the `DUMP` permission | `am start` over ADB needs it to be exported; other apps still cannot open it |
+
+**Not verified yet, because this PC has no phone, Android SDK or `adb`**
+
+- The helper's Java only compiles against the Android API. It has never run, and
+  `android-helper/dist` still holds **0.7**, so monitor mode is blocked with a clear
+  reason on every phone until 0.8 is built and installed.
+- Decoding, touch, drop handling and latency on a real phone, and all of §7 M12.
+- The UI changes have been compiled but not looked at.
+- `tests/monitor.rs` runs the real manager and framing against a stand-in for the
+  helper. It does not prove the Java agrees, beyond reading both sides.
+
+**Not verified yet on this PC**
+
+- `zwlr_virtual_pointer_v1` output mapping: the one run happened over a fullscreen
+  game holding the pointer, so its result means nothing. Run `monitor_probe` with
+  nothing fullscreen.
+- Capture and encode throughput at 60 fps, and VA-API, which needs
+  `intel-media-driver`.
+
+**Test reliability:** all tests pass in normal runs. With 12 copies of the manager
+tests at once, one run of 36 copies had failures in three Reconnect tests. It did not
+happen again in 60 further copies, and the cause was not found. The tests use short
+search deadlines, so timing is the likely reason, but that is unproven.
+
+**Limits to expect**
+
+- While an app elsewhere has locked or confined the pointer, such as a fullscreen
+  game, touches on the phone cannot move it to the phone's monitor.
+- Removing an output can move the pointer: Hyprland decides where it goes.

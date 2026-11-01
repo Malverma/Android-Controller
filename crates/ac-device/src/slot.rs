@@ -250,6 +250,9 @@ pub struct Slot {
     pub stream_enabled: bool,
     pub stream: StreamPhase,
     pub profile: StreamProfile,
+    /// What the Reconnect button learned while a connection attempt was still
+    /// running. It says more than that attempt's own failure will.
+    search_message: Option<String>,
     /// The user wants this phone as a monitor. Lasts for the app session only.
     pub display_desired: bool,
     pub display: DisplayPhase,
@@ -278,6 +281,7 @@ impl Slot {
             stream_enabled: false,
             stream: StreamPhase::Off,
             profile: StreamProfile::Grid,
+            search_message: None,
             display_desired: false,
             display: DisplayPhase::Off,
             display_id: 0,
@@ -650,7 +654,8 @@ impl Slot {
             {
                 if now.duration_since(since) >= Duration::from_secs(cfg.reconnect_give_up_after_s) {
                     let name = self.display_name();
-                    return self.fail_to_disconnected(ErrorCode::ReconnectGaveUp, format!("{name} is offline"), true);
+                    let message = self.search_message.take().unwrap_or_else(|| format!("{name} is offline"));
+                    return self.fail_to_disconnected(ErrorCode::ReconnectGaveUp, message, true);
                 }
                 let attempt = attempt + 1;
                 self.phase = P::Reconnecting { attempt, since, cause };
@@ -829,6 +834,10 @@ impl Slot {
                 self.phase = P::Disconnected { error: Some(message) };
                 Vec::new()
             }
+            (P::ConnectingAdb { .. } | P::Reconnecting { .. }, E::SearchFailed(message)) => {
+                self.search_message = Some(message);
+                Vec::new()
+            }
 
             // ---- teardown ----------------------------------------------------------
             (P::Empty, E::Disconnect | E::Forget) => Vec::new(),
@@ -871,7 +880,8 @@ impl Slot {
         if attempt >= MAX_CONNECT_ATTEMPTS {
             let addr = self.addr.clone().unwrap_or_default();
             let mut fx: Vec<Effect> = self.disconnect_effect().into_iter().collect();
-            fx.extend(self.fail_to_disconnected(ErrorCode::ConnectFailed, format!("Could not connect to {addr}: {msg}"), !silent));
+            let message = self.search_message.take().unwrap_or_else(|| format!("Could not connect to {addr}: {msg}"));
+            fx.extend(self.fail_to_disconnected(ErrorCode::ConnectFailed, message, !silent));
             return fx;
         }
         self.identify_inflight = false;
@@ -900,6 +910,7 @@ impl Slot {
         }
         let serial = self.adb_serial.clone().or_else(|| self.addr.clone()).unwrap_or_default();
         let shell_v2 = info.shell_v2();
+        self.search_message = None;
         self.known_id = Some(info.id.clone());
         self.expect_serial = Some(info.id.clone());
         self.device = Some(info);

@@ -3,7 +3,32 @@
 Native Arch Linux (GTK4 + libadwaita) app for viewing and controlling up to
 four Android phones over Wi-Fi (five with `max_slots = 5`). The full design is in [`spec.md`](spec.md).
 
-## Status: v1.1 — Milestones 1–7 built
+## Status: v2.0 — Test Bed Multi
+
+New in 2.0 ([`spec2.md`](spec2.md)):
+
+- **Reconnect** (toolbar button, Ctrl+R): finds every saved phone again after its
+  address changed, with no re-pairing. It asks mDNS, adb and the ARP table, then
+  sweeps your local network, and checks each phone's identity before accepting it.
+  A phone it cannot bring back says why on its tile.
+- **Monitor mode** (the display button on a tile, or *Use as PC monitor* in the
+  phone's helper): the phone becomes an extra Hyprland monitor. Tap to click, drag,
+  hold to right-click, two fingers to scroll; three fingers on the phone shows
+  **Exit**. If the phone drops, windows stay on its monitor for 30 s, and the picture
+  returns when it does.
+  - Needs Hyprland, Wireless Debugging Keeper 0.8 on the phone, and an ADB
+    connection. Connections without ADB are refused because they are not encrypted.
+  - On `adb tcpip`, which is also unencrypted, touch is off until you turn it on.
+  - Anyone holding the phone sees that monitor. The status bar names every phone
+    that can control the pointer.
+  - Settings are in `[monitor]` in `config.toml`. On Intel graphics, install
+    `intel-media-driver`, or encoding runs on the CPU.
+  - **Not yet tested on a real phone.** See [`spec2.md` §10](spec2.md).
+- `monitor_probe` tests this PC's half without a phone (it adds a monitor and takes
+  over the pointer briefly, and refuses to run over a fullscreen app):
+  `cargo run --release -p ac-monitor --example monitor_probe`
+
+Settings move from `android-controller` to `test-bed-multi` automatically on first start.
 
 Working (Milestones 1–2):
 

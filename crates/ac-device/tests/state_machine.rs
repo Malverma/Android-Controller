@@ -795,3 +795,38 @@ fn an_unknown_phone_cannot_be_asked_to_be_a_monitor() {
     assert!(ev(&mut s, SlotEvent::SetDisplay { on: true }).is_empty());
     assert!(!s.display_desired);
 }
+
+// ---- the Reconnect button's advice ---------------------------------------------
+
+#[test]
+fn search_advice_outlives_a_connection_attempt_still_running() {
+    let mut s = Slot::restored(1, "SER1", TransportKind::Tls, Some("192.168.0.84:37000".into()), None);
+    ev(&mut s, SlotEvent::Connect { addr: "192.168.0.84:37000".into(), transport: TransportKind::Tls, expect_serial: None, silent: true });
+    ev(&mut s, SlotEvent::SearchFailed("turn on Wireless debugging".into()));
+    assert!(matches!(s.phase, Phase::ConnectingAdb { .. }), "the attempt carries on");
+    for _ in 0..MAX_CONNECT_ATTEMPTS {
+        let fx = ev(&mut s, SlotEvent::ConnectDone(Err("refused".into())));
+        if !fx.is_empty() && matches!(s.phase, Phase::ConnectingAdb { .. }) {
+            fire(&mut s, &fx);
+        }
+    }
+    assert_eq!(s.phase, Phase::Disconnected { error: Some("turn on Wireless debugging".into()) });
+}
+
+#[test]
+fn search_advice_is_dropped_when_the_phone_connects_after_all() {
+    let mut s = online_slot();
+    ev(&mut s, SlotEvent::AdbGone { serial: "192.168.1.42:37115".into() });
+    ev(&mut s, SlotEvent::SearchFailed("old advice".into()));
+    ev(&mut s, SlotEvent::Identified(info("SER1")));
+    ev(&mut s, SlotEvent::Disconnect);
+    ev(&mut s, SlotEvent::Connect { addr: "192.168.1.42:37115".into(), transport: TransportKind::Tls, expect_serial: None, silent: true });
+    for _ in 0..MAX_CONNECT_ATTEMPTS {
+        let fx = ev(&mut s, SlotEvent::ConnectDone(Err("refused".into())));
+        if !fx.is_empty() && matches!(s.phase, Phase::ConnectingAdb { .. }) {
+            fire(&mut s, &fx);
+        }
+    }
+    let Phase::Disconnected { error: Some(e) } = &s.phase else { panic!("{:?}", s.phase) };
+    assert!(e.contains("Could not connect"), "{e}");
+}

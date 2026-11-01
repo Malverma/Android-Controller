@@ -14,6 +14,13 @@ lets phones **without** wireless debugging connect without ADB at all:
   and on (then waits 1, 2, 4, 8, up to 15 minutes between further tries).
   It never touches Wi-Fi you switched off yourself.
 - A silent notification shows what it is doing, with a **Pause** button.
+- **PC monitor** (0.8): *Use as PC monitor* here or in the notification makes this
+  phone a monitor for Test Bed Multi's PC. Tap the screen with three fingers for
+  **Exit**. The Wi-Fi watchdog reacts after 20 s while this is on. It works only
+  through wireless debugging or `adb tcpip`, over a socket only adb's shell may open.
+- **Finding this phone** (0.8, can be switched off): answers Test Bed Multi's
+  Reconnect search on TCP port 27193 with a random id, its version and its wireless
+  debugging port, so the PC can find it after its address changed.
 - **PC connection without ADB** (off by default): for Android 10 and older
   when no USB data cable is at hand. See below.
 

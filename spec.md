@@ -1,5 +1,8 @@
 # Android Controller — Technical Specification
 
+> The product is now **Test Bed Multi**. [`spec2.md`](spec2.md) covers the rename, the
+> Reconnect button and monitor mode, and takes precedence where the two differ.
+
 | Field            | Value                                                              |
 |------------------|--------------------------------------------------------------------|
 | Document         | `spec.md` — architecture & implementation specification            |

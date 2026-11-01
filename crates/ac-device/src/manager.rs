@@ -42,6 +42,9 @@ const STAY_AWAKE_TIMEOUT: u32 = i32::MAX as u32;
 /// Finishes setting up the Wireless Debugging Keeper helper (android-helper/)
 /// on a phone that has it installed: the one permission it needs can only be
 /// granted over adb. Prints `@granted` when it did the setup now.
+const HELPER_PACKAGE: &str = "org.androidcontroller.keeper";
+/// How long an update of the helper is watched for a signature failure.
+const HELPER_INSTALL_WAIT: Duration = Duration::from_secs(180);
 pub const HELPER_SETUP_CMD: &str = "rm -f /data/local/tmp/android-controller-server.jar /data/local/tmp/android-controller-probe.jar /data/local/tmp/android-controller-ui.xml; \
 p=org.androidcontroller.keeper; \
 pm path $p >/dev/null 2>&1 || { echo @none; exit 0; }; \
@@ -171,6 +174,9 @@ enum Msg {
     /// Something for the Reconnect button's search.
     Reconnect(reconnect::JobMsg),
     Display(display::DisplayMsg),
+    /// The phone refused the shipped helper: it is signed with another key.
+    HelperSignature { slot: SlotId, device_id: String },
+    HelperRemoved { slot: SlotId, device_id: String, result: Result<(), String> },
 }
 
 /// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
@@ -1160,10 +1166,64 @@ so touch control of the PC is off unless you turn it on. Wireless debugging is e
             return;
         }
         let title = self.title(i);
-        self.transfers.submit(slot, d.id.clone(), title, vec![path], true);
+        let device_id = d.id.clone();
+        self.transfers.submit(slot, device_id.clone(), title, vec![path], true);
+        // Watch how it goes: a different signing key needs an extra step (spec2 §6).
+        let mut results = self.transfers.install_results();
+        self.spawn_msg(async move {
+            let refused = async {
+                loop {
+                    match results.recv().await {
+                        Ok((s, ok, message)) if s == slot => return !ok && is_signature_failure(&message),
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return false,
+                    }
+                }
+            };
+            match tokio::time::timeout(HELPER_INSTALL_WAIT, refused).await {
+                Ok(true) => Msg::HelperSignature { slot, device_id },
+                _ => Msg::Prune,
+            }
+        });
         self.helper_old[i] = None;
         // Check again once it has restarted.
         self.helper_checked[i] = self.slots[i].transport == TransportKind::Direct;
+    }
+
+    /// Android only replaces an app with one signed by the same key. Over ADB it
+    /// can be removed first, once the user agrees: its settings go with it.
+    fn on_helper_signature(&mut self, slot: SlotId, device_id: String) {
+        let Some(i) = self.idx(slot) else { return };
+        if self.slots[i].device_id() != Some(device_id.as_str()) {
+            return;
+        }
+        let title = self.title(i);
+        if self.slots[i].transport == TransportKind::Direct {
+            return self.toast(
+                None,
+                format!("{title} has Wireless Debugging Keeper signed with a different key. Uninstall it on the phone, install this version, then pair again."),
+            );
+        }
+        let Some((serial, shell_v2, _)) = self.adb_target(i) else { return };
+        let answer = self.confirm(
+            format!("Reinstall Wireless Debugging Keeper on {title}?"),
+            "The copy on this phone was signed with a different key, so Android will not update it. Reinstalling removes it first, \
+which resets its settings and its pairing for connections without ADB. Permissions are granted again automatically."
+                .into(),
+        );
+        let adb = self.adb.clone();
+        self.spawn_msg(async move {
+            if !answer.await {
+                return Msg::Prune;
+            }
+            let result = match adb.shell(&serial, &format!("pm uninstall {HELPER_PACKAGE}"), shell_v2).await {
+                Ok(out) if out.stdout.contains("Success") => Ok(()),
+                Ok(out) => Err(format!("{}{}", out.stdout.trim(), out.stderr.trim())),
+                Err(e) => Err(e.to_string()),
+            };
+            Msg::HelperRemoved { slot, device_id, result }
+        });
     }
 
     /// Reads (`set = None`) or changes the phone's "keep screen on" state.
@@ -1888,6 +1948,15 @@ so touch control of the PC is off unless you turn it on. Wireless debugging is e
             }
             Msg::Reconnect(m) => self.on_reconnect_msg(m),
             Msg::Display(m) => self.on_display_msg(m),
+            Msg::HelperSignature { slot, device_id } => self.on_helper_signature(slot, device_id),
+            Msg::HelperRemoved { slot, device_id, result } => {
+                let Some(i) = self.idx(slot) else { return };
+                match result {
+                    Ok(()) if self.slots[i].device_id() == Some(device_id.as_str()) => self.update_helper(slot),
+                    Ok(()) => {}
+                    Err(e) => self.toast(None, format!("Could not remove the old Wireless Debugging Keeper: {e}")),
+                }
+            }
             Msg::Slot(slot, ev) => self.feed(slot, ev),
             Msg::Session(SessionMsg::Slot(slot, ev)) => {
                 self.check_codec_failure(slot, &ev);
@@ -2188,6 +2257,11 @@ so touch control of the PC is off unless you turn it on. Wireless debugging is e
 
 /// Version code 6 → `0.6`.
 /// `@keeper=data="<uuid>"` from `HELPER_SETUP_CMD`; helpers before 0.8 print no data.
+/// Did an install fail because the installed app has another signing key?
+fn is_signature_failure(message: &str) -> bool {
+    message.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
+}
+
 fn parse_keeper_id(line: &str) -> Option<String> {
     let id = line.trim().strip_prefix("@keeper=data=\"")?.strip_suffix('"')?;
     (!id.is_empty()).then(|| id.to_owned())
@@ -2685,6 +2759,12 @@ mod tests {
         assert!(!tile_change_needs_restart(640, 800), "exactly 25 % larger");
         assert!(tile_change_needs_restart(640, 816));
         assert!(!tile_change_needs_restart(0, 640));
+    }
+
+    #[test]
+    fn recognises_a_signature_failure() {
+        assert!(is_signature_failure("Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match] — signature differs"));
+        assert!(!is_signature_failure("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"));
     }
 
     #[test]
