@@ -21,6 +21,7 @@ ac-media = { path = "crates/ac-media" }
 ac-transfer = { path = "crates/ac-transfer" }
 ac-direct = { path = "crates/ac-direct" }
 ac-audio = { path = "crates/ac-audio" }
+ac-monitor = { path = "crates/ac-monitor" }
 adb-mock = { path = "crates/adb-mock" }
 
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }

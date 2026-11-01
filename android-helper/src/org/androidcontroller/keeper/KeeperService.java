@@ -32,6 +32,7 @@ import java.util.ArrayDeque;
  */
 public final class KeeperService extends Service {
     static final String ACTION_PAUSE = "org.androidcontroller.keeper.PAUSE";
+    static final String ACTION_MONITOR = "org.androidcontroller.keeper.MONITOR";
     private static final String CHANNEL = "keeper";
     private static final int NOTIFICATION = 1;
     /** At most this many attempts per minute, so we never fight the system in a loop. */
@@ -40,6 +41,8 @@ public final class KeeperService extends Service {
     private static final long[] RECHECK_MS = {2_000, 8_000, 30_000};
     /** Disconnected this long (with Wi-Fi switched on) before restarting Wi-Fi. */
     private static final long WATCHDOG_AFTER_MS = 45_000;
+    /** Someone is looking at this phone as a monitor: react sooner. */
+    private static final long WATCHDOG_AFTER_MONITOR_MS = 20_000;
     /** Pause after each restart that did not help: 1, 2, 4, 8, then 15 min. */
     private static final long WATCHDOG_MIN_BACKOFF_MS = 60_000;
     private static final long WATCHDOG_MAX_BACKOFF_MS = 15 * 60_000;
@@ -121,6 +124,8 @@ public final class KeeperService extends Service {
         NetworkRequest wifi = new NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build();
         connectivity.registerNetworkCallback(wifi, networkCallback);
         handler.postDelayed(watchdog, WATCHDOG_AFTER_MS);
+        Locator.start(this);
+        Monitor.startServer(this);
     }
 
     @Override
@@ -130,6 +135,9 @@ public final class KeeperService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
+        if (intent != null && ACTION_MONITOR.equals(intent.getAction())) {
+            Monitor.userToggle(this, true);
+        }
         schedule(0);
         return START_STICKY;
     }
@@ -137,6 +145,7 @@ public final class KeeperService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        Locator.stop();
         if (observer != null) getContentResolver().unregisterContentObserver(observer);
         if (networkCallback != null) connectivity.unregisterNetworkCallback(networkCallback);
         super.onDestroy();
@@ -200,7 +209,8 @@ public final class KeeperService extends Service {
             disconnectedSince = now;
             return;
         }
-        if (now - disconnectedSince < WATCHDOG_AFTER_MS || now < nextRestartAt) return;
+        long after = Monitor.active() ? WATCHDOG_AFTER_MONITOR_MS : WATCHDOG_AFTER_MS;
+        if (now - disconnectedSince < after || now < nextRestartAt) return;
         restarts++;
         Log.i(Keeper.TAG, "Wi-Fi on but disconnected for " + (now - disconnectedSince) / 1000 + " s: restarting Wi-Fi (try " + restarts + ")");
         show("Wi-Fi did not reconnect: restarting Wi-Fi (try " + restarts + ")", false);
@@ -226,6 +236,8 @@ public final class KeeperService extends Service {
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         PendingIntent pause = PendingIntent.getService(this, 1, new Intent(this, KeeperService.class).setAction(ACTION_PAUSE),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        PendingIntent monitor = PendingIntent.getService(this, 2, new Intent(this, KeeperService.class).setAction(ACTION_MONITOR),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         @SuppressWarnings("deprecation")
         Notification.Builder b = Keeper.isAtLeast(26) ? new Notification.Builder(this, CHANNEL) : new Notification.Builder(this);
         return b
@@ -235,6 +247,7 @@ public final class KeeperService extends Service {
                 .setStyle(new Notification.BigTextStyle().bigText(text))
                 .setContentIntent(open)
                 .addAction(new Notification.Action.Builder(null, "Pause", pause).build())
+                .addAction(new Notification.Action.Builder(null, "Use as monitor", monitor).build())
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setCategory(Notification.CATEGORY_SERVICE)

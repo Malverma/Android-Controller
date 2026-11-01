@@ -14,6 +14,8 @@ import android.os.Build;
 import android.provider.Settings;
 import android.util.Log;
 
+import java.util.UUID;
+
 /** Settings access shared by the service, the boot receiver and the screen. */
 final class Keeper {
     static final String TAG = "WDKeeper";
@@ -25,6 +27,8 @@ final class Keeper {
     private static final String PREFS = "keeper";
     private static final String KEY_ACTIVE = "active";
     private static final String KEY_WATCHDOG = "wifi_watchdog";
+    private static final String KEY_KEEPER_ID = "keeper_id";
+    private static final String KEY_LOCATOR = "locator";
 
     private Keeper() {}
 
@@ -111,6 +115,42 @@ final class Keeper {
 
     static void setWatchdog(Context c, boolean on) {
         prefs(c).edit().putBoolean(KEY_WATCHDOG, on).apply();
+    }
+
+    /** A random id for this install, so the PC can tell its phones apart on the network. */
+    static synchronized String keeperId(Context c) {
+        String id = prefs(c).getString(KEY_KEEPER_ID, null);
+        if (id == null) {
+            id = UUID.randomUUID().toString();
+            prefs(c).edit().putString(KEY_KEEPER_ID, id).apply();
+        }
+        return id;
+    }
+
+    /** Whether the PC may find this phone on the network (see {@link Locator}). */
+    static boolean locatorEnabled(Context c) {
+        return prefs(c).getBoolean(KEY_LOCATOR, true);
+    }
+
+    static void setLocatorEnabled(Context c, boolean on) {
+        prefs(c).edit().putBoolean(KEY_LOCATOR, on).apply();
+        if (on) {
+            Locator.start(c);
+        } else {
+            Locator.stop();
+        }
+    }
+
+    /** The wireless debugging port, or 0 when Android does not let this app read it. */
+    static int adbPort() {
+        try {
+            Class<?> props = Class.forName("android.os.SystemProperties");
+            String v = (String) props.getMethod("get", String.class).invoke(null, "service.adb.tls.port");
+            return v == null || v.isEmpty() ? 0 : Integer.parseInt(v);
+        } catch (ReflectiveOperationException | NumberFormatException | SecurityException e) {
+            Log.d(TAG, "cannot read the wireless debugging port: " + e);
+            return 0;
+        }
     }
 
     static boolean wifiSwitchedOn(Context c) {

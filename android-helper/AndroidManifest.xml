@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.androidcontroller.keeper"
-    android:versionCode="7"
-    android:versionName="0.7.0">
+    android:versionCode="8"
+    android:versionName="0.8.0">
 
     <!-- Target 28 on purpose: since Android 10, only apps targeting 28 or lower
          may switch Wi-Fi off and on (WifiManager.setWifiEnabled), which is how
@@ -76,6 +76,23 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service" />
+        </service>
+
+        <!-- Monitor mode: the phone shows a display of the PC. -->
+        <activity
+            android:name=".MonitorActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <service
+            android:name=".MonitorService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Shows a display of the paired PC on this phone over Wi-Fi" />
         </service>
 
         <activity

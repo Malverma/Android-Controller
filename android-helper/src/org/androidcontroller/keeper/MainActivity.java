@@ -35,6 +35,8 @@ public final class MainActivity extends Activity {
     private Button capture;
     private Button storage;
     private Button forget;
+    private Button monitor;
+    private TextView monitorStatus;
     private final Runnable refresh = new Runnable() {
         @Override
         public void run() {
@@ -120,6 +122,7 @@ public final class MainActivity extends Activity {
         setup.setTextIsSelectable(true);
         col.addView(setup);
 
+        addMonitorSection(col);
         addDirectSection(col);
 
         ScrollView scroll = new ScrollView(this);
@@ -146,6 +149,8 @@ public final class MainActivity extends Activity {
     }
 
     private void render() {
+        monitor.setText(Monitor.active() ? "Exit Monitor" : "Use as PC monitor");
+        monitorStatus.setText(Monitor.statusLine());
         boolean granted = Keeper.canWriteSettings(this);
         keep.setChecked(Keeper.active(this));
         watchdog.setChecked(Keeper.watchdog(this));
@@ -173,6 +178,41 @@ public final class MainActivity extends Activity {
     }
 
     /** "PC connection without ADB": for phones with no wireless debugging and no USB cable. */
+    private void addMonitorSection(LinearLayout col) {
+        TextView head = new TextView(this);
+        head.setText("PC monitor");
+        head.setTextSize(18);
+        head.setTypeface(Typeface.DEFAULT_BOLD);
+        head.setPadding(0, dp(24), 0, dp(8));
+        col.addView(head);
+
+        monitor = new Button(this);
+        monitor.setOnClickListener(v -> {
+            Monitor.startServer(this);
+            Monitor.userToggle(this, !Monitor.active());
+            render();
+        });
+        col.addView(monitor);
+
+        monitorStatus = new TextView(this);
+        monitorStatus.setTextSize(13);
+        col.addView(monitorStatus);
+
+        Switch locator = new Switch(this);
+        locator.setText("Let the PC find this phone on the network");
+        locator.setTextSize(15);
+        locator.setPadding(0, dp(12), 0, 0);
+        locator.setChecked(Keeper.locatorEnabled(this));
+        locator.setOnCheckedChangeListener((b, on) -> Keeper.setLocatorEnabled(this, on));
+        col.addView(locator);
+
+        TextView locatorAbout = new TextView(this);
+        locatorAbout.setText("Helps Test Bed Multi reconnect after this phone's address changes, on routers that block network discovery. "
+                + "Being found gives no access to this phone.");
+        locatorAbout.setTextSize(13);
+        col.addView(locatorAbout);
+    }
+
     private void addDirectSection(LinearLayout col) {
         TextView head = new TextView(this);
         head.setText("PC connection without ADB");
