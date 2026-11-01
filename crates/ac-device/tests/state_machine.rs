@@ -527,3 +527,105 @@ fn t19c_tcpip_address_is_kept_and_retried_after_tls() {
     assert!(matches!(s.phase, Phase::Online { .. }));
     assert_eq!((s.addr.as_deref(), s.transport, s.legacy_addr.as_deref()), (Some("10.0.0.7:5555"), TransportKind::Legacy, None));
 }
+
+// ---- the Reconnect button (spec2 §4) ------------------------------------------
+
+fn other(id: &str) -> DeviceInfo {
+    DeviceInfo { id: id.into(), model: format!("Model {id}"), manufacturer: String::new(), sdk: 35, features: vec![], wifi_mac: None }
+}
+
+#[test]
+fn restored_slot_rejects_another_phone_at_its_old_address() {
+    // Phone B took phone A's old DHCP lease. The slot must stay A's.
+    let mut s = Slot::restored(1, "PHONE_A", TransportKind::Tls, Some("10.0.0.7:37000".into()), None);
+    ev(&mut s, SlotEvent::Connect { addr: "10.0.0.7:37000".into(), transport: TransportKind::Tls, expect_serial: Some("PHONE_A".into()), silent: true });
+    ev(&mut s, SlotEvent::ConnectDone(Ok(())));
+    ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.7:37000".into(), state: DeviceState::Device });
+
+    let fx = ev(&mut s, SlotEvent::Identified(other("PHONE_B")));
+
+    assert_eq!(fx, vec![Effect::Disconnect { serial: "10.0.0.7:37000".into() }], "silent: no toast");
+    assert_eq!(s.device_id(), Some("PHONE_A"));
+    assert_eq!(s.known_id.as_deref(), Some("PHONE_A"));
+    assert!(s.device.is_none());
+    match &s.phase {
+        Phase::Disconnected { error: Some(e) } => assert!(e.contains("Model PHONE_B"), "{e}"),
+        p => panic!("{p:?}"),
+    }
+}
+
+#[test]
+fn a_visible_connect_to_the_wrong_phone_tells_the_user() {
+    let mut s = Slot::restored(1, "PHONE_A", TransportKind::Tls, Some("10.0.0.7:37000".into()), None);
+    ev(&mut s, SlotEvent::Connect { addr: "10.0.0.7:37000".into(), transport: TransportKind::Tls, expect_serial: Some("PHONE_A".into()), silent: false });
+    ev(&mut s, SlotEvent::ConnectDone(Ok(())));
+    ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.7:37000".into(), state: DeviceState::Device });
+    let fx = ev(&mut s, SlotEvent::Identified(other("PHONE_B")));
+    assert!(fx.iter().any(|f| matches!(f, Effect::Toast { .. })), "{fx:?}");
+}
+
+#[test]
+fn pairing_may_still_replace_the_phone_in_a_slot() {
+    let mut s = Slot::restored(1, "OLD", TransportKind::Tls, None, None);
+    ev(&mut s, SlotEvent::PairCode { addr: sa("10.0.0.9:41000"), code: "111111".into(), connect: None });
+    ev(&mut s, SlotEvent::PairDone(Ok(Some("adb-NEW-abc".into()))));
+    ev(&mut s, SlotEvent::AdbState { serial: "10.0.0.9:40000".into(), state: DeviceState::Device });
+    ev(&mut s, SlotEvent::Identified(other("NEW")));
+    assert_eq!(s.device_id(), Some("NEW"));
+    assert!(matches!(s.phase, Phase::Online { .. }));
+}
+
+#[test]
+fn relocate_moves_a_disconnected_slot_and_drops_the_old_transport() {
+    let mut s = Slot::restored(1, "SER1", TransportKind::Tls, Some("192.168.0.84:37000".into()), None);
+    let fx = ev(&mut s, SlotEvent::Relocate { addr: "192.168.1.84:41000".into(), transport: TransportKind::Tls });
+    assert_eq!(
+        fx,
+        vec![Effect::Disconnect { serial: "192.168.0.84:37000".into() }, Effect::Connect { addr: "192.168.1.84:41000".into() }]
+    );
+    assert_eq!(s.addr.as_deref(), Some("192.168.1.84:41000"));
+    assert!(matches!(s.phase, Phase::ConnectingAdb { attempt: 0, silent: true, .. }));
+}
+
+#[test]
+fn relocate_interrupts_a_retry_cycle_but_not_the_same_address() {
+    let mut s = Slot::restored(1, "SER1", TransportKind::Tls, Some("10.0.0.7:37000".into()), None);
+    ev(&mut s, SlotEvent::Connect { addr: "10.0.0.7:37000".into(), transport: TransportKind::Tls, expect_serial: None, silent: true });
+    assert!(ev(&mut s, SlotEvent::Relocate { addr: "10.0.0.7:37000".into(), transport: TransportKind::Tls }).is_empty());
+    let fx = ev(&mut s, SlotEvent::Relocate { addr: "10.0.0.9:37000".into(), transport: TransportKind::Tls });
+    assert!(fx.contains(&Effect::Connect { addr: "10.0.0.9:37000".into() }), "{fx:?}");
+}
+
+#[test]
+fn relocate_needs_a_known_phone_and_leaves_online_alone() {
+    let mut empty = Slot::new(1);
+    assert!(ev(&mut empty, SlotEvent::Relocate { addr: "10.0.0.9:1".into(), transport: TransportKind::Tls }).is_empty());
+    let mut s = online("10.0.0.7:37000", "SER1");
+    assert!(ev(&mut s, SlotEvent::Relocate { addr: "10.0.0.9:1".into(), transport: TransportKind::Tls }).is_empty());
+    assert_eq!(s.addr.as_deref(), Some("10.0.0.7:37000"));
+}
+
+#[test]
+fn search_started_restarts_the_give_up_clock() {
+    let start = Instant::now();
+    let mut s = online("10.0.0.7:37000", "SER1");
+    s.handle(SlotEvent::AdbGone { serial: "10.0.0.7:37000".into() }, start, &cfg());
+    let later = start + Duration::from_secs(290);
+    s.handle(SlotEvent::SearchStarted, later, &cfg());
+    match s.phase {
+        Phase::Reconnecting { since, .. } => assert_eq!(since, later),
+        ref p => panic!("{p:?}"),
+    }
+}
+
+#[test]
+fn search_failed_shows_on_a_disconnected_tile_only() {
+    let mut s = Slot::restored(1, "SER1", TransportKind::Tls, None, None);
+    ev(&mut s, SlotEvent::SearchFailed("Could not find it".into()));
+    assert_eq!(s.phase, Phase::Disconnected { error: Some("Could not find it".into()) });
+
+    let mut r = online("10.0.0.7:37000", "SER1");
+    ev(&mut r, SlotEvent::AdbGone { serial: "10.0.0.7:37000".into() });
+    ev(&mut r, SlotEvent::SearchFailed("x".into()));
+    assert!(matches!(r.phase, Phase::Reconnecting { .. }), "keeps trying on its own");
+}

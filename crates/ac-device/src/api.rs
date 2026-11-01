@@ -28,8 +28,11 @@ pub enum UiCommand {
     /// connect to it over Wi-Fi.
     EnableWifiAdb { usb_serial: String, slot: Option<SlotId> },
     Disconnect { slot: SlotId },
-    /// Connect a remembered, disconnected slot to its last known address.
+    /// Search for this saved phone and connect to it (spec2 §4).
     Reconnect { slot: SlotId },
+    /// Search for every saved phone that is not online. Phones that are online
+    /// are left alone.
+    ReconnectAll,
     Forget { slot: SlotId },
     Rename { slot: SlotId, alias: String },
     /// Grid ⇄ focus (spec §4.4): restarts only this slot's stream.
@@ -271,6 +274,20 @@ pub enum UiEvent {
     Confirm { id: u64, title: String, body: String },
     /// How many automation clients are connected.
     Automation { clients: usize },
+    /// The Reconnect button's search started or ended.
+    Reconnecting { active: bool },
+    /// The search ended. `results` is empty when nothing needed reconnecting.
+    ReconnectDone { results: Vec<ReconnectResult> },
+}
+
+/// How the Reconnect button went for one phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconnectResult {
+    pub slot: SlotId,
+    pub title: String,
+    pub ok: bool,
+    /// Where it was found, or what the user needs to do.
+    pub message: String,
 }
 
 /// Aggregate progress of one slot's queued transfers (spec §5.7).

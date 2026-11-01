@@ -452,7 +452,8 @@ impl SlotCard {
                 "Offline",
                 "disconnected",
                 "Connect",
-                v.error.clone().unwrap_or_else(|| "Disconnected".into()),
+                // While the Reconnect button searches, the step; then the result.
+                if v.detail.is_empty() { v.error.clone().unwrap_or_else(|| "Disconnected".into()) } else { v.detail.clone() },
             ),
             PhaseView::Pairing => ("Pairing", "pairing", "Cancel", v.detail.clone()),
             PhaseView::Connecting => ("Connecting", "connecting", "Cancel", v.detail.clone()),

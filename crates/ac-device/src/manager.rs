@@ -46,6 +46,7 @@ const HELPER_SETUP_CMD: &str = "rm -f /data/local/tmp/android-controller-server.
 p=org.androidcontroller.keeper; \
 pm path $p >/dev/null 2>&1 || { echo @none; exit 0; }; \
 echo @$(dumpsys package $p | grep -m 1 -o 'versionCode=[0-9]*'); \
+echo @keeper=$(am broadcast -a $p.KEEPER_ID -n $p/.BootReceiver 2>/dev/null | grep -o 'data=\"[^\"]*\"'); \
 dumpsys package $p | grep -q 'WRITE_SECURE_SETTINGS: granted=true' && { echo @ready; exit 0; }; \
 pm grant $p android.permission.WRITE_SECURE_SETTINGS && echo @granted; \
 pm grant $p android.permission.POST_NOTIFICATIONS >/dev/null 2>&1; \
@@ -88,11 +89,13 @@ pub struct ManagerOptions {
     /// Serve the automation socket here (when `config.automation.enabled`);
     /// the app uses `control::socket_path()`, tests none.
     pub control_socket: Option<PathBuf>,
+    /// The Reconnect button's search (tests shorten it).
+    pub reconnect: reconnect::ReconnectOptions,
 }
 
 impl ManagerOptions {
     pub fn new(config: Config, paths: Option<Paths>) -> Self {
-        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None, control_socket: None }
+        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None, control_socket: None, reconnect: Default::default() }
     }
 }
 
@@ -115,6 +118,7 @@ impl ManagerHandle {
 
 mod automation;
 mod games;
+pub mod reconnect;
 
 enum Msg {
     Ui(UiCommand),
@@ -156,6 +160,10 @@ enum Msg {
     Game { slot: SlotId, serial: String, ev: crate::game::GameEvent },
     /// The game add-on through the helper's relay (no ADB).
     GameNews { slot: SlotId, conn: u64, news: Value },
+    /// The Keeper's id on the phone `device_id`.
+    KeeperId { device_id: String, keeper_id: String },
+    /// Something for the Reconnect button's search.
+    Reconnect(reconnect::JobMsg),
 }
 
 /// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
@@ -297,6 +305,9 @@ struct Manager {
     auto: automation::Automation,
     control_socket: Option<PathBuf>,
     games: games::Games,
+    reconnect_opts: reconnect::ReconnectOptions,
+    reconnect_job: Option<reconnect::ReconnectJob>,
+    reconnect_seq: u64,
 }
 
 impl Manager {
@@ -338,6 +349,9 @@ impl Manager {
             adb,
             paths: opts.paths,
             arp_table: opts.arp_table,
+            reconnect_opts: opts.reconnect,
+            reconnect_job: None,
+            reconnect_seq: 0,
             discovery: opts.discovery,
             devices,
             slots,
@@ -496,6 +510,7 @@ impl Manager {
             Phase::Online { .. } => (PhaseView::Online, String::new()),
             Phase::Reconnecting { attempt, .. } => (PhaseView::Reconnecting, format!("Reconnecting… (attempt {})", attempt + 1)),
         };
+        let detail = self.reconnect_step(s.id).map_or(detail, str::to_owned);
         let mut title = s.display_name();
         if title == "New device" && let Some(r) = record {
             title = r.display_name().to_owned();
@@ -712,9 +727,18 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
                 Msg::ConnectResult(slot, connect(&adb, &addr).await)
             }),
             Effect::Disconnect { serial } => {
-                tokio::spawn(async move {
-                    let _ = adb.disconnect_device(&serial).await;
+                // A slot that moved off, or tried a wrong address must not cut off
+                // the phone another slot is using or connecting to there.
+                let in_use = self.slots.iter().enumerate().any(|(j, s)| {
+                    j != i
+                        && matches!(s.phase, Phase::Online { .. } | Phase::ConnectingAdb { .. })
+                        && (s.adb_serial.as_deref() == Some(serial.as_str()) || s.addr.as_deref() == Some(serial.as_str()))
                 });
+                if !in_use {
+                    tokio::spawn(async move {
+                        let _ = adb.disconnect_device(&serial).await;
+                    });
+                }
             }
             Effect::Identify { serial } => {
                 let low_latency = self.cfg.connection.phone_low_latency_wifi;
@@ -1053,7 +1077,12 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
             if let Ok(o) = &out
                 && let Some(v) = o.stdout.lines().find_map(|l| l.trim().strip_prefix("@versionCode=")?.parse().ok())
             {
-                let _ = tx.send(Msg::HelperVersion { slot, device_id, version: v });
+                let _ = tx.send(Msg::HelperVersion { slot, device_id: device_id.clone(), version: v });
+            }
+            if let Ok(o) = &out
+                && let Some(keeper_id) = o.stdout.lines().find_map(parse_keeper_id)
+            {
+                let _ = tx.send(Msg::KeeperId { device_id, keeper_id });
             }
             match out {
                 Ok(out) if out.stdout.lines().any(|l| l.trim() == "@granted") => {
@@ -1693,26 +1722,17 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
             UiCommand::EnableWifiAdb { usb_serial, slot } => self.enable_wifi_adb(usb_serial, slot),
             UiCommand::Disconnect { slot } => {
                 if let Some(i) = self.idx(slot) {
+                    self.reconnect_drop_target(slot);
                     let s = &self.slots[i];
                     self.suppressed.extend(s.device_id().map(str::to_owned));
                     self.suppressed.extend(s.adb_serial.clone());
                     self.feed(slot, SlotEvent::Disconnect);
                 }
             }
-            UiCommand::Reconnect { slot } => {
-                let Some(i) = self.idx(slot) else { return };
-                let s = &self.slots[i];
-                let Some(addr) = s.addr.clone() else {
-                    return self.toast(None, "No known address — pair again or enter IP:port");
-                };
-                let (transport, expect) = (s.transport, s.device_id().map(str::to_owned));
-                if let Some(id) = &expect {
-                    self.suppressed.remove(id);
-                }
-                self.suppressed.remove(&addr);
-                self.feed(slot, SlotEvent::Connect { addr, transport, expect_serial: expect, silent: false });
-            }
+            UiCommand::Reconnect { slot } => self.start_reconnect(Some(slot)),
+            UiCommand::ReconnectAll => self.start_reconnect(None),
             UiCommand::Forget { slot } => {
+                self.reconnect_drop_target(slot);
                 self.transfers.cancel(slot);
                 self.feed(slot, SlotEvent::Forget);
             }
@@ -1833,6 +1853,15 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
         match msg {
             Msg::Ui(cmd) => self.on_ui(cmd),
             Msg::Slot(slot, SlotEvent::Identified(info)) => self.on_identified(slot, info),
+            Msg::KeeperId { device_id, keeper_id } => {
+                if let Some(rec) = self.devices.get_mut(&device_id)
+                    && rec.keeper_id.as_deref() != Some(keeper_id.as_str())
+                {
+                    rec.keeper_id = Some(keeper_id);
+                    self.save_devices();
+                }
+            }
+            Msg::Reconnect(m) => self.on_reconnect_msg(m),
             Msg::Slot(slot, ev) => self.feed(slot, ev),
             Msg::Session(SessionMsg::Slot(slot, ev)) => {
                 self.check_codec_failure(slot, &ev);
@@ -1984,6 +2013,13 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
 
     fn on_identified(&mut self, slot: SlotId, info: DeviceInfo) {
         let Some(i) = self.idx(slot) else { return };
+        // Another phone answered at this slot's address: the slot rejects it,
+        // whatever that phone is doing elsewhere.
+        let pairing = matches!(self.slots[i].phase, Phase::Pairing { .. });
+        if !pairing && self.slots[i].device_id().is_some_and(|d| d != info.id) {
+            self.feed(slot, SlotEvent::Identified(info));
+            return;
+        }
         // Same phone already live in another slot (e.g. two transports).
         if let Some(other) = self.slots.iter().find(|s| {
             s.id != slot && matches!(s.phase, Phase::Online { .. }) && s.device_id() == Some(info.id.as_str())
@@ -2072,6 +2108,9 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
             }
             ServiceKind::Connect => {
                 let Some(serial) = dev.serial() else { return };
+                if self.reconnect_offer_connect(serial, dev.addr) {
+                    return;
+                }
                 let auto = self.cfg.discovery.auto_connect_known && !self.suppressed.contains(serial);
                 let slot = self.slots.iter().find(|s| {
                     let just_paired_here = matches!(s.phase, Phase::Pairing { paired: true, pair_ip: Some(ip), .. } if ip == dev.addr.ip());
@@ -2093,6 +2132,9 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
             ServiceKind::Direct => {
                 let Some(id) = dev.serial() else { return };
                 if !self.keys.is_paired(id) {
+                    return;
+                }
+                if self.reconnect_offer_direct(id, dev.addr) {
                     return;
                 }
                 let auto = self.cfg.discovery.auto_connect_known && !self.suppressed.contains(id);
@@ -2118,6 +2160,12 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
 // ---- free functions running on worker tasks -------------------------------------------
 
 /// Version code 6 → `0.6`.
+/// `@keeper=data="<uuid>"` from `HELPER_SETUP_CMD`; helpers before 0.8 print no data.
+fn parse_keeper_id(line: &str) -> Option<String> {
+    let id = line.trim().strip_prefix("@keeper=data=\"")?.strip_suffix('"')?;
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
 fn helper_version_name(code: u32) -> String {
     format!("0.{code}")
 }

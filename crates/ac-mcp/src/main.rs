@@ -367,6 +367,12 @@ fn tools() -> Vec<Tool> {
             request: pass!("phones"),
         },
         Tool {
+            name: "reconnect_all",
+            description: "Search the network for every saved phone that is not online and reconnect it, for example after phone addresses changed. Phones already online are left alone. Takes up to about 20 s. Returns, per phone, whether it came back, or what the user has to do on it.",
+            schema: json!({ "type": "object", "properties": {} }),
+            request: pass!("reconnect_all"),
+        },
+        Tool {
             name: "screenshot",
             description: "See a phone's screen as an image. Use it for games and custom-drawn UI; for normal apps ui_tree is faster and gives exact tap points. The answer says how image pixels map to phone pixels.",
             schema: schema(

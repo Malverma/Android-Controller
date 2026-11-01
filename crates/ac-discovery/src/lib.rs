@@ -3,6 +3,7 @@
 mod arp;
 mod avahi;
 mod lan;
+pub mod sweep;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

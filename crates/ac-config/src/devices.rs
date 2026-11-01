@@ -28,6 +28,10 @@ pub struct DeviceRecord {
     pub last_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wifi_mac: Option<String>,
+    /// The Wireless Debugging Keeper's random id, which its locator reports
+    /// when the phone is searched for on the network (spec2 §4.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeper_id: Option<String>,
     #[serde(default = "yes")]
     pub auto_connect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,6 +66,7 @@ impl DeviceRecord {
             mdns_instance: None,
             last_address: None,
             wifi_mac: None,
+            keeper_id: None,
             auto_connect: true,
             target_dir: None,
             supported_codecs: Vec::new(),

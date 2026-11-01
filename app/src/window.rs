@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ac_config::{AppState, BroadcastState, WindowState};
 use ac_core::SlotId;
 use ac_device::{
+    ReconnectResult,
     AppAction, ManagerHandle, NearbyView, PhaseView, SlotIo, SlotView, StreamProfile, StreamView, TransferView, UiCommand, UiEvent,
     UsbDeviceView,
 };
@@ -124,6 +125,7 @@ pub struct App {
     last_from_device: RefCell<Option<String>>,
     nearby_list: gtk::ListBox,
     nearby_button: gtk::MenuButton,
+    reconnect_spinner: adw::Spinner,
     /// The grid, or the welcome page while no slot has a phone.
     home: gtk::Stack,
     status: gtk::Label,
@@ -267,6 +269,16 @@ pub fn build(
     let nearby_button = gtk::MenuButton::builder()
         .popover(&gtk::Popover::builder().child(&nearby_scroll).build())
         .tooltip_text("Phones on this network or USB that can be added")
+        .build();
+    let reconnect_spinner = adw::Spinner::builder().visible(false).build();
+    let reconnect_content = adw::ButtonContent::builder().icon_name("view-refresh-symbolic").label("Reconnect").build();
+    let reconnect_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    reconnect_box.append(&reconnect_spinner);
+    reconnect_box.append(&reconnect_content);
+    let reconnect_button = gtk::Button::builder()
+        .child(&reconnect_box)
+        .action_name("win.reconnect-all")
+        .tooltip_text("Find saved phones on the network and reconnect them, e.g. after their addresses changed (Ctrl+R). Phones already connected are left alone.")
         .build();
     let add_button = gtk::Button::builder()
         .child(&adw::ButtonContent::builder().icon_name("list-add-symbolic").label("Add Device").build())
@@ -426,6 +438,7 @@ pub fn build(
             last_from_device: RefCell::new(None),
             nearby_list,
             nearby_button: nearby_button.clone(),
+            reconnect_spinner: reconnect_spinner.clone(),
             home: content.clone(),
             status,
             commands: manager.commands.clone(),
@@ -459,7 +472,7 @@ pub fn build(
 
     let test_bar = TestBar::new(
         &app_rc,
-        &[add_button.upcast_ref(), nearby_button.upcast_ref()],
+        &[add_button.upcast_ref(), reconnect_button.upcast_ref(), nearby_button.upcast_ref()],
         &[mirror_toggle.upcast_ref(), broadcast_toggle.upcast_ref()],
     );
     toolbar.add_top_bar(&test_bar.root);
@@ -789,6 +802,16 @@ fn install_actions(app: &Rc<App>, gapp: &adw::Application) {
     app.window.add_action(&pair);
     gapp.set_accels_for_action("win.pair", &["<Ctrl>n"]);
 
+    let reconnect_all = gtk::gio::SimpleAction::new("reconnect-all", None);
+    let weak = Rc::downgrade(app);
+    reconnect_all.connect_activate(move |_, _| {
+        if let Some(app) = weak.upgrade() {
+            app.send(UiCommand::ReconnectAll);
+        }
+    });
+    app.window.add_action(&reconnect_all);
+    gapp.set_accels_for_action("win.reconnect-all", &["<Ctrl>r"]);
+
     let pair_code = gtk::gio::SimpleAction::new("pair-code", None);
     let weak = Rc::downgrade(app);
     pair_code.connect_activate(move |_, _| {
@@ -1056,6 +1079,8 @@ impl App {
                 }
             }
             UiEvent::Toast { message, .. } => self.toast(&message),
+            UiEvent::Reconnecting { active } => self.reconnect_spinner.set_visible(active),
+            UiEvent::ReconnectDone { results } => self.reconnect_done(results),
             UiEvent::AdbStatus { version, error } => {
                 self.state.borrow_mut().adb = Some(match (version, error) {
                     (_, Some(e)) => Err(e),
@@ -1248,6 +1273,38 @@ impl App {
         });
         alert.present(Some(&self.window));
         self.window.present();
+    }
+
+    /// One line for the whole search, with the reasons behind a button.
+    fn reconnect_done(self: &Rc<Self>, results: Vec<ReconnectResult>) {
+        if results.is_empty() {
+            let saved = self.state.borrow().slots.iter().flatten().any(|v| v.device_id.is_some());
+            self.toast(if saved { "All saved phones are already connected" } else { "No saved phones yet. Use Add Device" });
+            return;
+        }
+        let ok = results.iter().filter(|r| r.ok).count();
+        let title = match (ok, results.len()) {
+            (1, 1) => format!("{} reconnected", results[0].title),
+            (0, 1) => results[0].message.clone(),
+            (ok, n) => format!("{ok} of {n} phones reconnected"),
+        };
+        let t = adw::Toast::builder().title(title).timeout(8).build();
+        if ok < results.len() && results.len() > 1 {
+            t.set_button_label(Some("Details"));
+            let weak = Rc::downgrade(self);
+            t.connect_button_clicked(move |_| {
+                if let Some(app) = weak.upgrade() {
+                    let body: Vec<String> = results
+                        .iter()
+                        .map(|r| if r.ok { format!("{}: reconnected", r.title) } else { r.message.clone() })
+                        .collect();
+                    let dialog = adw::AlertDialog::new(Some("Reconnect"), Some(&body.join("\n\n")));
+                    dialog.add_response("close", "Close");
+                    dialog.present(Some(&app.window));
+                }
+            });
+        }
+        self.toasts.add_toast(t);
     }
 
     /// "Saved" with a button that opens the folder.

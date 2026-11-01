@@ -17,6 +17,7 @@ pub mod transfer;
 pub mod uitree;
 
 pub use api::*;
+pub use manager::reconnect::ReconnectOptions;
 pub use manager::{ManagerHandle, ManagerOptions, normalize_addr, parse_inet, spawn};
 pub use slot::StreamProfile;
 pub use stream::{SlotIo, StreamInfo};

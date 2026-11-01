@@ -321,3 +321,228 @@ async fn max_slots_five_allows_a_fifth_device() {
         wait_phase(&h, i, PhaseView::Online).await;
     }
 }
+
+// ---- the Reconnect button (spec2 §4) ------------------------------------------
+
+fn svc(kind: ServiceKind, instance: &str, addr: &str) -> DiscoveredDevice {
+    DiscoveredDevice { instance: instance.into(), kind, addr: addr.parse().unwrap(), host: "phone.local".into(), txt: BTreeMap::new() }
+}
+
+/// A manager with `saved` restored from devices.toml and a fast search.
+fn start_saved(mock: &MockAdbHandle, dir: &std::path::Path, saved: &[(&str, u8, &str)], tweak: impl FnOnce(&mut ReconnectOptions)) -> ManagerHandle {
+    let mut devices = ac_config::Devices::default();
+    for (id, slot, addr) in saved {
+        let mut r = ac_config::DeviceRecord::new(id, TransportKind::Tls, chrono::Utc::now());
+        r.slot = *slot;
+        r.last_address = Some((*addr).to_owned());
+        r.keeper_id = Some(format!("keeper-{id}"));
+        devices.upsert(r);
+    }
+    let paths = ac_config::Paths::in_dirs(&dir.join("config"), &dir.join("state"));
+    ac_config::save_devices(&paths.devices, &devices).unwrap();
+
+    let mut cfg = Config::default();
+    cfg.general.adb_server = mock.addr;
+    cfg.general.start_adb_server = false;
+    cfg.general.lan_only = false; // the fake phones live on 127.0.0.1
+    cfg.discovery.auto_connect_known = false; // only the button acts
+    cfg.connection.heartbeat_interval_ms = 250;
+    cfg.connection.heartbeat_timeout_ms = 500;
+    cfg.connection.reconnect_backoff_ms = vec![50, 100, 200];
+    cfg.connection.reconnect_jitter_pct = 0;
+    let mut opts = ManagerOptions::new(cfg, Some(paths));
+    opts.discovery = false;
+    opts.streaming = false;
+    opts.reconnect = ReconnectOptions {
+        route_table: dir.join("no-routes"),
+        hosts: Some(Vec::new()),
+        mdns_wait: Duration::from_millis(50),
+        deadline: Duration::from_millis(1500),
+        try_gap: Duration::from_millis(100),
+        tick: Duration::from_millis(25),
+        online_probe_timeout: Duration::from_millis(300),
+        sweep_timeout: Duration::from_millis(200),
+        ..ReconnectOptions::default()
+    };
+    tweak(&mut opts.reconnect);
+    ac_device::spawn(opts)
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("tbm-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+async fn wait_done(h: &ManagerHandle) -> Vec<ReconnectResult> {
+    wait_for(h, "the search to end", |e| match e {
+        UiEvent::ReconnectDone { results } => Some(results.clone()),
+        _ => None,
+    })
+    .await
+}
+
+/// A fake Keeper locator answering with `reply`; returns its port.
+async fn fake_locator(reply: String) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let mut b = [0u8; 5];
+            if s.read_exact(&mut b).await.is_ok() {
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        }
+    });
+    port
+}
+
+async fn closed_port() -> u16 {
+    tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap().local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn button_follows_mdns_to_a_new_subnet() {
+    let dir = temp_dir("mdns");
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        s.connectable.insert("192.168.1.84:41000".into(), phone("SER1", "Pixel 8"));
+    });
+    let h = start_saved(&mock, &dir, &[("SER1", 1, "192.168.0.84:37000")], |o| o.deadline = Duration::from_secs(4));
+
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    h.discovery_tx.send(DiscoveryEvent::Added(svc(ServiceKind::Connect, "adb-SER1-OpVSoG", "192.168.1.84:41000"))).unwrap();
+
+    let results = wait_done(&h).await;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].ok, "{results:?}");
+    assert!(results[0].message.contains("192.168.1.84:41000"));
+    assert!(mock.requests().contains(&"host:connect:192.168.1.84:41000".to_owned()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn button_finds_a_phone_through_its_keeper_without_mdns() {
+    let dir = temp_dir("keeper");
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        s.connectable.insert("127.0.0.1:41927".into(), phone("SER1", "Pixel 8"));
+    });
+    let locator = fake_locator(r#"{"keeper_id":"keeper-SER1","version":8,"adb_on":true,"adb_port":41927}"#.to_owned()).await;
+    let closed = closed_port().await;
+    let h = start_saved(&mock, &dir, &[("SER1", 1, "192.168.0.84:37000")], |o| {
+        o.hosts = Some(vec!["127.0.0.1".parse().unwrap()]);
+        o.locator_port = locator;
+        o.direct_port = closed;
+    });
+
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    let results = wait_done(&h).await;
+    assert!(results[0].ok, "{results:?}");
+    assert!(results[0].message.contains("127.0.0.1:41927"), "{results:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn button_reports_wireless_debugging_off_with_the_fix() {
+    let dir = temp_dir("off");
+    let mock = MockAdb::start().await;
+    let locator = fake_locator(r#"{"keeper_id":"keeper-SER1","version":8,"adb_on":false}"#.to_owned()).await;
+    let closed = closed_port().await;
+    let h = start_saved(&mock, &dir, &[("SER1", 1, "192.168.0.84:37000")], |o| {
+        o.hosts = Some(vec!["127.0.0.1".parse().unwrap()]);
+        o.locator_port = locator;
+        o.direct_port = closed;
+        o.deadline = Duration::from_millis(800);
+    });
+
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    let results = wait_done(&h).await;
+    assert!(!results[0].ok);
+    assert!(results[0].message.contains("Always allow"), "{results:?}");
+    let v = wait_for(&h, "the tile's message", |e| match e {
+        UiEvent::Slot(v) if v.slot == 1 && v.error.as_deref().is_some_and(|m| m.contains("Always allow")) => Some(v.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(v.phase, PhaseView::Disconnected);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn button_does_not_touch_a_phone_that_is_online() {
+    let dir = temp_dir("online");
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        s.connectable.insert("192.168.1.84:41000".into(), phone("SER1", "Pixel 8"));
+    });
+    let h = start_saved(&mock, &dir, &[("SER1", 1, "192.168.1.84:41000")], |_| {});
+    h.commands.send(UiCommand::Reconnect { slot: 1 }).await.unwrap();
+    assert!(wait_done(&h).await[0].ok);
+
+    let connects = || mock.requests().iter().filter(|r| r.starts_with("host:connect")).count();
+    let before = connects();
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    let results = wait_done(&h).await;
+    assert!(results.is_empty(), "{results:?}");
+    assert_eq!(connects(), before);
+    assert!(!mock.requests().iter().any(|r| r.starts_with("host:disconnect")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn phones_that_swapped_addresses_end_up_in_their_own_slots() {
+    let dir = temp_dir("swap");
+    let mock = MockAdb::start().await;
+    mock.with_state(|s| {
+        // Each phone now holds the address saved for the other.
+        s.connectable.insert("192.168.1.10:40000".into(), phone("SER_B", "Phone B"));
+        s.connectable.insert("192.168.1.20:40000".into(), phone("SER_A", "Phone A"));
+    });
+    let h = start_saved(
+        &mock,
+        &dir,
+        &[("SER_A", 1, "192.168.1.10:40000"), ("SER_B", 2, "192.168.1.20:40000")],
+        |o| o.deadline = Duration::from_secs(4),
+    );
+
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    // Let both reject the stale address, then mDNS names them correctly.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.discovery_tx.send(DiscoveryEvent::Added(svc(ServiceKind::Connect, "adb-SER_A-aaaaaa", "192.168.1.20:40000"))).unwrap();
+    h.discovery_tx.send(DiscoveryEvent::Added(svc(ServiceKind::Connect, "adb-SER_B-bbbbbb", "192.168.1.10:40000"))).unwrap();
+
+    let results = wait_done(&h).await;
+    assert!(results.iter().all(|r| r.ok), "{results:?}");
+    let saved = ac_config::load_devices(&ac_config::Paths::in_dirs(&dir.join("config"), &dir.join("state")).devices).unwrap();
+    let addr = |id: &str| saved.get(id).unwrap().last_address.clone().unwrap();
+    assert_eq!((saved.get("SER_A").unwrap().slot, addr("SER_A").as_str()), (1, "192.168.1.20:40000"));
+    assert_eq!((saved.get("SER_B").unwrap().slot, addr("SER_B").as_str()), (2, "192.168.1.10:40000"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn search_gives_up_at_the_limit_with_a_clear_message() {
+    let dir = temp_dir("limit");
+    let mock = MockAdb::start().await;
+    let h = start_saved(&mock, &dir, &[("SER1", 1, "192.168.0.84:37000")], |o| o.deadline = Duration::from_millis(400));
+    let started = std::time::Instant::now();
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    let results = wait_done(&h).await;
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    assert!(!results[0].ok);
+    assert!(results[0].message.contains("Could not find"), "{results:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn nothing_saved_means_nothing_to_do() {
+    let dir = temp_dir("empty");
+    let mock = MockAdb::start().await;
+    let h = start_saved(&mock, &dir, &[], |_| {});
+    h.commands.send(UiCommand::ReconnectAll).await.unwrap();
+    assert!(wait_done(&h).await.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

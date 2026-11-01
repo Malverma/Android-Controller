@@ -142,6 +142,7 @@ impl Manager {
             "phones" => {
                 let _ = reply.send(Ok(self.phones()));
             }
+            "reconnect_all" => self.start_reconnect_with(None, Some(reply)),
             "screenshot" => {
                 let ts = targets!(true);
                 let names = names_of(&ts);

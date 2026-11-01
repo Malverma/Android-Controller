@@ -160,6 +160,14 @@ pub enum SlotEvent {
     SetProfile(StreamProfile),
     /// User retry after `Failed`.
     RestartStream,
+    /// The Reconnect button found (or wants to try) this phone at `addr`.
+    /// Starts over from there: new attempts and a new give-up clock.
+    Relocate { addr: String, transport: TransportKind },
+    /// The Reconnect button started searching: `Reconnecting` gets a new
+    /// give-up clock, so a search near the limit is not cut off.
+    SearchStarted,
+    /// The Reconnect button could not bring a disconnected phone back.
+    SearchFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,6 +440,10 @@ impl Slot {
             (P::Pairing { pair_ip, paired: false, .. }, E::PairDone(Ok(guid))) => {
                 let serial = guid.as_deref().and_then(serial_from_instance).map(str::to_owned);
                 self.expect_serial = serial.clone();
+                // Pairing here chose the phone for this slot, replacing any
+                // remembered one; whichever phone answers next belongs here.
+                self.known_id = None;
+                self.device = None;
                 if let Some(addr) = self.pair_connect.take() {
                     return self.start_connect(addr, TransportKind::Tls, serial, false);
                 }
@@ -660,6 +672,31 @@ impl Slot {
                 fx
             }
 
+            // ---- the Reconnect button ---------------------------------------------
+            (P::Disconnected { .. } | P::ConnectingAdb { .. } | P::Reconnecting { .. }, E::Relocate { addr, transport })
+                if self.device_id().is_some() =>
+            {
+                if matches!(self.phase, P::ConnectingAdb { .. }) && self.addr.as_deref() == Some(addr.as_str()) {
+                    return Vec::new(); // already trying there
+                }
+                let mut fx = Vec::new();
+                if let Some(old) = self.adb_serial.clone().or_else(|| self.addr.clone()).filter(|old| *old != addr) {
+                    // adb may still hold a dead transport for the old address.
+                    fx.push(Effect::Disconnect { serial: old });
+                }
+                let expect = self.device_id().map(str::to_owned);
+                fx.extend(self.start_connect(addr, transport, expect, true));
+                fx
+            }
+            (P::Reconnecting { attempt, cause, .. }, E::SearchStarted) => {
+                self.phase = P::Reconnecting { attempt, since: now, cause };
+                Vec::new()
+            }
+            (P::Disconnected { .. }, E::SearchFailed(message)) => {
+                self.phase = P::Disconnected { error: Some(message) };
+                Vec::new()
+            }
+
             // ---- teardown ----------------------------------------------------------
             (P::Empty, E::Disconnect | E::Forget) => Vec::new(),
             (_, E::Disconnect) => {
@@ -707,13 +744,20 @@ impl Slot {
     }
 
     fn identified(&mut self, info: DeviceInfo) -> Vec<Effect> {
-        let reconnecting = matches!(self.phase, Phase::Reconnecting { .. });
-        if reconnecting && self.device_id().is_some_and(|id| id != info.id) {
-            // Another phone now answers at the old address (DHCP reuse). Drop
-            // it and keep looking for ours.
+        // A slot belongs to one phone, not to an address: another phone may now
+        // hold the old one (DHCP reuse). Drop it and keep looking for ours.
+        // Pairing is exempt, because there the user chose to replace the phone.
+        let pairing = matches!(self.phase, Phase::Pairing { .. });
+        if !pairing && self.device_id().is_some_and(|id| id != info.id) {
             self.identify_inflight = false;
             let serial = self.adb_serial.take().unwrap_or_default();
-            return vec![Effect::Disconnect { serial }];
+            let mut fx = vec![Effect::Disconnect { serial }];
+            if let Phase::ConnectingAdb { silent, .. } = self.phase {
+                let addr = self.addr.clone().unwrap_or_default();
+                let message = format!("A different phone ({}) now answers at {addr}", info.model);
+                fx.extend(self.fail_to_disconnected(ErrorCode::ConnectFailed, message, !silent));
+            }
+            return fx;
         }
         if self.wifi_mac.is_none() {
             self.wifi_mac = info.wifi_mac.clone();
