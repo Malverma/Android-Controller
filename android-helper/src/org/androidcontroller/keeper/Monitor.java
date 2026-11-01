@@ -26,6 +26,8 @@ import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Monitor mode: this phone shows a display of the PC (crates/ac-monitor).
@@ -50,6 +52,8 @@ final class Monitor {
     private static final int OUTPUT_TIMEOUT_US = 50_000;
 
     private static final Handler main = new Handler(Looper.getMainLooper());
+    /** One thread, so a touch's down, moves and up reach the PC in order. */
+    private static final ExecutorService sender = Executors.newSingleThreadExecutor();
     private static final Set<DataOutputStream> controls = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private static LocalServerSocket server;
     private static Context app;
@@ -120,15 +124,15 @@ final class Monitor {
     }
 
     private static void sendAll(JSONObject o) {
-        for (DataOutputStream out : controls) {
-            new Thread(() -> {
+        sender.execute(() -> {
+            for (DataOutputStream out : controls) {
                 try {
                     Proto.write(out, o);
                 } catch (IOException e) {
                     Log.d(Keeper.TAG, "monitor control: " + e);
                 }
-            }, "monitor-send").start();
-        }
+            }
+        });
     }
 
     // ---- the screen ---------------------------------------------------------------------

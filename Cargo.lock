@@ -52,6 +52,7 @@ dependencies = [
  "ac-direct",
  "ac-discovery",
  "ac-media",
+ "ac-monitor",
  "ac-scrcpy",
  "ac-transfer",
  "adb-mock",

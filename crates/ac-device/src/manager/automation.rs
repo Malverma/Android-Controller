@@ -137,12 +137,34 @@ impl Manager {
                 }
             };
         }
+        // These act on what the phone shows, which is now the PC's desktop.
+        if matches!(method, "tap" | "swipe" | "type" | "key" | "screenshot") {
+            let ts = targets!(true);
+            if let Some(t) = ts.iter().find(|t| self.slots[t.slot as usize - 1].display_desired) {
+                bail!(format!(
+                    "{}: {} is being used as a monitor for the PC, so it cannot be controlled. Turn that off with set_monitor.",
+                    ErrorCode::MonitorActive.as_str(),
+                    t.name
+                ));
+            }
+        }
         let ctx = self.ctx();
         match method {
             "phones" => {
                 let _ = reply.send(Ok(self.phones()));
             }
             "reconnect_all" => self.start_reconnect_with(None, Some(reply)),
+            "set_monitor" => {
+                let ts = targets!(false);
+                let Some(on) = p.get("on").and_then(Value::as_bool) else { bail!("set_monitor needs on: true or false".into()) };
+                let t = &ts[0];
+                let i = t.slot as usize - 1;
+                if on && let Some(reason) = self.display_blocked(i) {
+                    bail!(reason);
+                }
+                self.request_display(t.slot, on, false);
+                let _ = reply.send(Ok(json!({ "phone": t.name, "monitor": on })));
+            }
             "screenshot" => {
                 let ts = targets!(true);
                 let names = names_of(&ts);
@@ -598,6 +620,7 @@ impl Manager {
                     "slot": i + 1,
                     "name": v.title,
                     "state": format!("{:?}", v.phase).to_lowercase(),
+                    "monitor": s.display_desired,
                     "model": v.model,
                     "manufacturer": v.manufacturer,
                     "android_sdk": v.sdk,
@@ -623,7 +646,7 @@ impl Manager {
     }
 
     /// Asks the user in the app; resolves to their answer (no on timeout).
-    fn confirm(&mut self, title: String, body: String) -> impl Future<Output = bool> + Send + 'static {
+    pub(super) fn confirm(&mut self, title: String, body: String) -> impl Future<Output = bool> + Send + 'static {
         let id = self.next_id();
         let (tx, rx) = oneshot::channel();
         self.auto.confirms.insert(id, tx);

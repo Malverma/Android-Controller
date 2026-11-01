@@ -24,6 +24,27 @@ pub fn validate(cfg: &Config) -> Vec<ValidationError> {
     let mut errs = Vec::new();
     let mut err = |key: String, message: String| errs.push(ValidationError { key, message });
 
+    let m = &cfg.monitor;
+    if !(1..=120).contains(&m.fps) {
+        err("monitor.fps".into(), "must be 1..=120".into());
+    }
+    if !(320..=4096).contains(&m.max_size) {
+        err("monitor.max_size".into(), "must be 320..=4096".into());
+    }
+    if !(1..=100).contains(&m.bitrate_mbps) {
+        err("monitor.bitrate_mbps".into(), "must be 1..=100".into());
+    }
+    if !(0.25..=4.0).contains(&m.scale) {
+        err("monitor.scale".into(), "must be 0.25..=4".into());
+    }
+    if !matches!(m.encoder.as_str(), "auto" | "nvenc" | "vaapi" | "x264") {
+        err("monitor.encoder".into(), "must be auto, nvenc, vaapi or x264".into());
+    }
+    // These go into a `hyprctl keyword monitor` rule, separated by commas.
+    if m.position.is_empty() || !m.position.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        err("monitor.position".into(), "must look like auto-right or 1920x0".into());
+    }
+
     if !(1..=ac_core::MAX_SLOTS as u8).contains(&cfg.general.max_slots) {
         err("general.max_slots".into(), format!("must be 1..={}", ac_core::MAX_SLOTS));
     }

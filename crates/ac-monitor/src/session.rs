@@ -51,6 +51,11 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Set it to ask for a keyframe, from any thread.
+    pub fn keyframe_flag(&self) -> Arc<AtomicBool> {
+        self.keyframe.clone()
+    }
+
     pub fn request_keyframe(&self) {
         self.keyframe.store(true, Ordering::Relaxed);
     }

@@ -32,6 +32,13 @@ pub struct DeviceRecord {
     /// when the phone is searched for on the network (spec2 §4.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keeper_id: Option<String>,
+    /// Monitor mode in portrait; landscape otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monitor_portrait: bool,
+    /// Monitor mode without touch control of the PC. Unset means on for an
+    /// unencrypted connection and off otherwise (spec2 §5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_view_only: Option<bool>,
     #[serde(default = "yes")]
     pub auto_connect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +74,8 @@ impl DeviceRecord {
             last_address: None,
             wifi_mac: None,
             keeper_id: None,
+            monitor_portrait: false,
+            monitor_view_only: None,
             auto_connect: true,
             target_dir: None,
             supported_codecs: Vec::new(),

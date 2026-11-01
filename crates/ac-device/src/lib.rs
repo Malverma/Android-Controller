@@ -18,7 +18,8 @@ pub mod uitree;
 
 pub use api::*;
 pub use manager::reconnect::ReconnectOptions;
-pub use manager::{ManagerHandle, ManagerOptions, normalize_addr, parse_inet, spawn};
+pub use manager::display::{DisplayHost, EventSink, RealHost, SessionGuard};
+pub use manager::{HELPER_SETUP_CMD, ManagerHandle, ManagerOptions, normalize_addr, parse_inet, spawn};
 pub use slot::StreamProfile;
 pub use stream::{SlotIo, StreamInfo};
 pub use ac_direct::PORT as DIRECT_PORT;

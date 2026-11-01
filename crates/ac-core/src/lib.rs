@@ -40,6 +40,8 @@ pub enum ErrorCode {
     Decoder,
     ClipboardTruncated,
     AvahiMissing,
+    MonitorFailed,
+    MonitorActive,
 }
 
 impl ErrorCode {
@@ -59,6 +61,8 @@ impl ErrorCode {
             Self::Decoder => "E_DECODER",
             Self::ClipboardTruncated => "W_CLIPBOARD_TRUNCATED",
             Self::AvahiMissing => "W_AVAHI_MISSING",
+            Self::MonitorFailed => "E_MONITOR_FAILED",
+            Self::MonitorActive => "E_MONITOR_ACTIVE",
         }
     }
 

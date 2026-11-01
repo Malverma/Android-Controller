@@ -31,6 +31,10 @@ pub const LEGACY_LOOKUP_FROM_ATTEMPT: u32 = 2;
 pub const STREAM_RETRIES: u32 = 2;
 pub const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Monitor mode start retries before giving up.
+pub const DISPLAY_RETRIES: u32 = 2;
+pub const DISPLAY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Which stream profile a slot runs (spec §4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamProfile {
@@ -48,6 +52,19 @@ pub enum StreamPhase {
     Starting { attempt: u32 },
     /// Video is arriving (`Streaming`).
     Live { width: u32, height: u32 },
+    Failed { error: String },
+}
+
+/// Monitor mode (spec2 §5). Named "display" because "monitor" already means
+/// the ADB device tracker here. Only one of this and [`StreamPhase`] runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DisplayPhase {
+    #[default]
+    Off,
+    Starting { attempt: u32 },
+    Live { width: u32, height: u32 },
+    /// The phone went away: the PC's output stays for a while.
+    Paused,
     Failed { error: String },
 }
 
@@ -126,6 +143,7 @@ pub enum TimerKind {
     AwaitOnline,
     AwaitConnectService,
     StreamRetry,
+    DisplayRetry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +186,15 @@ pub enum SlotEvent {
     SearchStarted,
     /// The Reconnect button could not bring a disconnected phone back.
     SearchFailed(String),
+    /// Monitor mode on or off, from either end.
+    SetDisplay { on: bool },
+    /// Apply changed options: the PC's output stays, so windows do not move.
+    RestartDisplay,
+    DisplayLive { id: u64, width: u32, height: u32 },
+    /// The picture stopped by itself; worth trying again.
+    DisplayEnded { id: u64, error: String },
+    /// Trying again would not help.
+    DisplayFailed { id: u64, error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +218,11 @@ pub enum Effect {
     Toast { code: ErrorCode, message: String },
     StartStream { id: u64, serial: String, profile: StreamProfile, shell_v2: bool },
     StopStream,
+    StartDisplay { id: u64, serial: String, shell_v2: bool },
+    /// Ends monitor mode and removes the PC's output.
+    StopDisplay,
+    /// Stops the picture but keeps the PC's output for now.
+    PauseDisplay,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +250,10 @@ pub struct Slot {
     pub stream_enabled: bool,
     pub stream: StreamPhase,
     pub profile: StreamProfile,
+    /// The user wants this phone as a monitor. Lasts for the app session only.
+    pub display_desired: bool,
+    pub display: DisplayPhase,
+    display_id: u64,
     stream_id: u64,
     /// Address to connect to once pairing succeeds (manual pairing).
     pair_connect: Option<String>,
@@ -242,6 +278,9 @@ impl Slot {
             stream_enabled: false,
             stream: StreamPhase::Off,
             profile: StreamProfile::Grid,
+            display_desired: false,
+            display: DisplayPhase::Off,
+            display_id: 0,
             stream_id: 0,
             pair_connect: None,
             identify_inflight: false,
@@ -358,6 +397,10 @@ impl Slot {
 
     fn enter_reconnecting(&mut self, cause: ReconnectCause, now: Instant, cfg: &Connection) -> Vec<Effect> {
         let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+        if matches!(self.display, DisplayPhase::Starting { .. } | DisplayPhase::Live { .. }) {
+            self.display = DisplayPhase::Paused;
+            fx.push(Effect::PauseDisplay);
+        }
         self.set_phase(Phase::Reconnecting { attempt: 0, since: now, cause });
         fx.extend([Effect::StopMonitor, self.timer(TimerKind::Backoff, Self::backoff(cfg, 0))]);
         fx
@@ -379,6 +422,63 @@ impl Slot {
             profile: self.profile,
             shell_v2: self.device.as_ref().is_some_and(DeviceInfo::shell_v2),
         }
+    }
+
+    fn start_display(&mut self, attempt: u32) -> Effect {
+        self.display_id += 1;
+        self.display = DisplayPhase::Starting { attempt };
+        Effect::StartDisplay {
+            id: self.display_id,
+            serial: self.adb_serial.clone().or_else(|| self.addr.clone()).unwrap_or_default(),
+            shell_v2: self.device.as_ref().is_some_and(DeviceInfo::shell_v2),
+        }
+    }
+
+    /// Ends monitor mode, whatever state it is in.
+    fn stop_display(&mut self) -> Option<Effect> {
+        self.display_desired = false;
+        let running = !matches!(self.display, DisplayPhase::Off | DisplayPhase::Failed { .. });
+        self.display = DisplayPhase::Off;
+        running.then_some(Effect::StopDisplay)
+    }
+
+    fn set_display(&mut self, on: bool, online: bool) -> Vec<Effect> {
+        if on == self.display_desired || (on && self.device_id().is_none()) {
+            return Vec::new();
+        }
+        if on {
+            self.display_desired = true;
+            if !online {
+                return Vec::new(); // starts when the phone comes back
+            }
+            let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+            fx.push(self.start_display(0));
+            return fx;
+        }
+        let mut fx: Vec<Effect> = self.stop_display().into_iter().collect();
+        if online && self.stream_enabled {
+            fx.push(self.start_stream(0));
+        }
+        fx
+    }
+
+    /// Gives up on monitor mode and goes back to mirroring.
+    fn display_failed(&mut self, error: String) -> Vec<Effect> {
+        let mut fx: Vec<Effect> = self.stop_display().into_iter().collect();
+        self.display = DisplayPhase::Failed { error: error.clone() };
+        fx.push(Effect::Toast {
+            code: ErrorCode::MonitorFailed,
+            message: format!("{} could not be used as a monitor: {error}", self.display_name()),
+        });
+        if self.stream_enabled {
+            fx.push(self.start_stream(0));
+        }
+        fx
+    }
+
+    /// The id of the display currently starting or running.
+    pub fn display_id(&self) -> u64 {
+        self.display_id
     }
 
     /// The id of the stream currently starting or running.
@@ -440,18 +540,21 @@ impl Slot {
             (P::Pairing { pair_ip, paired: false, .. }, E::PairDone(Ok(guid))) => {
                 let serial = guid.as_deref().and_then(serial_from_instance).map(str::to_owned);
                 self.expect_serial = serial.clone();
+                // A new phone does not inherit the old one's monitor role.
+                let stop: Option<Effect> = self.stop_display();
                 // Pairing here chose the phone for this slot, replacing any
                 // remembered one; whichever phone answers next belongs here.
                 self.known_id = None;
                 self.device = None;
+                let mut fx: Vec<Effect> = stop.into_iter().collect();
                 if let Some(addr) = self.pair_connect.take() {
-                    return self.start_connect(addr, TransportKind::Tls, serial, false);
+                    fx.extend(self.start_connect(addr, TransportKind::Tls, serial, false));
+                    return fx;
                 }
                 self.phase = P::Pairing { qr: None, pair_ip, paired: true };
-                vec![
-                    Effect::FindConnectService { serial, ip: pair_ip },
-                    self.timer(TimerKind::AwaitConnectService, AWAIT_CONNECT_SERVICE),
-                ]
+                fx.push(Effect::FindConnectService { serial, ip: pair_ip });
+                fx.push(self.timer(TimerKind::AwaitConnectService, AWAIT_CONNECT_SERVICE));
+                fx
             }
             (P::Pairing { paired: false, .. }, E::PairDone(Err(msg))) => {
                 self.fail_to_disconnected(ErrorCode::PairFailed, format!("Pairing failed: {msg}"), true)
@@ -666,10 +769,40 @@ impl Slot {
                     Vec::new()
                 }
             }
-            (P::Online { .. }, E::RestartStream) if self.stream_enabled => {
+            (P::Online { .. }, E::RestartStream) if self.stream_enabled && !self.display_desired => {
                 let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
                 fx.push(self.start_stream(0));
                 fx
+            }
+
+            // ---- monitor mode ------------------------------------------------------
+            (phase, E::SetDisplay { on }) => self.set_display(on, matches!(phase, P::Online { .. })),
+            (P::Online { .. }, E::RestartDisplay) if self.display_desired => vec![self.start_display(0)],
+            (P::Online { .. }, E::DisplayLive { id, width, height }) if id == self.display_id => {
+                self.display = DisplayPhase::Live { width, height };
+                Vec::new()
+            }
+            (P::Online { .. }, E::DisplayEnded { id, error }) if id == self.display_id => {
+                let attempt = match self.display {
+                    // One that was running starts over.
+                    DisplayPhase::Live { .. } => 0,
+                    DisplayPhase::Starting { attempt } => attempt + 1,
+                    _ => return Vec::new(),
+                };
+                if attempt > DISPLAY_RETRIES {
+                    return self.display_failed(error);
+                }
+                self.display = DisplayPhase::Starting { attempt };
+                vec![self.timer(TimerKind::DisplayRetry, DISPLAY_RETRY_DELAY)]
+            }
+            (P::Online { .. }, E::DisplayFailed { id, error }) if id == self.display_id && self.display_desired => {
+                self.display_failed(error)
+            }
+            (P::Online { .. }, E::Timer { kind: TimerKind::DisplayRetry, generation })
+                if generation == self.generation && matches!(self.display, DisplayPhase::Starting { .. }) =>
+            {
+                let DisplayPhase::Starting { attempt } = self.display else { unreachable!() };
+                vec![self.start_display(attempt)]
             }
 
             // ---- the Reconnect button ---------------------------------------------
@@ -701,6 +834,7 @@ impl Slot {
             (P::Empty, E::Disconnect | E::Forget) => Vec::new(),
             (_, E::Disconnect) => {
                 let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+                fx.extend(self.stop_display());
                 fx.push(Effect::StopMonitor);
                 fx.extend(self.disconnect_effect());
                 self.adb_serial = None;
@@ -710,6 +844,7 @@ impl Slot {
             }
             (_, E::Forget) => {
                 let mut fx: Vec<Effect> = self.stop_stream().into_iter().collect();
+                fx.extend(self.stop_display());
                 fx.push(Effect::StopMonitor);
                 fx.extend(self.disconnect_effect());
                 if let Some(id) = self.device_id() {
@@ -720,6 +855,7 @@ impl Slot {
                     generation: self.generation + 1,
                     stream_enabled: self.stream_enabled,
                     stream_id: self.stream_id,
+                    display_id: self.display_id,
                     ..Slot::new(id)
                 };
                 fx
@@ -769,7 +905,9 @@ impl Slot {
         self.device = Some(info);
         self.set_phase(Phase::Online { heartbeat_failures: 0 });
         let mut fx = vec![Effect::StartMonitor { serial, shell_v2 }, Effect::Persist];
-        if self.stream_enabled {
+        if self.display_desired {
+            fx.push(self.start_display(0));
+        } else if self.stream_enabled {
             fx.push(self.start_stream(0));
         }
         fx

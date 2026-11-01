@@ -12,23 +12,33 @@ const MAX_JSON: u32 = 1 << 20;
 const KEY_FLAG: u64 = 1 << 62;
 const PTS_MASK: u64 = KEY_FLAG - 1;
 
-pub fn write_json(w: &mut impl Write, v: &Value) -> io::Result<()> {
-    let body = serde_json::to_vec(v)?;
+/// One message as it goes on the wire.
+pub fn encode_json(v: &Value) -> Vec<u8> {
+    let body = v.to_string().into_bytes();
     let mut msg = Vec::with_capacity(body.len() + 4);
     msg.extend_from_slice(&(body.len() as u32).to_be_bytes());
     msg.extend_from_slice(&body);
-    w.write_all(&msg)?;
+    msg
+}
+
+/// The body length from a message's first 4 bytes, if it is acceptable.
+pub fn body_len(prefix: [u8; 4]) -> io::Result<usize> {
+    let n = u32::from_be_bytes(prefix);
+    if !(2..=MAX_JSON).contains(&n) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad message length {n}")));
+    }
+    Ok(n as usize)
+}
+
+pub fn write_json(w: &mut impl Write, v: &Value) -> io::Result<()> {
+    w.write_all(&encode_json(v))?;
     w.flush()
 }
 
 pub fn read_json(r: &mut impl Read) -> io::Result<Value> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
-    let n = u32::from_be_bytes(len);
-    if !(2..=MAX_JSON).contains(&n) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad message length {n}")));
-    }
-    let mut body = vec![0u8; n as usize];
+    let mut body = vec![0u8; body_len(len)?];
     r.read_exact(&mut body)?;
     Ok(serde_json::from_slice(&body)?)
 }

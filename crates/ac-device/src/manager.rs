@@ -42,7 +42,7 @@ const STAY_AWAKE_TIMEOUT: u32 = i32::MAX as u32;
 /// Finishes setting up the Wireless Debugging Keeper helper (android-helper/)
 /// on a phone that has it installed: the one permission it needs can only be
 /// granted over adb. Prints `@granted` when it did the setup now.
-const HELPER_SETUP_CMD: &str = "rm -f /data/local/tmp/android-controller-server.jar /data/local/tmp/android-controller-probe.jar /data/local/tmp/android-controller-ui.xml; \
+pub const HELPER_SETUP_CMD: &str = "rm -f /data/local/tmp/android-controller-server.jar /data/local/tmp/android-controller-probe.jar /data/local/tmp/android-controller-ui.xml; \
 p=org.androidcontroller.keeper; \
 pm path $p >/dev/null 2>&1 || { echo @none; exit 0; }; \
 echo @$(dumpsys package $p | grep -m 1 -o 'versionCode=[0-9]*'); \
@@ -91,11 +91,16 @@ pub struct ManagerOptions {
     pub control_socket: Option<PathBuf>,
     /// The Reconnect button's search (tests shorten it).
     pub reconnect: reconnect::ReconnectOptions,
+    /// What monitor mode acts on. `None` turns it off, so nothing can touch
+    /// the desktop unless asked: the app passes `display::RealHost`.
+    pub display_host: Option<Arc<dyn display::DisplayHost>>,
+    /// How long a phone's output outlives its connection (tests shorten it).
+    pub display_grace: Duration,
 }
 
 impl ManagerOptions {
     pub fn new(config: Config, paths: Option<Paths>) -> Self {
-        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None, control_socket: None, reconnect: Default::default() }
+        Self { config, paths, discovery: true, arp_table: "/proc/net/arp".into(), streaming: true, media: None, control_socket: None, reconnect: Default::default(), display_host: None, display_grace: display::OUTPUT_GRACE }
     }
 }
 
@@ -117,6 +122,7 @@ impl ManagerHandle {
 }
 
 mod automation;
+pub mod display;
 mod games;
 pub mod reconnect;
 
@@ -164,6 +170,7 @@ enum Msg {
     KeeperId { device_id: String, keeper_id: String },
     /// Something for the Reconnect button's search.
     Reconnect(reconnect::JobMsg),
+    Display(display::DisplayMsg),
 }
 
 /// A slot's connection to the Android helper (no ADB): heartbeat, telemetry
@@ -308,6 +315,7 @@ struct Manager {
     reconnect_opts: reconnect::ReconnectOptions,
     reconnect_job: Option<reconnect::ReconnectJob>,
     reconnect_seq: u64,
+    displays: display::Displays,
 }
 
 impl Manager {
@@ -352,6 +360,7 @@ impl Manager {
             reconnect_opts: opts.reconnect,
             reconnect_job: None,
             reconnect_seq: 0,
+            displays: display::Displays::new(opts.display_host, opts.display_grace, n as usize),
             discovery: opts.discovery,
             devices,
             slots,
@@ -463,6 +472,7 @@ impl Manager {
             .filter(|_| self.cfg.automation.enabled)
             .map(|path| tokio::spawn(crate::control::serve(path, ctl_tx, self.auto.clients.clone())));
 
+        self.displays.remove_leftovers();
         self.emit_all();
         self.auto_connect_restored();
 
@@ -550,8 +560,17 @@ impl Manager {
 tap “Turn on touch control” and switch on “Test Bed Multi touch control”."
                         .into(),
                 ),
+                (_, Phase::Online { .. }) if s.display_desired && s.transport == TransportKind::Legacy => Some(
+                    "This connection (adb tcpip) is not encrypted: anyone on this network could see this monitor's picture, \
+so touch control of the PC is off unless you turn it on. Wireless debugging is encrypted."
+                        .into(),
+                ),
                 _ => None,
             },
+            display: self.display_view(i),
+            display_blocked: self.display_blocked(i),
+            display_view_only: self.display_view_only(i),
+            display_portrait: record.is_some_and(|r| r.monitor_portrait),
             stream: match (&self.stream_env, &s.phase, &s.stream) {
                 (Err(reason), Phase::Online { .. }, _) if !reason.is_empty() => StreamView::Unavailable(reason.clone()),
                 (_, Phase::Online { .. }, StreamPhase::Starting { .. }) => StreamView::Starting,
@@ -621,6 +640,7 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
             }
         }
         self.reconcile_testing();
+        self.reconcile_display_links();
         let nearby = self.nearby_views();
         if nearby != self.last_nearby {
             self.last_nearby = nearby.clone();
@@ -842,6 +862,9 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
                     }
                 });
             }
+            Effect::StartDisplay { id, serial, shell_v2 } => self.start_display(i, id, serial, shell_v2),
+            Effect::StopDisplay => self.stop_display(i),
+            Effect::PauseDisplay => self.pause_display(i),
             Effect::Persist => self.persist(i),
             Effect::Forget { id } => {
                 self.devices.remove(&id);
@@ -1809,6 +1832,8 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
             UiCommand::Record { slots, on } => self.record(slots, on),
             UiCommand::SetPerf { on } => self.perf_on = on,
             UiCommand::UpdateHelper { slot } => self.update_helper(slot),
+            UiCommand::SetDisplay { slot, on } => self.request_display(slot, on, true),
+            UiCommand::SetDisplayOptions { slot, view_only, portrait } => self.set_display_options(slot, view_only, portrait),
             UiCommand::Confirm { id, ok } => self.on_confirm(id, ok),
             UiCommand::FrameSaved { request, error } => self.on_frame_saved(request, error),
             UiCommand::SetTileSize { slot, px } => {
@@ -1862,6 +1887,7 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
                 }
             }
             Msg::Reconnect(m) => self.on_reconnect_msg(m),
+            Msg::Display(m) => self.on_display_msg(m),
             Msg::Slot(slot, ev) => self.feed(slot, ev),
             Msg::Session(SessionMsg::Slot(slot, ev)) => {
                 self.check_codec_failure(slot, &ev);
@@ -1944,6 +1970,7 @@ tap “Turn on touch control” and switch on “Test Bed Multi touch control”
                 if let Some(i) = self.idx(slot)
                     && self.slots[i].device_id() == Some(device_id.as_str())
                 {
+                    self.displays.set_helper_version(i, version);
                     self.check_helper_version(i, version);
                 }
             }

@@ -17,6 +17,7 @@ ac-media.workspace = true
 ac-transfer.workspace = true
 ac-direct.workspace = true
 ac-audio.workspace = true
+ac-monitor.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["process"] }
 async-channel.workspace = true

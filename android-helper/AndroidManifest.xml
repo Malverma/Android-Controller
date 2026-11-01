@@ -81,7 +81,8 @@
         <!-- Monitor mode: the phone shows a display of the PC. -->
         <activity
             android:name=".MonitorActivity"
-            android:exported="false"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />

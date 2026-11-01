@@ -8,7 +8,7 @@ use wayland_client::protocol::{wl_output, wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{zwlr_virtual_pointer_manager_v1 as manager_v1, zwlr_virtual_pointer_v1 as pointer_v1};
 
-use crate::touch::{Button, PointerAction};
+use crate::touch::{Button, PointerAction, TouchAction, TouchEvent, TouchMapper};
 
 /// Linux input codes.
 const BTN_LEFT: u32 = 0x110;
@@ -69,7 +69,7 @@ impl VirtualPointer {
                 self.pointer.button(time, code, state);
             }
             PointerAction::Scroll { dy } => {
-                self.pointer.axis_source(wl_pointer::AxisSource::Finger);
+                self.pointer.axis_source(wl_pointer::AxisSource::Continuous);
                 self.pointer.axis(time, wl_pointer::Axis::VerticalScroll, dy);
             }
         }
@@ -84,6 +84,39 @@ impl VirtualPointer {
         self.queue.roundtrip(&mut self.state).context("Wayland roundtrip")?;
         Ok(())
     }
+}
+
+/// Runs a pointer for `output` on its own thread. Dropping the sender ends it,
+/// releasing any button a gesture still holds.
+pub fn spawn(output: &str) -> Result<std::sync::mpsc::Sender<TouchEvent>> {
+    let (tx, rx) = std::sync::mpsc::channel::<TouchEvent>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let name = output.to_owned();
+    std::thread::Builder::new().name(format!("pointer-{output}")).spawn(move || {
+        let mut pointer = match VirtualPointer::connect(&name) {
+            Ok(p) => {
+                let _ = ready_tx.send(Ok(()));
+                p
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        let mut mapper = TouchMapper::default();
+        let release = TouchEvent { action: TouchAction::Cancel, time_ms: 0, points: Vec::new() };
+        let events = rx.iter().chain(std::iter::once(release));
+        for event in events {
+            for action in mapper.handle(&event) {
+                if let Err(e) = pointer.apply(action) {
+                    tracing::warn!("pointer for {name}: {e:#}");
+                    return;
+                }
+            }
+        }
+    })?;
+    ready_rx.recv().map_err(|_| anyhow!("the pointer thread ended"))??;
+    Ok(tx)
 }
 
 impl Drop for VirtualPointer {

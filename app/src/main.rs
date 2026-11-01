@@ -57,6 +57,7 @@ fn main() -> glib::ExitCode {
         let _guard = runtime.enter();
         let mut opts = ac_device::ManagerOptions::new(config.clone(), paths);
         opts.control_socket = Some(ac_device::control::socket_path());
+        opts.display_host = Some(std::sync::Arc::new(ac_device::RealHost));
         ac_device::spawn(opts)
     };
 

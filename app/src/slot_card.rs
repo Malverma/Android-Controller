@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use ac_core::{DeviceStats, SlotId, TransportKind};
 use ac_device::transfer::human_bytes;
-use ac_device::{AppKind, CrashView, PerfSample, PhaseView, SlotView, StreamView, TransferView};
+use ac_device::{AppKind, CrashView, DisplayView, PerfSample, PhaseView, SlotView, StreamView, TransferView};
 use adw::prelude::*;
 use gtk::glib;
 
@@ -29,6 +29,11 @@ pub enum CardAction {
     BroadcastTarget(bool),
     /// The "keep screen on" toggle changed.
     StayAwake(bool),
+    /// Use this phone as a monitor for the PC.
+    Monitor(bool),
+    /// Its touches control the PC's pointer.
+    MonitorTouch(bool),
+    MonitorPortrait(bool),
     SendFiles,
     SendFolder,
     CancelTransfers,
@@ -61,6 +66,9 @@ pub struct SlotCard {
     target_warning: gtk::Image,
     send: gtk::MenuButton,
     stay_awake: gtk::ToggleButton,
+    monitor: gtk::ToggleButton,
+    monitor_touch: gtk::ToggleButton,
+    monitor_portrait: gtk::ToggleButton,
     rename: gtk::Button,
     warning: gtk::Label,
     helper_row: gtk::Box,
@@ -85,6 +93,18 @@ pub struct SlotCard {
     perf_label: gtk::Label,
     perf_graph: gtk::DrawingArea,
     perf: Rc<RefCell<VecDeque<PerfSample>>>,
+}
+
+const MONITOR_TIP: &str = "Use this phone as a monitor for this PC";
+
+fn monitor_status(d: &DisplayView) -> String {
+    match d {
+        DisplayView::Live { width, height, fps, kbps, encoder } => {
+            format!("Monitor · {width}×{height} · {fps} fps · {:.1} Mbit/s · {encoder}", f64::from(*kbps) / 1000.0)
+        }
+        DisplayView::Waiting => "Monitor: waiting for the phone".into(),
+        _ => "Starting the monitor…".into(),
+    }
 }
 
 fn dim_label(text: &str) -> gtk::Label {
@@ -185,6 +205,27 @@ impl SlotCard {
                 }
             });
         }
+        // Monitor mode (spec2 §5), and two options shown while it is on.
+        let toggle = |icon: &str, tip: &str, name: &str, action: fn(bool) -> CardAction| {
+            let b = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).visible(false).build();
+            b.add_css_class("flat");
+            b.update_property(&[gtk::accessible::Property::Label(name)]);
+            let (on_action, syncing) = (on_action.clone(), syncing.clone());
+            b.connect_toggled(move |b| {
+                if !syncing.get() {
+                    on_action(slot, action(b.is_active()));
+                }
+            });
+            b
+        };
+        let monitor = toggle("video-display-symbolic", MONITOR_TIP, "Use as a monitor for this PC", CardAction::Monitor);
+        let monitor_touch = toggle(
+            "input-mouse-symbolic",
+            "Touch controls this PC's pointer on this monitor: tap to click, drag, hold to right-click, two fingers to scroll",
+            "Touch controls this PC",
+            CardAction::MonitorTouch,
+        );
+        let monitor_portrait = toggle("object-rotate-right-symbolic", "Portrait monitor", "Portrait monitor", CardAction::MonitorPortrait);
         let rename = gtk::Button::from_icon_name("document-edit-symbolic");
         rename.set_tooltip_text(Some("Rename this phone"));
         rename.add_css_class("flat");
@@ -195,6 +236,9 @@ impl SlotCard {
         }
         header.append(&rename);
         header.append(&stay_awake);
+        header.append(&monitor_portrait);
+        header.append(&monitor_touch);
+        header.append(&monitor);
         header.append(&send);
         header.append(&focus);
 
@@ -402,6 +446,9 @@ impl SlotCard {
             target_warning,
             send,
             stay_awake,
+            monitor,
+            monitor_touch,
+            monitor_portrait,
             rename,
             warning,
             helper_row,
@@ -440,12 +487,18 @@ impl SlotCard {
             warning: None,
             helper_update: None,
             stream: StreamView::Off,
+            display: DisplayView::Off,
+            display_blocked: None,
+            display_view_only: false,
+            display_portrait: false,
         });
         card
     }
 
     pub fn update(&self, v: &SlotView) {
         self.phase.set(v.phase);
+        // A failed start has gone back to mirroring.
+        let monitor_on = !matches!(v.display, DisplayView::Off | DisplayView::Failed(_));
         let (badge, class, primary, status) = match v.phase {
             PhaseView::Empty => ("Empty", "empty", "Add device", v.error.clone().unwrap_or_else(|| "No device".into())),
             PhaseView::Disconnected => (
@@ -457,6 +510,7 @@ impl SlotCard {
             ),
             PhaseView::Pairing => ("Pairing", "pairing", "Cancel", v.detail.clone()),
             PhaseView::Connecting => ("Connecting", "connecting", "Cancel", v.detail.clone()),
+            PhaseView::Online if monitor_on => ("Monitor", "online", "Disconnect", monitor_status(&v.display)),
             PhaseView::Online => ("Online", "online", "Disconnect", match &v.stream {
                 StreamView::Off | StreamView::Starting => "Starting mirroring…".into(),
                 StreamView::Live { .. } => String::new(),
@@ -464,6 +518,9 @@ impl SlotCard {
                 StreamView::Unavailable(e) if e.starts_with("Mirroring unavailable") => e.clone(),
                 StreamView::Unavailable(e) => format!("Mirroring unavailable: {e}"),
             }),
+            PhaseView::Reconnecting if monitor_on => {
+                ("Reconnecting", "reconnecting", "Stop", format!("{}\nThe monitor resumes when the phone is back.", v.detail))
+            }
             PhaseView::Reconnecting => ("Reconnecting", "reconnecting", "Stop", v.detail.clone()),
         };
         for c in ["empty", "disconnected", "pairing", "connecting", "online", "reconnecting"] {
@@ -488,17 +545,24 @@ impl SlotCard {
         self.helper_row.set_visible(v.helper_update.is_some());
 
         let online = v.phase == PhaseView::Online;
-        let starting = online && matches!(v.stream, StreamView::Off | StreamView::Starting);
+        let starting = online
+            && if monitor_on {
+                v.display == DisplayView::Starting
+            } else {
+                matches!(v.stream, StreamView::Off | StreamView::Starting)
+            };
         // Keep the last frame on screen across a restart (profile switch, rotation retry).
         let show_video = online
+            && !monitor_on
             && match v.stream {
                 StreamView::Live { .. } => true,
                 StreamView::Starting => self.picture.paintable().is_some(),
                 _ => false,
             };
-        if !online {
+        if !online || monitor_on {
             self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
         }
+        self.frame_icon.set_icon_name(Some(if monitor_on { "video-display-symbolic" } else { "phone-symbolic" }));
         self.frame_stack.set_visible_child_name(if show_video { "video" } else { "placeholder" });
         self.focus.set_visible(online && matches!(v.stream, StreamView::Live { .. } | StreamView::Starting));
         self.retry.set_visible(online && matches!(v.stream, StreamView::Failed(_)));
@@ -508,7 +572,15 @@ impl SlotCard {
         self.stay_awake.set_sensitive(v.stay_awake.is_some());
         self.syncing.set(true);
         self.stay_awake.set_active(v.stay_awake == Some(true));
+        self.monitor.set_active(monitor_on);
+        self.monitor_touch.set_active(!v.display_view_only);
+        self.monitor_portrait.set_active(v.display_portrait);
         self.syncing.set(false);
+        self.monitor.set_visible(online || monitor_on);
+        self.monitor.set_sensitive(v.display_blocked.is_none());
+        self.monitor.set_tooltip_text(Some(v.display_blocked.as_deref().unwrap_or(MONITOR_TIP)));
+        self.monitor_touch.set_visible(monitor_on);
+        self.monitor_portrait.set_visible(monitor_on);
         self.video_info.set_visible(show_video);
 
         let busy = starting || matches!(v.phase, PhaseView::Pairing | PhaseView::Connecting | PhaseView::Reconnecting);
@@ -541,6 +613,7 @@ impl SlotCard {
         }
 
         let state = match (v.phase, &v.stream) {
+            (PhaseView::Online, _) if monitor_on => "used as a monitor",
             (PhaseView::Online, StreamView::Live { .. }) => "streaming",
             (PhaseView::Online, StreamView::Failed(_) | StreamView::Unavailable(_)) => "connected, not mirroring",
             (PhaseView::Online, _) => "starting",

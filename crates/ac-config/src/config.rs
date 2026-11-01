@@ -24,6 +24,7 @@ pub struct Config {
     pub audio: Audio,
     pub testing: Testing,
     pub automation: Automation,
+    pub monitor: Monitor,
     pub ui: Ui,
     #[serde(deserialize_with = "merge_keybindings")]
     pub keybindings: BTreeMap<String, String>,
@@ -51,6 +52,7 @@ impl Default for Config {
             audio: Audio::default(),
             testing: Testing::default(),
             automation: Automation::default(),
+            monitor: Monitor::default(),
             ui: Ui::default(),
             keybindings: default_keybindings(),
         }
@@ -366,6 +368,41 @@ pub struct Automation {
 impl Default for Automation {
     fn default() -> Self {
         Self { enabled: true, confirm_destructive: true, game_port: 27191 }
+    }
+}
+
+/// A phone used as a monitor for this PC (spec2 §5.8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Monitor {
+    /// How many phones may be monitors at once.
+    pub max_concurrent: u32,
+    /// Longest side of the picture, in pixels.
+    pub max_size: u32,
+    pub fps: u32,
+    pub bitrate_mbps: u32,
+    /// Hyprland scale of the output: above 1 makes text larger.
+    pub scale: f64,
+    /// `auto`, `nvenc`, `vaapi` or `x264`.
+    pub encoder: String,
+    /// Hyprland position, such as `auto-right` or `1920x0`.
+    pub position: String,
+    /// The graphics card used by VA-API.
+    pub render_node: String,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 2,
+            max_size: 1920,
+            fps: 60,
+            bitrate_mbps: 8,
+            scale: 1.5,
+            encoder: "auto".into(),
+            position: "auto-right".into(),
+            render_node: "/dev/dri/renderD128".into(),
+        }
     }
 }
 

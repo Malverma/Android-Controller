@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use ac_config::{AppState, BroadcastState, WindowState};
 use ac_core::SlotId;
 use ac_device::{
+    DisplayView,
     ReconnectResult,
     AppAction, ManagerHandle, NearbyView, PhaseView, SlotIo, SlotView, StreamProfile, StreamView, TransferView, UiCommand, UiEvent,
     UsbDeviceView,
@@ -135,6 +136,7 @@ pub struct App {
     /// The focus view's "keep screen on" toggle, and its echo guard.
     rail_stay_awake: gtk::ToggleButton,
     rail_syncing: Cell<bool>,
+    rail_monitor: gtk::Button,
     transfer_cfg: RefCell<ac_config::Transfer>,
     /// Shared with every slot's input handler.
     prefs: Rc<RefCell<InputPrefs>>,
@@ -450,6 +452,11 @@ pub fn build(
                 .focusable(false)
                 .build(),
             rail_syncing: Cell::new(false),
+            rail_monitor: gtk::Button::builder()
+                .icon_name("video-display-symbolic")
+                .tooltip_text("Use this phone as a monitor for this PC")
+                .focusable(false)
+                .build(),
             transfer_cfg: RefCell::new(cfg.transfer.clone()),
             prefs,
             config: RefCell::new(cfg.clone()),
@@ -661,6 +668,18 @@ fn build_rail(app: &Rc<App>, rail: &gtk::Box) {
         }
     });
     rail.append(stay);
+    let monitor = &app.rail_monitor;
+    monitor.add_css_class("circular");
+    monitor.update_property(&[gtk::accessible::Property::Label("Use as a monitor for this PC")]);
+    let weak = Rc::downgrade(app);
+    monitor.connect_clicked(move |_| {
+        if let Some(app) = weak.upgrade()
+            && let Some(slot) = app.focused.get()
+        {
+            app.send(UiCommand::SetDisplay { slot, on: true });
+        }
+    });
+    rail.append(monitor);
 }
 
 /// A thumbnail for the focus view's rail; clicking it focuses that phone.
@@ -949,6 +968,9 @@ impl App {
                 }
             }
             CardAction::StayAwake(on) => self.set_stay_awake(slot, on),
+            CardAction::Monitor(on) => self.send(UiCommand::SetDisplay { slot, on }),
+            CardAction::MonitorTouch(on) => self.send(UiCommand::SetDisplayOptions { slot, view_only: Some(!on), portrait: None }),
+            CardAction::MonitorPortrait(on) => self.send(UiCommand::SetDisplayOptions { slot, view_only: None, portrait: Some(on) }),
             CardAction::SendFiles => self.pick_files(slot, false),
             CardAction::SendFolder => self.pick_files(slot, true),
             CardAction::CancelTransfers => self.send(UiCommand::CancelTransfers { slot }),
@@ -1034,7 +1056,17 @@ impl App {
                     self.video.borrow_mut()[idx].frame = None;
                 }
                 let (slot, live) = (v.slot, v.phase == PhaseView::Online && matches!(v.stream, StreamView::Live { .. }));
+                let monitor = !matches!(v.display, DisplayView::Off | DisplayView::Failed(_));
+                if monitor {
+                    // Nothing is mirrored, whichever end started it.
+                    self.focus_pictures[idx].set_paintable(None::<&gdk::Paintable>);
+                    self.thumbs[idx].picture.set_paintable(None::<&gdk::Paintable>);
+                    self.video.borrow_mut()[idx].frame = None;
+                }
                 self.state.borrow_mut().slots[idx] = Some(v);
+                if monitor && self.focused.get() == Some(slot) {
+                    self.leave_focus();
+                }
                 self.refresh_rail_stay_awake();
                 self.render_status();
                 self.render_nearby();
@@ -1340,7 +1372,11 @@ impl App {
 
     /// Mirrors the focused phone's "keep screen on" state on the rail toggle.
     fn refresh_rail_stay_awake(&self) {
-        let state = self.focused.get().and_then(|s| self.slot_view(s)).and_then(|v| v.stay_awake);
+        let view = self.focused.get().and_then(|s| self.slot_view(s));
+        let blocked = view.as_ref().and_then(|v| v.display_blocked.clone());
+        self.rail_monitor.set_sensitive(blocked.is_none());
+        self.rail_monitor.set_tooltip_text(Some(blocked.as_deref().unwrap_or("Use this phone as a monitor for this PC")));
+        let state = view.and_then(|v| v.stay_awake);
         self.rail_stay_awake.set_sensitive(state.is_some());
         self.rail_syncing.set(true);
         self.rail_stay_awake.set_active(state == Some(true));
@@ -1866,6 +1902,17 @@ impl App {
             0 => {}
             1 => line.push_str("  ·  automation client connected"),
             n => line.push_str(&format!("  ·  {n} automation clients connected")),
+        }
+        // The one feature where a phone can act on this PC: always say so.
+        let controlling: Vec<&str> = st
+            .slots
+            .iter()
+            .flatten()
+            .filter(|v| matches!(v.display, DisplayView::Live { .. } | DisplayView::Starting) && !v.display_view_only)
+            .map(|v| v.title.as_str())
+            .collect();
+        if !controlling.is_empty() {
+            line.push_str(&format!("  ·  🖱 {} can control the pointer", controlling.join(", ")));
         }
         let kbps = self.total_kbps.get();
         if kbps > 0 {

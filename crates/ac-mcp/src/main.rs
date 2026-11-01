@@ -373,6 +373,12 @@ fn tools() -> Vec<Tool> {
             request: pass!("reconnect_all"),
         },
         Tool {
+            name: "set_monitor",
+            description: "Use a phone as a monitor for this PC (a new Hyprland display that the phone shows and controls by touch), or stop. While on, the phone cannot be tapped, swiped or screenshotted, and those tools return E_MONITOR_ACTIVE.",
+            schema: schema(false, json!({ "on": { "type": "boolean", "description": "true to start, false to stop" } }), &["on"]),
+            request: pass!("set_monitor"),
+        },
+        Tool {
             name: "screenshot",
             description: "See a phone's screen as an image. Use it for games and custom-drawn UI; for normal apps ui_tree is faster and gives exact tap points. The answer says how image pixels map to phone pixels.",
             schema: schema(

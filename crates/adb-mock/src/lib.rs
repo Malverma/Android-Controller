@@ -65,7 +65,10 @@ pub struct MockState {
     pub files: HashMap<(String, String), Vec<u8>>,
     /// Every request payload, in order.
     pub requests: Vec<String>,
-    next_port: u16,
+    /// `forward tcp:0` answers with the port after this one.
+    pub next_port: u16,
+    /// Answer every `forward tcp:0` with this port instead.
+    pub forward_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -254,7 +257,7 @@ impl MockAdb {
                     if arg.starts_with("tcp:0;") {
                         let port = self.with_state(|st| {
                             st.next_port += 1;
-                            st.next_port
+                            st.forward_port.unwrap_or(st.next_port)
                         });
                         write_hex_string(s, &port.to_string()).await?;
                     }

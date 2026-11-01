@@ -67,6 +67,10 @@ pub enum UiCommand {
     Record { slots: Vec<SlotId>, on: bool },
     /// Sample frame rate, CPU, memory and temperature (always on during a run).
     SetPerf { on: bool },
+    /// Use this phone as a monitor for this PC, or stop (spec2 §5).
+    SetDisplay { slot: SlotId, on: bool },
+    /// This phone's monitor options; applied at once if it is one now.
+    SetDisplayOptions { slot: SlotId, view_only: Option<bool>, portrait: Option<bool> },
     /// Install the Wireless Debugging Keeper this app ships over an older one.
     UpdateHelper { slot: SlotId },
     /// The user's answer to `UiEvent::Confirm`.
@@ -202,6 +206,24 @@ pub struct SlotView {
     /// The phone's helper app is older than the one this app ships.
     pub helper_update: Option<String>,
     pub stream: StreamView,
+    pub display: DisplayView,
+    /// Why this phone cannot be a monitor right now.
+    pub display_blocked: Option<String>,
+    /// The phone's touches do not control the PC.
+    pub display_view_only: bool,
+    pub display_portrait: bool,
+}
+
+/// This phone as a monitor for the PC.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DisplayView {
+    #[default]
+    Off,
+    Starting,
+    Live { width: u32, height: u32, fps: u32, kbps: u32, encoder: String },
+    /// The phone went away and monitor mode resumes when it returns.
+    Waiting,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -240,6 +262,7 @@ pub struct UsbDeviceView {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // few per second at most, and a boxed view would only add noise
 pub enum UiEvent {
     Slot(SlotView),
     Stats { slot: SlotId, stats: DeviceStats },

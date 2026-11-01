@@ -629,3 +629,169 @@ fn search_failed_shows_on_a_disconnected_tile_only() {
     ev(&mut r, SlotEvent::SearchFailed("x".into()));
     assert!(matches!(r.phase, Phase::Reconnecting { .. }), "keeps trying on its own");
 }
+
+// ---- monitor mode (spec2 §5) --------------------------------------------------
+
+fn online_slot() -> Slot {
+    let mut s = Slot::new(1);
+    s.stream_enabled = true;
+    ev(&mut s, SlotEvent::Connect { addr: "192.168.1.42:37115".into(), transport: TransportKind::Tls, expect_serial: None, silent: false });
+    ev(&mut s, SlotEvent::ConnectDone(Ok(())));
+    ev(&mut s, SlotEvent::AdbState { serial: "192.168.1.42:37115".into(), state: DeviceState::Device });
+    ev(&mut s, SlotEvent::Identified(info("SER1")));
+    assert!(matches!(s.phase, Phase::Online { .. }));
+    assert!(matches!(s.stream, StreamPhase::Starting { .. }), "a normal phone mirrors");
+    s
+}
+
+fn start_id(fx: &[Effect]) -> u64 {
+    fx.iter()
+        .find_map(|f| match f {
+            Effect::StartDisplay { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("a StartDisplay effect")
+}
+
+fn has(fx: &[Effect], want: &Effect) -> bool {
+    fx.contains(want)
+}
+
+fn starts_stream(fx: &[Effect]) -> bool {
+    fx.iter().any(|f| matches!(f, Effect::StartStream { .. }))
+}
+
+#[test]
+fn display_on_replaces_the_mirror_and_off_brings_it_back() {
+    let mut s = online_slot();
+    let fx = ev(&mut s, SlotEvent::SetDisplay { on: true });
+    assert!(has(&fx, &Effect::StopStream));
+    let id = start_id(&fx);
+    assert_eq!(s.stream, StreamPhase::Off);
+    assert_eq!(s.display, DisplayPhase::Starting { attempt: 0 });
+
+    ev(&mut s, SlotEvent::DisplayLive { id, width: 1920, height: 864 });
+    assert_eq!(s.display, DisplayPhase::Live { width: 1920, height: 864 });
+
+    assert!(ev(&mut s, SlotEvent::SetDisplay { on: true }).is_empty(), "already on");
+    assert!(ev(&mut s, SlotEvent::RestartStream).is_empty(), "no mirror while a monitor");
+
+    let fx = ev(&mut s, SlotEvent::SetDisplay { on: false });
+    assert!(has(&fx, &Effect::StopDisplay));
+    assert!(starts_stream(&fx));
+    assert_eq!(s.display, DisplayPhase::Off);
+}
+
+#[test]
+fn dropped_link_pauses_keeps_the_wish_and_resumes_as_a_monitor() {
+    let mut s = online_slot();
+    let id = start_id(&ev(&mut s, SlotEvent::SetDisplay { on: true }));
+    ev(&mut s, SlotEvent::DisplayLive { id, width: 1920, height: 864 });
+
+    let fx = ev(&mut s, SlotEvent::AdbGone { serial: "192.168.1.42:37115".into() });
+    assert!(has(&fx, &Effect::PauseDisplay));
+    assert!(!has(&fx, &Effect::StopDisplay), "windows stay put during the grace time");
+    assert_eq!(s.display, DisplayPhase::Paused);
+    assert!(s.display_desired);
+
+    // Late news about the old session changes nothing.
+    assert!(ev(&mut s, SlotEvent::DisplayEnded { id, error: "gone".into() }).is_empty());
+    assert_eq!(s.display, DisplayPhase::Paused);
+
+    let fx = ev(&mut s, SlotEvent::Identified(info("SER1")));
+    assert!(start_id(&fx) > id);
+    assert!(!starts_stream(&fx), "a monitor does not mirror");
+}
+
+#[test]
+fn stopping_while_the_phone_is_away_does_not_resume() {
+    let mut s = online_slot();
+    ev(&mut s, SlotEvent::SetDisplay { on: true });
+    ev(&mut s, SlotEvent::AdbGone { serial: "192.168.1.42:37115".into() });
+    assert!(has(&ev(&mut s, SlotEvent::SetDisplay { on: false }), &Effect::StopDisplay));
+    let fx = ev(&mut s, SlotEvent::Identified(info("SER1")));
+    assert!(starts_stream(&fx));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::StartDisplay { .. })));
+}
+
+#[test]
+fn disconnect_and_forget_end_monitor_mode() {
+    let mut s = online_slot();
+    ev(&mut s, SlotEvent::SetDisplay { on: true });
+    assert!(has(&ev(&mut s, SlotEvent::Disconnect), &Effect::StopDisplay));
+    assert!(!s.display_desired);
+
+    let mut s = online_slot();
+    ev(&mut s, SlotEvent::SetDisplay { on: true });
+    assert!(has(&ev(&mut s, SlotEvent::Forget), &Effect::StopDisplay));
+    assert!(!s.display_desired);
+}
+
+#[test]
+fn a_failing_start_retries_then_gives_up_back_to_the_mirror() {
+    let mut s = online_slot();
+    let mut id = start_id(&ev(&mut s, SlotEvent::SetDisplay { on: true }));
+    for attempt in 1..=DISPLAY_RETRIES {
+        let fx = ev(&mut s, SlotEvent::DisplayEnded { id, error: "no video".into() });
+        assert_eq!(s.display, DisplayPhase::Starting { attempt });
+        id = start_id(&fire(&mut s, &fx));
+    }
+    let fx = ev(&mut s, SlotEvent::DisplayEnded { id, error: "no video".into() });
+    assert!(has(&fx, &Effect::StopDisplay));
+    assert!(starts_stream(&fx));
+    assert!(fx.iter().any(|f| matches!(f, Effect::Toast { code: ErrorCode::MonitorFailed, .. })));
+    assert_eq!(s.display, DisplayPhase::Failed { error: "no video".into() });
+    assert!(!s.display_desired);
+
+    assert!(start_id(&ev(&mut s, SlotEvent::SetDisplay { on: true })) > id, "the user may try again");
+}
+
+#[test]
+fn a_running_display_that_drops_starts_over_with_fresh_retries() {
+    let mut s = online_slot();
+    let id = start_id(&ev(&mut s, SlotEvent::SetDisplay { on: true }));
+    ev(&mut s, SlotEvent::DisplayLive { id, width: 1920, height: 864 });
+    ev(&mut s, SlotEvent::DisplayEnded { id, error: "closed".into() });
+    assert_eq!(s.display, DisplayPhase::Starting { attempt: 0 });
+}
+
+#[test]
+fn a_hopeless_failure_does_not_retry_and_stale_ones_are_ignored() {
+    let mut s = online_slot();
+    let id = start_id(&ev(&mut s, SlotEvent::SetDisplay { on: true }));
+    assert!(ev(&mut s, SlotEvent::DisplayFailed { id: id + 7, error: "old".into() }).is_empty());
+    assert!(ev(&mut s, SlotEvent::DisplayLive { id: id + 7, width: 1, height: 1 }).is_empty());
+    assert_eq!(s.display, DisplayPhase::Starting { attempt: 0 });
+    let fx = ev(&mut s, SlotEvent::DisplayFailed { id, error: "no decoder".into() });
+    assert!(!fx.iter().any(|f| matches!(f, Effect::Timer { .. })));
+    assert!(matches!(s.display, DisplayPhase::Failed { .. }));
+}
+
+#[test]
+fn changing_options_restarts_the_picture_without_removing_the_output() {
+    let mut s = online_slot();
+    assert!(ev(&mut s, SlotEvent::RestartDisplay).is_empty(), "not a monitor");
+    let id = start_id(&ev(&mut s, SlotEvent::SetDisplay { on: true }));
+    let fx = ev(&mut s, SlotEvent::RestartDisplay);
+    assert!(start_id(&fx) > id);
+    assert!(!has(&fx, &Effect::StopDisplay));
+}
+
+#[test]
+fn a_new_phone_paired_into_the_slot_does_not_inherit_monitor_mode() {
+    let mut s = online_slot();
+    ev(&mut s, SlotEvent::SetDisplay { on: true });
+    ev(&mut s, SlotEvent::Disconnect);
+    ev(&mut s, SlotEvent::SetDisplay { on: true }); // wanted again while offline
+    assert!(s.display_desired);
+    ev(&mut s, SlotEvent::PairCode { addr: sa("192.168.1.50:40000"), code: "123456".into(), connect: None });
+    ev(&mut s, SlotEvent::PairDone(Ok(None)));
+    assert!(!s.display_desired);
+}
+
+#[test]
+fn an_unknown_phone_cannot_be_asked_to_be_a_monitor() {
+    let mut s = Slot::new(1);
+    assert!(ev(&mut s, SlotEvent::SetDisplay { on: true }).is_empty());
+    assert!(!s.display_desired);
+}
